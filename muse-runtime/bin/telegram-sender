@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""Send Telegram messages for the muse-agent-bridge, show the typing
+indicator, set reactions, and register the command menu.
+
+Contract (from bridge_core/telegram.py):
+  telegram-sender <chat_id> [--reply-to <id>] [--keyboard]
+      send the reply text on stdin. On confirmed acceptance, exit 0
+      with the exact Telegram message_id as the last nonempty stdout
+      line. Any failure exits nonzero and prints nothing usable as a
+      message_id. --reply-to threads the reply under that message.
+      --keyboard attaches the inline command keyboard.
+  telegram-sender --photo <chat_id> <file_path> [--reply-to <id>] [--keyboard]
+      send a photo (sendPhoto) with the caption on stdin (optional,
+      may be empty, max 1024 characters). The file must exist and be
+      at most 10MB. Same exit contract as the text send.
+  telegram-sender --document <chat_id> <file_path> [--reply-to <id>] [--keyboard]
+      send a file (sendDocument), same shape as --photo, at most 50MB.
+  telegram-sender --typing <chat_id>  show "typing..." in the chat
+      (sendChatAction). Free, costs no tokens. Expires after 5
+      seconds, so re-run it every few seconds during a long turn.
+      Exit 0 on success, nonzero on failure. Reads no stdin.
+  telegram-sender --react <chat_id> <message_id> <emoji>
+      set an emoji reaction on a message (setMessageReaction).
+      Best effort: a failure never blocks the reply that follows.
+      Exit 0 on success, nonzero on failure. Reads no stdin.
+  telegram-sender --register-commands <chat_id>
+      register the command menu (setMyCommands) scoped to one
+      private chat only, so the commands appear in the Telegram UI
+      when the owner types "/" in the DM but are not advertised in
+      the group. Exit 0 on success, nonzero on failure.
+
+Formatting: replies are sent with parse_mode=HTML. The text is
+sanitized first (& < > escaped, except for a small allowlist of
+formatting tags the agent may use: <b> <i> <u> <s> <code> <pre>
+and <a href="http(s)://...">), so stray markup can never break the
+send. If Telegram still rejects the send with a 400 (bad formatting
+or a stale reply target), the sender retries as plain text, then as
+plain text without threading, so a formatting failure never strands
+a reply. Only a 400 is retried: any other failure may mean the send
+went out, so it is never retried.
+
+Never prints credentials: the bot token is a surrogate fetched at
+runtime, swapped for the real token by the egress layer on approved
+requests to api.telegram.org.
+"""
+import json
+import mimetypes
+import os
+import re
+import secrets
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
+from dynamic_credentials import (
+    DynamicCredentialError,
+    dynamic_credential_entry,
+)
+
+CREDENTIAL = "custom.telegram-muse-bot"
+API_HOST = "api.telegram.org"
+
+#: callback_data values for the inline command keyboard. Must match
+#: bridge_core.telegram.CALLBACK_PREFIX / CALLBACK_COMMANDS: a tap
+#: becomes the matching typed command ("/pause", "/resume", ...).
+COMMAND_BUTTONS = [
+    ("Pause", "cmd:pause"),
+    ("Resume", "cmd:resume"),
+    ("Status", "cmd:status"),
+    ("Help", "cmd:help"),
+    ("Who", "cmd:who"),
+    ("Active", "cmd:active"),
+]
+
+#: Commands registered by --register-commands, with the short
+#: descriptions Telegram shows in the "/" menu.
+BOT_COMMANDS = [
+    ("pause", "Pause the bot (owner / group admin only)"),
+    ("resume", "Resume the bot and answer held messages"),
+    ("status", "Show whether the bot is paused and what is waiting"),
+    ("help", "List the bot commands"),
+    ("who", "Who this bot is"),
+    ("active", "Who has been active in the group recently"),
+    ("menu", "Show the command buttons"),
+]
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        raise RuntimeError("redirect refused, verify the endpoint")
+
+
+def _surrogate():
+    """The raw credential surrogate for the Telegram URL. Raises
+    DynamicCredentialError when unavailable."""
+    entry = dynamic_credential_entry(CREDENTIAL)
+    return str(entry["surrogate"]).strip()
+
+
+def _post(method, payload):
+    """POST one Bot API method. Returns the decoded JSON body.
+    Raises on transport or HTTP failure. Never prints the surrogate."""
+    surrogate = _surrogate()
+    # Build the URL with the raw surrogate, exactly like the bridge intake
+    # does. url_with_surrogate_path_segment percent-encodes it, and the
+    # encoded form is not substituted, so Telegram rejects the call with
+    # a 404. Verified 2026-11-11: quoted form got 404, raw form got 400
+    # for a bad chat, which proves the token was accepted.
+    url = f"https://api.telegram.org/bot{surrogate}/{method}"
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+#: Formatting tags the agent may use in a reply. Everything else
+#: that looks like markup is escaped, so it can never break the send.
+_TAG_RE = re.compile(r"<(/?)(b|i|u|s|code|pre)>", re.IGNORECASE)
+_LINK_OPEN_RE = re.compile(r'<a\s+href="(https?://[^"<\s]+)">', re.IGNORECASE)
+_LINK_CLOSE_RE = re.compile(r"</a>", re.IGNORECASE)
+
+
+def _sanitize_html(text):
+    """Escape a reply for parse_mode=HTML.
+
+    & < > are escaped, except for the allowlisted formatting tags
+    (<b> <i> <u> <s> <code> <pre> and <a href="http(s)://...">),
+    which are protected with placeholders while the rest is escaped
+    and then restored. A stray "<" (for example "a < b") becomes
+    "&lt;", so it can never break the send."""
+    placeholders = {}
+
+    def protect(match):
+        key = "\x00%d\x00" % len(placeholders)
+        placeholders[key] = match.group(0)
+        return key
+
+    protected = _TAG_RE.sub(protect, text)
+    protected = _LINK_OPEN_RE.sub(protect, protected)
+    protected = _LINK_CLOSE_RE.sub(protect, protected)
+    protected = (
+        protected.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    for key, tag in placeholders.items():
+        protected = protected.replace(key, tag)
+    return protected
+
+
+def _command_keyboard():
+    """Inline keyboard for the command buttons: two rows of three.
+    callback_data is "cmd:<command>", which the bridge turns into
+    the matching typed command."""
+    rows = []
+    row = []
+    for label, data in COMMAND_BUTTONS:
+        row.append({"text": label, "callback_data": data})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return {"inline_keyboard": rows}
+
+
+def send_message(chat_id, text, reply_to=None, keyboard=False):
+    """Send one message. Returns the Telegram message_id, or None when
+    Telegram rejected it (the error is printed to stderr).
+
+    Attempts, in order (only a 400 is retried — a definitive
+    rejection, so the send provably did not go out; any other failure
+    may mean it did, so it is never retried):
+      1. HTML (sanitized) + reply threading + keyboard.
+      2. Plain text + reply threading + keyboard.
+      3. Plain text, no threading (the reply target may be gone).
+    """
+    attempts = []
+    html = {"chat_id": chat_id, "text": _sanitize_html(text), "parse_mode": "HTML"}
+    plain = {"chat_id": chat_id, "text": text}
+    if reply_to is not None:
+        html["reply_to_message_id"] = reply_to
+        plain["reply_to_message_id"] = reply_to
+    if keyboard:
+        html["reply_markup"] = _command_keyboard()
+        plain["reply_markup"] = _command_keyboard()
+    attempts.append(html)
+    attempts.append(dict(plain))
+    no_thread = {"chat_id": chat_id, "text": text}
+    if keyboard:
+        no_thread["reply_markup"] = _command_keyboard()
+    attempts.append(no_thread)
+    # Dedupe (when there is no reply target, attempts 2 and 3 are identical).
+    seen = set()
+    unique = []
+    for payload in attempts:
+        key = json.dumps(payload, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            unique.append(payload)
+    for payload in unique:
+        try:
+            body = _post("sendMessage", payload)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 400:
+                continue
+            raise
+        if not body.get("ok"):
+            print(
+                f"telegram error: {body.get('description', 'unknown')}",
+                file=sys.stderr,
+            )
+            return None
+        message_id = body.get("result", {}).get("message_id")
+        if message_id is None:
+            print("telegram response had no message_id", file=sys.stderr)
+            return None
+        return message_id
+    print("telegram error: all send attempts rejected (400)", file=sys.stderr)
+    return None
+
+
+def _post_multipart(method, fields, file_field, filename, data, content_type):
+    """POST one Bot API method with a multipart/form-data body (one
+    file part plus string fields). Returns the decoded JSON body.
+    Raises on transport or HTTP failure. Never prints the surrogate.
+    The filename is stripped of quotes and line breaks so it can
+    never break out of the part header."""
+    boundary = "----musebridge" + secrets.token_hex(16)
+    safe_name = str(filename).replace('"', "_").replace("\r", "_").replace("\n", "_")
+    parts = []
+    for key, value in fields.items():
+        parts.append(f"--{boundary}".encode())
+        parts.append(
+            f'Content-Disposition: form-data; name="{key}"'.encode()
+        )
+        parts.append(b"")
+        parts.append(str(value).encode("utf-8"))
+    parts.append(f"--{boundary}".encode())
+    parts.append(
+        f'Content-Disposition: form-data; name="{file_field}"; '
+        f'filename="{safe_name}"'.encode()
+    )
+    parts.append(f"Content-Type: {content_type}".encode())
+    parts.append(b"")
+    parts.append(data)
+    parts.append(f"--{boundary}--".encode())
+    parts.append(b"")
+    body = b"\r\n".join(parts)
+    surrogate = _surrogate()
+    url = f"https://api.telegram.org/bot{surrogate}/{method}"
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+#: Outbound size caps (bytes): Telegram's Bot API caps sendPhoto at
+#: 10MB and sendDocument at 50MB.
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+
+#: Maximum caption length (characters) for a photo/document send.
+MAX_CAPTION_CHARS = 1024
+
+
+def _send_media(method, file_field, chat_id, path, caption="",
+                reply_to=None, keyboard=False, max_bytes=MAX_DOCUMENT_BYTES):
+    """Send one photo or document. Returns the Telegram message_id,
+    or None when Telegram rejected it (the error is printed to
+    stderr).
+
+    The file is read once and sent with the same retry chain as a
+    text send (only a 400 is retried — a definitive rejection, so
+    the send provably did not go out; any other failure may mean
+    it did, so it is never retried):
+      1. HTML caption (sanitized) + reply threading + keyboard.
+      2. Plain caption + reply threading + keyboard.
+      3. Plain caption, no threading (the reply target may be gone).
+    An empty caption sends with no caption at all. A file over
+    max_bytes, or one that cannot be read, returns None without
+    any API call.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        print(f"cannot read media file: {exc}", file=sys.stderr)
+        return None
+    if size > max_bytes:
+        print(
+            f"media file is {size} bytes, over the {max_bytes} byte cap",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        print(f"cannot read media file: {exc}", file=sys.stderr)
+        return None
+    filename = os.path.basename(path) or "file"
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    attempts = []
+    if caption:
+        html = {"chat_id": chat_id, "caption": _sanitize_html(caption),
+                "parse_mode": "HTML"}
+        plain = {"chat_id": chat_id, "caption": caption}
+    else:
+        html = {"chat_id": chat_id}
+        plain = {"chat_id": chat_id}
+    if reply_to is not None:
+        html["reply_to_message_id"] = reply_to
+        plain["reply_to_message_id"] = reply_to
+    if keyboard:
+        markup = json.dumps(_command_keyboard())
+        html["reply_markup"] = markup
+        plain["reply_markup"] = markup
+    attempts.append(html)
+    attempts.append(dict(plain))
+    no_thread = dict(plain)
+    no_thread.pop("reply_to_message_id", None)
+    attempts.append(no_thread)
+    # Dedupe (when there is no reply target, attempts 2 and 3 are identical).
+    seen = set()
+    unique = []
+    for fields in attempts:
+        key = json.dumps(fields, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            unique.append(fields)
+    for fields in unique:
+        try:
+            body = _post_multipart(
+                method, fields, file_field, filename, data, content_type
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code == 400:
+                continue
+            raise
+        if not body.get("ok"):
+            print(
+                f"telegram error: {body.get('description', 'unknown')}",
+                file=sys.stderr,
+            )
+            return None
+        message_id = body.get("result", {}).get("message_id")
+        if message_id is None:
+            print("telegram response had no message_id", file=sys.stderr)
+            return None
+        return message_id
+    print("telegram error: all send attempts rejected (400)", file=sys.stderr)
+    return None
+
+
+def send_photo(chat_id, path, caption="", reply_to=None, keyboard=False):
+    """Send a photo (sendPhoto). Returns the Telegram message_id or None."""
+    return _send_media(
+        "sendPhoto", "photo", chat_id, path, caption=caption,
+        reply_to=reply_to, keyboard=keyboard, max_bytes=MAX_PHOTO_BYTES,
+    )
+
+
+def send_document(chat_id, path, caption="", reply_to=None, keyboard=False):
+    """Send a file (sendDocument). Returns the Telegram message_id or None."""
+    return _send_media(
+        "sendDocument", "document", chat_id, path, caption=caption,
+        reply_to=reply_to, keyboard=keyboard, max_bytes=MAX_DOCUMENT_BYTES,
+    )
+
+
+def send_typing(chat_id):
+    """Show "typing..." in the chat (sendChatAction). Returns True when
+    Telegram accepted it. Free, costs no tokens, expires after 5s."""
+    body = _post("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+    return bool(body.get("ok"))
+
+
+def send_reaction(chat_id, message_id, emoji):
+    """Set an emoji reaction on a message (setMessageReaction).
+    Returns True when Telegram accepted it. Best effort: the caller
+    sends the reply either way, so a failed reaction never blocks it."""
+    body = _post(
+        "setMessageReaction",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": [{"type": "emoji", "emoji": emoji}],
+        },
+    )
+    return bool(body.get("ok"))
+
+
+def register_commands(chat_id):
+    """Register the command menu, scoped to one private chat only
+    (BotCommandScopeChat), so the commands appear in the Telegram UI
+    when the owner types "/" in the DM but are not advertised in the
+    group. Returns True when Telegram accepted it."""
+    commands = [
+        {"command": name, "description": desc} for name, desc in BOT_COMMANDS
+    ]
+    body = _post(
+        "setMyCommands",
+        {
+            "commands": commands,
+            "scope": {"type": "chat", "chat_id": chat_id},
+        },
+    )
+    return bool(body.get("ok"))
+
+
+def _int_arg(value, name):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        print(f"invalid {name}", file=sys.stderr)
+        return None
+
+
+def _run_api_call(fn, *args):
+    """Run one Bot API call, mapping credential/transport failures to
+    exit 1. Returns 0 on success, 1 on failure."""
+    try:
+        ok = fn(*args)
+    except DynamicCredentialError as exc:
+        print(f"credential unavailable: {exc}", file=sys.stderr)
+        return 1
+    except urllib.error.HTTPError as exc:
+        print(f"telegram HTTP {exc.code}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - any API failure is a plain failure
+        print(f"telegram call failed: {exc}", file=sys.stderr)
+        return 1
+    return 0 if ok else 1
+
+
+def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--typing":
+        chat_id = _int_arg(sys.argv[2], "chat_id")
+        if chat_id is None:
+            return 2
+        return _run_api_call(send_typing, chat_id)
+    if len(sys.argv) == 5 and sys.argv[1] == "--react":
+        chat_id = _int_arg(sys.argv[2], "chat_id")
+        message_id = _int_arg(sys.argv[3], "message_id")
+        emoji = sys.argv[4]
+        if chat_id is None or message_id is None or not emoji.strip():
+            print("usage: telegram-sender --react <chat_id> <message_id> <emoji>",
+                  file=sys.stderr)
+            return 2
+        return _run_api_call(send_reaction, chat_id, message_id, emoji)
+    if len(sys.argv) == 3 and sys.argv[1] == "--register-commands":
+        chat_id = _int_arg(sys.argv[2], "chat_id")
+        if chat_id is None:
+            return 2
+        return _run_api_call(register_commands, chat_id)
+    if len(sys.argv) >= 4 and sys.argv[1] in ("--photo", "--document"):
+        kind = sys.argv[1][2:]
+        chat_id = _int_arg(sys.argv[2], "chat_id")
+        file_path = sys.argv[3]
+        if chat_id is None:
+            return 2
+        reply_to = None
+        keyboard = False
+        rest = sys.argv[4:]
+        index = 0
+        while index < len(rest):
+            if rest[index] == "--keyboard":
+                keyboard = True
+                index += 1
+            elif rest[index] == "--reply-to" and index + 1 < len(rest):
+                reply_to = _int_arg(rest[index + 1], "reply_to_message_id")
+                if reply_to is None:
+                    return 2
+                index += 2
+            else:
+                print(f"unknown argument: {rest[index]}", file=sys.stderr)
+                return 2
+        caption = sys.stdin.read().strip()
+        if len(caption) > MAX_CAPTION_CHARS:
+            print(
+                f"caption must be 0-{MAX_CAPTION_CHARS} characters",
+                file=sys.stderr,
+            )
+            return 2
+        if not os.path.isfile(file_path):
+            print(f"media file not found: {file_path}", file=sys.stderr)
+            return 2
+        send_fn = send_photo if kind == "photo" else send_document
+        try:
+            message_id = send_fn(
+                chat_id, file_path, caption=caption,
+                reply_to=reply_to, keyboard=keyboard,
+            )
+        except DynamicCredentialError as exc:
+            print(f"credential unavailable: {exc}", file=sys.stderr)
+            return 1
+        except urllib.error.HTTPError as exc:
+            print(f"telegram HTTP {exc.code}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001 - any send failure is "unknown" upstream
+            print(f"send failed: {exc}", file=sys.stderr)
+            return 1
+        if message_id is None:
+            return 1
+        print(message_id)
+        return 0
+    if len(sys.argv) < 2 or sys.argv[1].startswith("--"):
+        print(
+            "usage: telegram-sender <chat_id> [--reply-to <id>] [--keyboard] | "
+            "telegram-sender --typing <chat_id> | "
+            "telegram-sender --react <chat_id> <message_id> <emoji> | "
+            "telegram-sender --register-commands <chat_id> | "
+            "telegram-sender --photo <chat_id> <file_path> [--reply-to <id>] [--keyboard] | "
+            "telegram-sender --document <chat_id> <file_path> [--reply-to <id>] [--keyboard]",
+            file=sys.stderr,
+        )
+        return 2
+    chat_id = _int_arg(sys.argv[1], "chat_id")
+    if chat_id is None:
+        return 2
+    reply_to = None
+    keyboard = False
+    rest = sys.argv[2:]
+    index = 0
+    while index < len(rest):
+        if rest[index] == "--keyboard":
+            keyboard = True
+            index += 1
+        elif rest[index] == "--reply-to" and index + 1 < len(rest):
+            reply_to = _int_arg(rest[index + 1], "reply_to_message_id")
+            if reply_to is None:
+                return 2
+            index += 2
+        else:
+            print(f"unknown argument: {rest[index]}", file=sys.stderr)
+            return 2
+    text = sys.stdin.read()
+    if not text.strip() or len(text) > 4096:
+        print("reply text must be 1-4096 characters", file=sys.stderr)
+        return 2
+    try:
+        message_id = send_message(chat_id, text, reply_to=reply_to, keyboard=keyboard)
+    except DynamicCredentialError as exc:
+        print(f"credential unavailable: {exc}", file=sys.stderr)
+        return 1
+    except urllib.error.HTTPError as exc:
+        print(f"telegram HTTP {exc.code}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - any send failure is "unknown" upstream
+        print(f"send failed: {exc}", file=sys.stderr)
+        return 1
+    if message_id is None:
+        return 1
+    print(message_id)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

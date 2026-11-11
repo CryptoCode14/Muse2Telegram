@@ -1,0 +1,5 @@
+# Telegram runtime dependencies.
+#
+# The bridge uses only the Python standard library — no third-party
+# packages are needed. Keep this file so `pip install -r
+# requirements.txt` succeeds as a no-op during setup.
