@@ -118,6 +118,9 @@ muse-runtime/
   hooks/
     telegram-bridge-intake.sh   the hook script (polls, decides, wakes)
     telegram-bridge-decide.py   the router (wake / hold / done + tiers)
+    telegram-bridge-watchdog.sh the queue watchdog (recycles dead claims)
+    telegram-bridge-watchdog.json
+                                the watchdog hook definition (120s poll)
   prompts/
     router.md         the hook-definition prompt (tiny router)
     tier-quick.md     quick tier prompt (simple chat)
@@ -152,6 +155,17 @@ Copy the pieces to where they live on this host. Use these exact paths
 - Hook script and decider: copy `muse-runtime/hooks/telegram-bridge-intake.sh`
   and `muse-runtime/hooks/telegram-bridge-decide.py` to the hooks scripts
   folder (e.g. `~/hooks/scripts/`). Make them executable.
+- Watchdog: copy `muse-runtime/hooks/telegram-bridge-watchdog.sh` to the
+  hooks scripts folder and make it executable, and copy
+  `muse-runtime/hooks/telegram-bridge-watchdog.json` to the hooks
+  definitions folder (e.g. `~/hooks/definitions/`). It polls every
+  120 seconds and recycles claimed items whose heartbeat went stale
+  (a turn that died mid-work) back to pending, so the intake's next
+  poll re-claims and re-wakes them. It never sends a Telegram
+  message, never closes work, and never touches "sending" items. It
+  is silent on health and on successful repair, and wakes an agent
+  only when the sweep itself fails. To stop it sweeping by hand,
+  create `~/workspace/telegram-bridge/WATCHDOG_PAUSE`.
 - Prompts: copy `muse-runtime/prompts/tier-quick.md`,
   `tier-standard.md`, and `tier-deep.md` to the prompts folder
   (e.g. `~/hooks/prompts/`).
@@ -356,6 +370,15 @@ keeps it small and the tier files carry the detail.
 
 **Done looks like:** the hook is enabled, polling every 5s, and a dry
 run (no messages waiting) exits silently.
+
+Also install the queue watchdog hook from
+`muse-runtime/hooks/telegram-bridge-watchdog.json` (poll every **120
+seconds**). It recycles claimed items whose heartbeat went stale — a
+turn that died mid-work — back to pending, so the intake's next poll
+re-claims and re-wakes them. It never sends a Telegram message and
+wakes an agent only when the sweep itself fails. **Done looks like:**
+the hook is enabled, polling every 120s, and a dry run exits silently
+with a healthy sweep report.
 
 ## Step 11 — Test it live
 

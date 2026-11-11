@@ -24,6 +24,7 @@ Commands:
 Work from ~/workspace/muse-agent-bridge-eval with TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json and TELEGRAM_BRIDGE_SEND_CMD=~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender.
 
 Sending (the only tool you use):
+- Heartbeat first: .venv/bin/python -m bridge_core.telegram --heartbeat CLAIM_TOKEN. It keeps your claim alive while you work; without it the bridge hands the batch to another turn after 2 minutes of silence.
 - ONE reply for the whole batch. Write it to ~/workspace/telegram-bridge/reply-<update_id>.txt, then send it with one call (fences, sends, records, closes):
   Multi-item batch: .venv/bin/python -m bridge_core.telegram --send-batch-and-close PRIMARY_UPDATE_ID CLAIM_TOKEN CHAT_ID [REPLY_TO_MESSAGE_ID] [--keyboard] [--cover OTHER_UPDATE_ID ...] < ~/workspace/telegram-bridge/reply-<update_id>.txt
   Single item: .venv/bin/python -m bridge_core.telegram --send-and-close UPDATE_ID CLAIM_TOKEN CHAT_ID [REPLY_TO_MESSAGE_ID] [--keyboard] < ~/workspace/telegram-bridge/reply-<update_id>.txt

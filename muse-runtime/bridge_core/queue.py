@@ -36,11 +36,16 @@ Claim discipline (the rules that keep wake turns from double-answering):
   alone never closes such an item: the outcome is unknown, so the
   close must cite evidence, stored as ``done_evidence`` (kept
   separate from the optional ``done_reason`` context).
-- Stale recycle applies only to unreplied ``claimed`` items older than
-  the TTL (default 1800s): a wake turn that died before sending must
-  not block the queue forever, but a slow turn is never raced by a
-  second claim. After a recycle the old batch token no longer matches,
-  so the stale turn's late transition calls are all rejected.
+- Stale recycle applies only to unreplied ``claimed`` items whose
+  heartbeat is stale (see ``HEARTBEAT_STALE_SECONDS``): a wake turn
+  that died before sending must not block the queue forever, but a
+  slow turn is never raced by a second claim. The heartbeat is the
+  fast path — a dead turn's claim recycles about two minutes after
+  its last heartbeat, not after the full stale TTL. The TTL
+  (default 1800s) survives only as a backstop for items whose
+  heartbeat was never recorded. After a recycle the old batch token
+  no longer matches, so the stale turn's late transition calls are
+  all rejected.
 - Unclaimed ``pending`` items are not kept forever either: before any
   claim, a sweep expires old ordinary conversation instead of waking
   a turn for it — a turn answering hours-old room chatter only
@@ -79,6 +84,19 @@ import time
 
 DEFAULT_BATCH_SIZE = 5
 DEFAULT_STALE_TTL = 1800.0
+
+#: Seconds without a heartbeat after which a claimed item counts as
+#: abandoned. The batch agent refreshes its heartbeat while it
+#: works (see ``heartbeat`` / ``heartbeat_batch``); a claim whose
+#: heartbeat is older than this is recycled on the next claim, so a
+#: turn that died mid-work blocks its lane for about two minutes
+#: instead of the full stale TTL. 120s: twice the worst observed
+#: wake latency (spawn + first action, ~60s), 24x the intake poll
+#: interval (5s), and short enough that the owner waits minutes,
+#: not half an hour, for a retry. A live turn heartbeats at least
+#: once a minute (wake prompt + automatic refresh on ack /
+#: claim-more), so it never trips this.
+HEARTBEAT_STALE_SECONDS = 120.0
 
 #: Default age (seconds since intake) after which an unclaimed
 #: group/supergroup item is expired by the claim-time sweep instead
@@ -206,6 +224,12 @@ def enqueue(
         "status": PENDING,
         "claimed_at": None,
         "claim_token": None,
+        # Liveness proof for the claim (see HEARTBEAT_STALE_SECONDS):
+        # set at claim time, refreshed by the owning turn while it
+        # works. A claimed item whose heartbeat goes stale is
+        # recycled fast; an item that never recorded one falls back
+        # to the claimed_at TTL. None until the first claim.
+        "heartbeat_at": None,
         "sending_at": None,
         "replied_at": None,
         "reply_message_id": None,
@@ -222,24 +246,48 @@ def enqueue(
     return item
 
 
-def _recycle_stale(state: dict, stale_ttl: float, now: float) -> None:
+def _recycle_stale(
+    state: dict,
+    stale_ttl: float,
+    now: float,
+    heartbeat_stale: float = HEARTBEAT_STALE_SECONDS,
+) -> list:
     # Only CLAIMED items are candidates. SENDING items are excluded by
     # construction: their send outcome is unknown, so they must never
     # be recycled into a possible duplicate send. Replied items are
     # excluded too — the reply already went out.
+    #
+    # Two rules, in order. When a heartbeat was recorded, ONLY the
+    # heartbeat decides: a turn that stops refreshing it is dead,
+    # however recent its claim is — and a live long turn that keeps
+    # refreshing it is never recycled for its claimed_at age alone.
+    # When no heartbeat was ever recorded (an item claimed before
+    # heartbeats existed, or by a turn that never sent one), the
+    # claimed_at TTL is the backstop. Returns the recycled items.
+    recycled = []
     for item in state["queue"]:
         if (
             item["status"] == CLAIMED
             and item["replied_at"] is None
             and item["claimed_at"] is not None
-            and now - item["claimed_at"] > stale_ttl
         ):
+            heartbeat_at = item.get("heartbeat_at")
+            stale = False
+            if heartbeat_at is not None:
+                stale = now - heartbeat_at > heartbeat_stale
+            else:
+                stale = now - item["claimed_at"] > stale_ttl
+            if not stale:
+                continue
             item["status"] = PENDING
             item["claimed_at"] = None
             item["claim_token"] = None
+            item["heartbeat_at"] = None
             # ever_claimed deliberately survives the recycle: the
             # claim history is what keeps a recycled item out of the
             # first-pending expiry sweep on every later poll.
+            recycled.append(item)
+    return recycled
 
 
 def pending_ttl(
@@ -362,6 +410,7 @@ def claim_batch(
     platform: str | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     stale_ttl: float = DEFAULT_STALE_TTL,
+    heartbeat_stale: float = HEARTBEAT_STALE_SECONDS,
     group_pending_ttl: float | None = DEFAULT_GROUP_PENDING_TTL,
     private_pending_ttl: float | None = None,
     now: float | None = None,
@@ -410,7 +459,7 @@ def claim_batch(
         private_ttl=private_pending_ttl,
         now=now,
     )
-    _recycle_stale(state, stale_ttl, now)
+    _recycle_stale(state, stale_ttl, now, heartbeat_stale=heartbeat_stale)
     pending = [
         item
         for item in state["queue"]
@@ -450,6 +499,7 @@ def claim_batch(
         item["status"] = CLAIMED
         item["claimed_at"] = now
         item["claim_token"] = token
+        item["heartbeat_at"] = now
         item["ever_claimed"] = True
     return {"claim_token": token, "items": batch}
 
@@ -505,8 +555,91 @@ def claim_more(
         item["status"] = CLAIMED
         item["claimed_at"] = now
         item["claim_token"] = token
+        item["heartbeat_at"] = now
         item["ever_claimed"] = True
     return {"claim_token": token, "items": batch}
+
+
+def heartbeat(
+    state: dict, platform: str, external_id, token, *, now: float | None = None
+) -> bool:
+    """Refresh one claimed item's heartbeat: proof its turn is alive.
+
+    Only the token that owns the claim may heartbeat it, and only
+    while the item is still ``claimed`` with no reply recorded. A
+    stale token (recycled batch) or a replied / sending item gets
+    False and changes nothing. The turn heartbeats while it works
+    (wake prompt: first thing, and before any step that may take
+    over a minute); the ack and claim-more paths refresh it too.
+    """
+    item = _owned_item(state, platform, external_id, token, (CLAIMED,))
+    if item is None:
+        return False
+    if item["replied_at"] is not None:
+        return False
+    item["heartbeat_at"] = _now(now)
+    return True
+
+
+def heartbeat_batch(state: dict, token, *, now: float | None = None) -> int:
+    """Refresh the heartbeat of every claimed, unreplied item under
+    one batch token. One call keeps a whole batch alive, so the turn
+    heartbeats its batch with a single command instead of one call
+    per item. Items under another token, replied items, and
+    ``sending`` items are untouched. Returns how many items were
+    refreshed (0 when the caller owns no live batch).
+    """
+    if token is None:
+        return 0
+    now = _now(now)
+    refreshed = 0
+    for item in state.get("queue", []):
+        if (
+            item["status"] == CLAIMED
+            and item.get("claim_token") == token
+            and item["replied_at"] is None
+        ):
+            item["heartbeat_at"] = now
+            refreshed += 1
+    return refreshed
+
+
+def watchdog_sweep(
+    state: dict,
+    *,
+    heartbeat_stale: float = HEARTBEAT_STALE_SECONDS,
+    stale_ttl: float = DEFAULT_STALE_TTL,
+    now: float | None = None,
+) -> dict:
+    """One watchdog pass: recycle dead claims, report queue health.
+
+    The sweep runs the same stale-claim rule as ``claim_batch``
+    (heartbeat first, claimed_at TTL as backstop for items that
+    never recorded one) and counts what it found. It NEVER touches
+    ``sending`` items (their send outcome is unknown — only an
+    operator reconciles those), replied items, or claims whose
+    heartbeat is still fresh. Recycled items return to ``pending``
+    with their token cleared, so the intake's next poll re-claims
+    and re-wakes them — the watchdog itself never sends anything
+    and never wakes an agent; waking is the intake's job once the
+    lane is free again.
+
+    Returns ``{"recycled": [external_id, ...], "pending": n,
+    "claimed_live": n, "sending": n}`` — counts taken after the
+    recycle, so ``pending`` includes the items just freed.
+    """
+    ensure_state(state)
+    now = _now(now)
+    recycled = _recycle_stale(
+        state, stale_ttl, now, heartbeat_stale=heartbeat_stale
+    )
+    counts_now = counts(state)
+    return {
+        "recycled": [item["external_id"] for item in recycled],
+        "pending": counts_now[PENDING],
+        "claimed_live": counts_now[CLAIMED],
+        "sending": counts_now[SENDING],
+    }
 
 
 def _owned_item(

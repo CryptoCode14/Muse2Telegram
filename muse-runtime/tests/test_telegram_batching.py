@@ -526,7 +526,10 @@ class BatchReplyTests(unittest.TestCase):
         )
         store = JsonStateStore(self.path)
         with store.transaction() as state:
-            queue_core.find_item(state, "telegram", 1)["received_at"] -= 7200
+            # 25 hours old: past the claimed-work limit (a day), so
+            # the covered item is stale even though claimed work
+            # gets the longer limit.
+            queue_core.find_item(state, "telegram", 1)["received_at"] -= 90000
         cmd = self.write_send_cmd()
         with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: cmd}):
             result = run_cli(

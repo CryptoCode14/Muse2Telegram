@@ -57,6 +57,7 @@ Commands:
 
 Replying:
 - Short and direct, in [USER]'s voice; answer first, then details. No em dashes, no arrow bullets. Bold (<b>...</b>) sparingly, key facts/numbers only.
+- Heartbeat first: the moment you decide to work this batch, refresh your claim's heartbeat: .venv/bin/python -m bridge_core.telegram --heartbeat CLAIM_TOKEN. Heartbeat again before any step that may take over a minute, and after each long step. If your heartbeat goes stale for 2 minutes the bridge assumes your turn died and hands the batch to another turn, so heartbeat to keep your work. The ack and --claim-more refresh it automatically.
 - ONE reply for the whole batch: when the payload has several items, answer ALL of them in a single reply, not one reply per message. Before sending, re-check for messages that arrived while you were thinking: .venv/bin/python -m bridge_core.telegram --claim-more CHAT_ID CLAIM_TOKEN. If it returns new items, fold them into the same reply and cover them too.
 - NEVER paste reply text into a shell command. Write it to ~/workspace/telegram-bridge/reply-<update_id>.txt, then send it with one call (fences, sends, records, closes):
   Multi-item batch: .venv/bin/python -m bridge_core.telegram --send-batch-and-close PRIMARY_UPDATE_ID CLAIM_TOKEN CHAT_ID [REPLY_TO_MESSAGE_ID] [--keyboard] [--cover OTHER_UPDATE_ID ...] < ~/workspace/telegram-bridge/reply-<update_id>.txt

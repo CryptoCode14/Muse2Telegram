@@ -539,6 +539,10 @@ class QueueTests(unittest.TestCase):
         )
         self.assertEqual(item["status"], queue_core.PENDING)
         self.assertEqual(item["claim_token"], token)
+        # The "other" turn is alive: heartbeat it, or the 1000s
+        # jump to the next claim would recycle its claim as stale
+        # (heartbeat horizon 120s) and re-claim it below.
+        queue_core.heartbeat_batch(state, nxt["claim_token"], now=2950.0)
         # And with only the replied item left pending, nothing claims.
         self.assertIsNone(queue_core.claim_batch(state, platform="telegram", now=3000.0))
 

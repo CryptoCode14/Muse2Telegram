@@ -80,13 +80,15 @@ class TelegramSendValidationTests(unittest.TestCase):
 
     def test_stale_item_is_refused_and_claim_preserved_without_sending(self):
         """Issue #17, review finding 1: a claimed item older than
-        the maximum reply age is refused at the fence with stage
-        "stale" and the send command is never invoked — but the
-        fence does NOT close the work. This item is a private
-        (owner DM) request: it stays claimed under the caller's
-        token, with no done marking, preserved for reassessment."""
+        the maximum reply age for claimed work (a day — claimed
+        work is unfinished work the owner is waiting on, not stale
+        chatter) is refused at the fence with stage "stale" and the
+        send command is never invoked — but the fence does NOT close
+        the work. This item is a private (owner DM) request: it
+        stays claimed under the caller's token, with no done
+        marking, preserved for reassessment."""
         with self.store.transaction() as state:
-            queue_core.find_item(state, "telegram", 101)["received_at"] -= 7200
+            queue_core.find_item(state, "telegram", 101)["received_at"] -= 90000
         result, sender = self.fenced("123456789")
         self.assertEqual(result, {"ok": False, "stage": "stale"})
         sender.assert_not_called()
@@ -99,8 +101,9 @@ class TelegramSendValidationTests(unittest.TestCase):
 
     def test_stale_group_item_is_preserved_for_reassessment(self):
         """Finding 1 for group work: a long-running claimed group
-        item past the maximum reply age is refused as stale, and
-        likewise stays claimed and unclosed — never done/expired."""
+        item past the maximum reply age for claimed work (a day)
+        is refused as stale, and likewise stays claimed and
+        unclosed — never done/expired."""
         store = JsonStateStore(Path(self.temp.name) / "group-state.json")
         with store.transaction() as state:
             queue_core.enqueue(
@@ -114,7 +117,7 @@ class TelegramSendValidationTests(unittest.TestCase):
             ]
             queue_core.find_item(state, "telegram", 202)[
                 "received_at"
-            ] -= 7200
+            ] -= 90000
         with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
             with mock.patch.object(telegram, "_run_send_command") as sender:
                 result = telegram.send_fenced(

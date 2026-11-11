@@ -85,6 +85,30 @@ Keeps the operational interface the wake hook drives:
                            nothing new arrived). Only the token that
                            owns the lane's in-flight batch may claim
                            more; anyone else gets an empty list.
+                           Claiming more also refreshes the batch
+                           heartbeat (the turn is alive).
+  --heartbeat CLAIM_TOKEN  refresh the heartbeat of every claimed
+                           item under the token: the owning turn's
+                           proof it is still alive and working.
+                           Prints {"ok": true, "heartbeated": n}, or
+                           {"ok": false, "stage": "fence"} when the
+                           token owns no live batch. The turn calls
+                           this first thing after waking and before
+                           any step that may take over a minute; a
+                           claim whose heartbeat goes stale for
+                           120s (TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS)
+                           is recycled on the next claim, so a turn
+                           that died mid-work blocks its lane for
+                           minutes, not half an hour.
+  --watchdog               one watchdog pass: recycle claimed items
+                           whose heartbeat went stale (a turn that
+                           died mid-work) back to pending, and print
+                           the sweep report JSON. Never touches
+                           sending / replied / live claims, never
+                           sends anything. The watchdog hook calls
+                           this every few minutes; the intake's next
+                           poll re-claims and re-wakes anything
+                           recycled here.
   --send-batch-and-close PRIMARY_ID TOKEN CHAT_ID
                            [REPLY_TO_MESSAGE_ID] [--keyboard]
                            [--cover UPDATE_ID ...]
@@ -290,7 +314,13 @@ messages from groups that are not adopted. Each adopted group has
 its own mode, allowlist status, trip, admin list, member count,
 and room buffer, so nothing leaks between groups.
 Batch size and stale TTL can be tuned with ``$TELEGRAM_BRIDGE_BATCH_SIZE``
-and ``$TELEGRAM_BRIDGE_STALE_TTL`` (seconds). The settle window before
+and ``$TELEGRAM_BRIDGE_STALE_TTL`` (seconds). The heartbeat horizon —
+how long a claim may go without a heartbeat before it counts as
+abandoned — is ``$TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS`` (default
+120): the owning turn heartbeats while it works (``--heartbeat``,
+plus automatic refresh on ack / claim-more), and a claim whose
+heartbeat goes stale is recycled on the next claim instead of
+blocking its lane for the full stale TTL. The settle window before
 a freshly arrived batch is claimed is ``$TELEGRAM_BRIDGE_SETTLE_SECONDS``
 (default 0, off; the hook sets 2): the intake waits out the window
 and re-fetches once so a rapid follow-up joins the same batch.
@@ -376,6 +406,22 @@ MAX_REPLY_AGE_ENV = "TELEGRAM_BRIDGE_MAX_REPLY_AGE"
 #: Operator posts that do not come from the queue never pass
 #: through the fence and are unaffected.
 DEFAULT_MAX_REPLY_AGE = 1800.0
+
+#: Maximum reply age for work a turn already claimed
+#: (``ever_claimed``), in seconds. A claimed item is unfinished
+#: work the owner is waiting on, not stale chatter — it stays
+#: answerable for a day, so a recovery after an outage is never
+#: refused by the fence that exists to stop late replies to old
+#: room chatter. This mirrors the pending-expiry sweep, which
+#: likewise never expires ever-claimed work. Never-claimed items
+#: keep DEFAULT_MAX_REPLY_AGE (30 minutes).
+DEFAULT_MAX_REPLY_AGE_CLAIMED = 86400.0
+
+#: Environment variable tuning the heartbeat horizon, in seconds:
+#: a claim whose heartbeat is older than this counts as abandoned
+#: and is recycled on the next claim (see
+#: queue_core.HEARTBEAT_STALE_SECONDS for why 120s).
+HEARTBEAT_STALE_ENV = "TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS"
 
 #: Environment variable naming this deployment's bot username, used
 #: by the intake classifier to recognise messages addressed to the
@@ -520,6 +566,31 @@ def _expiry_ttls() -> tuple:
 def _max_reply_age():
     """The send fence's maximum reply age, from the environment."""
     return _env_seconds(MAX_REPLY_AGE_ENV, DEFAULT_MAX_REPLY_AGE)
+
+
+def _heartbeat_stale():
+    """The heartbeat horizon, from the environment."""
+    return _env_seconds(
+        HEARTBEAT_STALE_ENV, queue_core.HEARTBEAT_STALE_SECONDS
+    )
+
+
+def _reply_age_limit(item: dict, max_reply_age) -> float | None:
+    """The stale-guard age limit (seconds since intake) for one item.
+
+    Never-claimed items use ``max_reply_age`` (default 1800s): a
+    late reply to hours-old room chatter lands off-context. An item
+    a turn already claimed (``ever_claimed``) is unfinished work
+    the owner is waiting on — it gets DEFAULT_MAX_REPLY_AGE_CLAIMED
+    (a day), so a recovery after an outage is never refused by the
+    fence. A negative or None ``max_reply_age`` disables the guard
+    for both, matching the existing convention.
+    """
+    if max_reply_age is None or max_reply_age < 0:
+        return None
+    if item.get("ever_claimed"):
+        return DEFAULT_MAX_REPLY_AGE_CLAIMED
+    return max_reply_age
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -2603,6 +2674,7 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
         now = time.time()
         batch_size = _env_int("TELEGRAM_BRIDGE_BATCH_SIZE", queue_core.DEFAULT_BATCH_SIZE)
         stale_ttl = float(_env_int("TELEGRAM_BRIDGE_STALE_TTL", int(queue_core.DEFAULT_STALE_TTL)))
+        heartbeat_stale = _heartbeat_stale()
         group_ttl, private_ttl = _expiry_ttls()
         rate_state = _load_rate_state()
         with store.transaction() as state:
@@ -2648,6 +2720,7 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
                 platform=PLATFORM,
                 batch_size=batch_size,
                 stale_ttl=stale_ttl,
+                heartbeat_stale=heartbeat_stale,
                 group_pending_ttl=group_ttl,
                 private_pending_ttl=private_ttl,
                 now=now,
@@ -2891,15 +2964,19 @@ def _reserve_send(
         # reply recorded — the same ownership the fence itself
         # checks. A caller that does not own the claim falls
         # through to mark_sending and gets the plain fence refusal.
+        # The age limit is per item: work a turn already claimed
+        # gets the longer claimed limit (see _reply_age_limit), so
+        # a recovery after an outage is never refused as stale.
+        limit = _reply_age_limit(item, max_reply_age) if item is not None else None
         stale_owned = (
-            max_reply_age is not None
+            limit is not None
             and item is not None
             and item["status"] == queue_core.CLAIMED
             and token is not None
             and item["claim_token"] == token
             and item["replied_at"] is None
             and (time.time() if now is None else now) - item["received_at"]
-            > max_reply_age
+            > limit
         )
         if stale_owned:
             # Stale: refuse the send, preserve the work. No state
@@ -3208,7 +3285,50 @@ def send_ack(
         # safe): the ack went out either way, so return success
         # without overwriting the existing record.
         queue_core.mark_ack(state, PLATFORM, target, message_id, token, now=now)
+        # The turn is alive and working (it just sent the ack), so
+        # refresh the whole batch heartbeat: a long turn that acks
+        # early never looks dead to the watchdog while it works.
+        queue_core.heartbeat_batch(state, token, now=now)
     return {"ok": True, "message_id": message_id}
+
+
+def heartbeat_batch(store: JsonStateStore, token, *, now: float | None = None) -> dict:
+    """Refresh the heartbeat of every claimed item under one batch
+    token: the owning turn's proof it is still alive and working.
+
+    Returns ``{"ok": true, "heartbeated": n}`` when n > 0, and
+    ``{"ok": false, "stage": "fence"}`` when the token owns no live
+    batch (stale token, or every item already replied / closed).
+    The turn calls this first thing after waking, and again before
+    any step that may take over a minute. The ack and claim-more
+    paths refresh it automatically, so a turn that acks or claims
+    more never needs an explicit heartbeat for those steps.
+    """
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        refreshed = queue_core.heartbeat_batch(state, token, now=now)
+    if refreshed == 0:
+        return {"ok": False, "stage": "fence"}
+    return {"ok": True, "heartbeated": refreshed}
+
+
+def watchdog_sweep(store: JsonStateStore, *, now: float | None = None) -> dict:
+    """Run one watchdog pass over the queue and report it.
+
+    Recycles claimed items whose heartbeat went stale (a turn that
+    died mid-work) back to pending, so the intake's next poll
+    re-claims and re-wakes them. Never touches ``sending`` items,
+    replied items, or live-heartbeat claims, and never sends
+    anything. Returns the sweep report (see
+    ``queue_core.watchdog_sweep``).
+    """
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        return queue_core.watchdog_sweep(
+            state,
+            heartbeat_stale=_heartbeat_stale(),
+            now=now,
+        )
 
 
 def send_batch_and_close(
@@ -3274,12 +3394,14 @@ def send_batch_and_close(
             return {"ok": False, "stage": "keyboard"}
         if max_reply_age is not None:
             for external_id, item in items.items():
+                limit = _reply_age_limit(item, max_reply_age)
                 if (
-                    item.get("status") == queue_core.CLAIMED
+                    limit is not None
+                    and item.get("status") == queue_core.CLAIMED
                     and token is not None
                     and item.get("claim_token") == token
                     and item.get("replied_at") is None
-                    and check_now - item["received_at"] > max_reply_age
+                    and check_now - item["received_at"] > limit
                 ):
                     return {"ok": False, "stage": "stale"}
     result = send_fenced(
@@ -3551,6 +3673,43 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         print(json.dumps(result))
         return 0
 
+    if args[:1] == ["--heartbeat"]:
+        # --heartbeat CLAIM_TOKEN: refresh the heartbeat of every
+        # claimed item under the token — the owning turn's proof it
+        # is still alive. Prints {"ok": true, "heartbeated": n}, or
+        # {"ok": false, "stage": "fence"} when the token owns no
+        # live batch. The turn calls this first thing after waking
+        # and before any step that may take over a minute.
+        if len(args) != 2:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --heartbeat CLAIM_TOKEN",
+            }))
+            return 2
+        print(json.dumps(heartbeat_batch(store, args[1])))
+        return 0
+
+    if args[:1] == ["--watchdog"]:
+        # --watchdog: one watchdog pass — recycle claimed items
+        # whose heartbeat went stale (a turn that died mid-work)
+        # back to pending, and report queue health. Never touches
+        # sending / replied / live claims, never sends anything.
+        # Prints the sweep report JSON. The hook script calls this
+        # every few minutes; the intake's next poll re-claims and
+        # re-wakes anything recycled here.
+        if len(args) != 1:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --watchdog",
+            }))
+            return 2
+        try:
+            print(json.dumps(watchdog_sweep(store)))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)[:200]}))
+            return 1
+        return 0
+
     if args[:1] == ["--claim-more"]:
         # --claim-more CHAT_ID CLAIM_TOKEN [BATCH_SIZE]: pull messages
         # that arrived during the turn into this turn's batch, so
@@ -3585,6 +3744,12 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
                 token=args[2],
                 batch_size=batch_size,
             )
+            if batch is not None:
+                # The turn is alive (it just claimed more), so
+                # refresh the whole batch heartbeat: claiming more
+                # proves the turn is working, and the pre-existing
+                # items get the same fresh heartbeat as the new ones.
+                queue_core.heartbeat_batch(state, args[2])
             if batch is None:
                 claimed = None
             else:

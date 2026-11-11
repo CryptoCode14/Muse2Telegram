@@ -115,6 +115,16 @@ so Telegram rejects the call with a 404.
   `reply_to_message_id`. The fence refuses any `reply_to` that is not
   the target item's own `message_id`, so a reply can never thread under
   the bot's own message.
+- Heartbeat: a turn refreshes its claim's heartbeat while it works
+  (`--heartbeat CLAIM_TOKEN`, first thing after waking and before
+  any step that may take over a minute; the ack and claim-more
+  paths refresh it automatically). A claim whose heartbeat goes
+  stale for 120s (`TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS`) is
+  recycled on the next claim, so a turn that died mid-work blocks
+  its lane for minutes, not the full 30-minute stale TTL. A queue
+  watchdog hook polls every 120s and recycles dead claims the same
+  way, silently; it never sends a Telegram message and wakes an
+  agent only when the sweep itself fails.
 - Batching: when a batch holds several messages the agent sends ONE
   reply for all of them, not one per message. Before sending it
   re-checks with `--claim-more CHAT_ID CLAIM_TOKEN` (messages that
