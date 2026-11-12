@@ -155,7 +155,7 @@ muse-runtime/
                                 the superseded files below)
   prompts/
     unified.md        the hook-definition prompt (one static prompt
-                      for every wake; 13262 chars, ~3316 modelled
+                      for every wake; 14607 chars, ~3652 modelled
                       tokens)
     router.md, tier-quick.md, tier-standard.md, tier-deep.md
                       superseded in v2; kept for history only,
@@ -211,16 +211,21 @@ mkdir -p ~/workspace/custom-skills/telegram-collab-protocol
   instead. It polls every
   60 seconds and recycles claimed items whose heartbeat went stale
   (a turn that died mid-work) back to pending, so the intake's next
-  poll re-claims and re-wakes them. It also watches intake liveness:
+  poll re-claims and re-wakes them. It also releases never-started
+  claims past the 120s claim lease (re-queued, re-woken by the next
+  poll) and after 3 failed attempts stops looping, flags the item
+  for follow-up, and wakes an agent once per escalation. It also
+  keeps the ack status card current by editing that same message
+  (never a second card). It also watches intake liveness:
   if the intake has not polled successfully in over 120 seconds it
   wakes an agent (once per stale episode) so the stuck intake gets
   looked at. It also surfaces items stuck in "sending" past the 1h
   horizon and wakes an agent to reconcile them against the send
-  evidence. It never sends a Telegram
+  evidence. It never sends a new Telegram
   message, never closes work, and never touches "sending" items. It
   is silent on health and on successful repair, and wakes an agent
   only when the sweep itself fails, the intake is stale, a
-  health check fails, or a send is stuck. It also verifies the install on every
+  health check fails, a send is stuck, or a claim lease is exhausted. It also verifies the install on every
   sweep — the intake hook definition (valid and enabled), the
   checkout, the venv, and the sender — and wakes an agent when
   a check fails, once per episode. A recovery is reported when
@@ -323,8 +328,8 @@ message if a run refuses to start.
 `TELEGRAM_BRIDGE_BOT_ALIASES` is optional: comma-separated short
 names (no "@", e.g. `Example` for a bot whose username is
 `ExampleBot`). An `@<alias>` @mention wakes this bot just like
-`@<username>`, in the decider, the adapter's preclaim filter, and
-the typing indicator, and the unified prompt says so. This is
+`@<username>`, in the decider and the adapter's preclaim filter,
+and the unified prompt says so. This is
 per-bot: every bot that installs the repo sets its own aliases, and
 each bot only wakes for its own username and aliases — `@Example`
 wakes ExampleBot, and so on. Unset, only the username counts.
@@ -570,7 +575,7 @@ The hook definition prompt is the unified prompt in
 definition prompt (replacing the placeholders), following the exact
 install steps in `muse-runtime/hooks/hook-definition-unified-prompt.md`.
 It is the woken agent's full instruction for the turn: one static text
-for every wake (13262 chars, ~3316 modelled tokens). There is no
+for every wake (14607 chars, ~3652 modelled tokens). There is no
 per-batch prompt selection any more: the decider prints only `wake` /
 `hold` / `done` / `empty`, and the intake hook pre-loads the agent's
 context into the wake payload as `context_md` (the bounded contents of
@@ -587,13 +592,17 @@ created and updated times; do not copy the JSON file verbatim, it
 has no timestamps and will not parse. It recycles claimed items
 whose heartbeat went stale — a
 turn that died mid-work — back to pending, so the intake's next poll
-re-claims and re-wakes them. It also wakes an agent if the intake
+re-claims and re-wakes them. It also releases never-started claims
+past the 120s claim lease, and after 3 failed attempts stops looping
+and wakes an agent once per escalation. It also keeps the ack status
+card current by editing that same message. It also wakes an agent if the intake
 has not polled successfully in over 120 seconds, if a health
 check fails (intake definition invalid or disabled, or checkout,
 venv, or sender missing), or if a send is stuck in "sending" past
-the 1h horizon. It never sends a Telegram message and
+the 1h horizon. It never sends a new Telegram message and
 wakes an agent only when the sweep itself fails, the intake is
-stale, a health check fails, or a send is stuck. **Done looks like:**
+stale, a health check fails, a send is stuck, or a claim lease is
+exhausted. **Done looks like:**
 the hook is enabled, polling every 60s, and a dry run exits silently
 with a healthy sweep report.
 
@@ -704,10 +713,13 @@ not change its mode and does not clear a safety trip.
   already have gone out. Only after independently confirmed
   non-delivery may you return it to pending with `--send-failed` and
   send again.
-- Long work (10+ minutes): the turn sends the fixed acknowledgement
-  first (`--send-ack UPDATE_ID CLAIM_TOKEN CHAT_ID
-  [REPLY_TO_MESSAGE_ID]`), so the owner knows the turn is working.
-  The ack does not close the item; the full reply still closes it
+- Long work (10+ minutes): the hook already sent a status card at
+  claim for the batch, so the turn does NOT send a second ack for
+  an item that already has one (`--send-ack` answers already-acked
+  then). Only call `--send-ack UPDATE_ID CLAIM_TOKEN CHAT_ID
+  [REPLY_TO_MESSAGE_ID]` for an item the hook did not card (for
+  example one claimed later with `--claim-more`). The ack does not
+  close the item; the full reply still closes it
   with `--send-and-close`. One ack per item.
 - Groups: the bridge serves every group the owner adds it to (it adopts
   a group when the owner speaks there). Each group has its own mode,

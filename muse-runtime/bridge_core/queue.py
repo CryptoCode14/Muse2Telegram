@@ -46,6 +46,19 @@ Claim discipline (the rules that keep wake turns from double-answering):
   heartbeat was never recorded. After a recycle the old batch token
   no longer matches, so the stale turn's late transition calls are
   all rejected.
+- Claim lease (P1 latency, see ``sweep_claim_lease``): a claim
+  whose turn never started (``turn_started_at`` None) is released
+  by the watchdog sweeper once it is older than
+  ``CLAIM_LEASE_SECONDS`` (120s), re-queued with an attempt
+  counter, and re-woken by the intake's next poll — no re-wake
+  before the lease expires. After ``CLAIM_LEASE_MAX_ATTEMPTS``
+  (3) expiries the item is escalated: it stays pending with a
+  24 h ``wake_after`` backoff and is reported once for an
+  operator wake. The lease never touches a started turn, a warm
+  claim (the 120s baton guards those), a ``sending`` item, or a
+  replied item, and the claim paths never release on lease: only
+  the sweeper does, so a claim alone cannot race a turn still
+  starting up.
 - Unclaimed ``pending`` items are not kept forever either: before any
   claim, a sweep expires old ordinary conversation instead of waking
   a turn for it — a turn answering hours-old room chatter only
@@ -157,6 +170,45 @@ HELD_WAKE_AFTER_SECONDS = 86400.0
 #: slow-starting turn room to start; the cost is a genuinely dead
 #: never-started claim waiting up to ten minutes before recycling.
 NEVER_STARTED_RECYCLE_SECONDS = 600.0
+
+#: Claim lease (seconds, P1 latency): a claim whose turn never
+#: started (``turn_started_at`` is None) is released by the
+#: watchdog sweeper once its claim is older than this. 120 s is
+#: the TOP of the synthesis's 60-120 s range, deliberately: a
+#: live turn heartbeats first thing (the wake prompt's first
+#: action) even when it reads MEMORY first — the same reason the
+#: warm baton is 120 s — so 60/90 s would risk recycling a
+#: slow-starting live turn, the failure that forced the 600 s
+#: horizon above. The lease applies ONLY to never-started,
+#: non-warm claims (see ``sweep_claim_lease``); a started turn
+#: keeps the 600 s heartbeat horizon, untouched. The sweeper
+#: enforces the lease (it polls every 60 s), so a dead claim is
+#: released 120-180 s after its claim; the intake's next poll
+#: re-claims and re-wakes it. No re-wake happens before the
+#: lease expires.
+CLAIM_LEASE_SECONDS = 120.0
+
+#: Failed lease attempts (P1 latency): after this many
+#: lease expiries for one claim episode, the sweeper stops
+#: looping and escalates the item (see ``sweep_claim_lease``):
+#: it stays pending with ``lease_escalated`` set and a 24 h
+#: ``wake_after`` backoff, so the intake stops re-waking it,
+#: and the sweep reports it once for an operator wake. 3
+#: attempts is ~6 minutes of never-started before escalation:
+#: enough for the runtime lane to drain a short backup, short
+#: enough that a genuinely dead claim is surfaced the same
+#: hour. The counter resets only when an escalated item is
+#: re-claimed after its backoff (a fresh episode); ordinary
+#: recycles keep it, so the bound is per episode, not per
+#: claim.
+CLAIM_LEASE_MAX_ATTEMPTS = 3
+
+#: Backoff (seconds) applied to a lease-escalated item: the
+#: same 24 h as a held item, so the intake leaves it alone for
+#: a day while an operator looks at it. The item is preserved
+#: (pending, never dropped) and re-claimable after the backoff
+#: or at once via ``clear_lease_escalation``.
+LEASE_ESCALATION_BACKOFF_SECONDS = 86400.0
 
 #: Age (seconds) of the intake's last successful poll past which
 #: the intake is treated as stale by the watchdog sweep. The
@@ -430,6 +482,18 @@ def enqueue(
         "wake_issued_at": None,
         "wake_count": 0,
         "recycle_count": 0,
+        # Claim-lease attempts (P1 latency, see
+        # ``sweep_claim_lease``): how many times this claim
+        # episode has been released for never starting. Reset
+        # only when an escalated item is re-claimed after its
+        # backoff (a fresh episode); ordinary recycles keep the
+        # count, so the K-attempt bound is per episode.
+        "lease_attempts": 0,
+        # True once the sweeper escalated the item (K lease
+        # expiries): it stays pending with a 24 h wake_after
+        # backoff until an operator clears it (see
+        # ``clear_lease_escalation``) or the backoff passes.
+        "lease_escalated": False,
         # True while the item was claimed by a warm hold (see
         # telegram._warm_hold): the baton guard recycles such a
         # claim fast when its turn never starts.
@@ -590,6 +654,103 @@ def _recycle_stale(
         # first-pending expiry sweep on every later poll.
         recycled.append(item)
     return recycled
+
+
+def sweep_claim_lease(
+    state: dict,
+    lease_seconds: float = CLAIM_LEASE_SECONDS,
+    max_attempts: int = CLAIM_LEASE_MAX_ATTEMPTS,
+    now: float | None = None,
+) -> dict:
+    """Release never-started claims past the claim lease (P1).
+
+    The sweeper's release (the watchdog sweep calls this; the
+    claim paths deliberately do NOT — a claim alone must never
+    race a turn that is still starting up, and the 600 s
+    heartbeat horizon in ``_recycle_stale`` stays the claim
+    path's only recycle). Candidates are CLAIMED, unreplied
+    items whose turn never started (``turn_started_at`` is
+    None), that are not warm claims (the 120 s warm baton
+    guards those), and whose claim is older than
+    ``lease_seconds``. A started turn is never lease-released,
+    however long it runs: only its heartbeat decides that.
+
+    A released item returns to pending (same field clearing
+    as ``_recycle_stale``, ``recycle_count`` + 1) with
+    ``lease_attempts`` + 1, so the intake's next poll
+    re-claims and re-wakes it — no re-wake happens before the
+    lease expires. Once ``lease_attempts`` reaches
+    ``max_attempts`` the item is ESCALATED instead: it stays
+    pending with ``lease_escalated`` set and ``wake_after``
+    now + ``LEASE_ESCALATION_BACKOFF_SECONDS`` (24 h), so the
+    intake stops re-waking it, and the sweep reports it once
+    for an operator wake. The item is never dropped: it is
+    preserved for reassessment, re-claimable after the
+    backoff or at once via ``clear_lease_escalation``.
+
+    Returns ``{"expired": [...], "escalated": [...]}`` (the
+    item dicts, in queue order). Items are in at most one
+    list. An item with a completed ack (``ack_message_id``
+    set) keeps it: the ack card went out, and the sweeper
+    updates its text (see telegram.refresh_ack_cards).
+    """
+    ensure_state(state)
+    now = _now(now)
+    expired = []
+    escalated = []
+    for item in state["queue"]:
+        if (
+            item["status"] != CLAIMED
+            or item["replied_at"] is not None
+            or item["claimed_at"] is None
+            or item.get("turn_started_at") is not None
+            or item.get("warm_claimed")
+            or now - item["claimed_at"] <= lease_seconds
+        ):
+            continue
+        attempts = item.get("lease_attempts", 0) + 1
+        item["lease_attempts"] = attempts
+        item["status"] = PENDING
+        item["claimed_at"] = None
+        item["claim_token"] = None
+        item["heartbeat_at"] = None
+        item["turn_started_at"] = None
+        item["warm_claimed"] = False
+        item["wake_issued_at"] = None
+        item["recycle_count"] = item.get("recycle_count", 0) + 1
+        if item.get("ack_message_id") is None:
+            item["ack_sent_at"] = None
+        if attempts >= max_attempts:
+            item["lease_escalated"] = True
+            item["wake_after"] = now + LEASE_ESCALATION_BACKOFF_SECONDS
+            escalated.append(item)
+        else:
+            expired.append(item)
+    return {"expired": expired, "escalated": escalated}
+
+
+def clear_lease_escalation(state: dict, platform: str, external_id) -> bool:
+    """Clear a lease escalation: the operator's re-queue path.
+
+    Only a pending, escalated item can be cleared. Clears
+    ``lease_escalated``, the backoff ``wake_after`` (a
+    throttle ``wake_after`` is never cleared by mistake —
+    only an escalated item carries one set by the lease),
+    and resets ``lease_attempts`` to 0, so the next claim
+    starts a fresh episode. The item stays pending; the
+    intake's next poll re-claims and re-wakes it. Returns
+    True when an escalated item was cleared.
+    """
+    ensure_state(state)
+    item = find_item(state, platform, external_id)
+    if item is None:
+        return False
+    if item["status"] != PENDING or not item.get("lease_escalated"):
+        return False
+    item["lease_escalated"] = False
+    item["wake_after"] = None
+    item["lease_attempts"] = 0
+    return True
 
 
 def pending_ttl(
@@ -826,6 +987,12 @@ def claim_batch(
         # (wake_issued_at stays None until mark_wake_issued).
         item["turn_started_at"] = None
         item["warm_claimed"] = False
+        # A re-claim after a lease escalation starts a fresh
+        # episode: the backoff is over and the attempt counter
+        # resets. Ordinary re-claims keep the counter.
+        if item.get("lease_escalated"):
+            item["lease_attempts"] = 0
+            item["lease_escalated"] = False
         item["wake_issued_at"] = None
     return {"claim_token": token, "items": batch}
 
@@ -900,6 +1067,12 @@ def claim_lane_batch(
         item["ever_claimed"] = True
         item["turn_started_at"] = None
         item["warm_claimed"] = False
+        # A re-claim after a lease escalation starts a fresh
+        # episode: the backoff is over and the attempt counter
+        # resets. Ordinary re-claims keep the counter.
+        if item.get("lease_escalated"):
+            item["lease_attempts"] = 0
+            item["lease_escalated"] = False
         # No wake issued for the fresh claim yet (see claim_batch).
         item["wake_issued_at"] = None
     return {"claim_token": token, "items": batch}
@@ -1121,6 +1294,12 @@ def claim_ids(
         item["ever_claimed"] = True
         item["turn_started_at"] = None
         item["warm_claimed"] = False
+        # A re-claim after a lease escalation starts a fresh
+        # episode: the backoff is over and the attempt counter
+        # resets. Ordinary re-claims keep the counter.
+        if item.get("lease_escalated"):
+            item["lease_attempts"] = 0
+            item["lease_escalated"] = False
         # No wake issued for the fresh claim yet (see claim_batch).
         item["wake_issued_at"] = None
     return {"claim_token": token, "items": batch}
@@ -1378,6 +1557,14 @@ def watchdog_sweep(
     and never wakes an agent for a recycled claim; waking is the
     intake's job once the lane is free again.
 
+    Before that, the sweep runs the claim lease (see
+    ``sweep_claim_lease``): never-started claims past
+    ``CLAIM_LEASE_SECONDS`` are released the same way (or
+    escalated at ``CLAIM_LEASE_MAX_ATTEMPTS``), and reported as
+    ``lease_expired`` / ``lease_escalated`` alongside the
+    merged ``recycled`` list. A started turn is never
+    lease-released: only its heartbeat decides that.
+
     It also reports intake liveness from the state's
     ``last_successful_poll`` (set by the intake on every
     successful poll): ``intake_stale`` is True once the last poll
@@ -1417,18 +1604,29 @@ def watchdog_sweep(
     (legacy or hand-edited state) counts as stuck: it cannot be
     shown to be fresh.
 
-    Returns ``{"recycled": [external_id, ...], "pending": n,
+    Returns ``{"recycled": [external_id, ...], "lease_expired":
+    [external_id, ...], "lease_escalated": [external_id, ...],
+    "pending": n,
     "claimed_live": n, "sending": n, "stuck_sending":
     [external_id, ...], "intake_age_seconds": age
     | None, "intake_stale": bool, "intake_wake": bool,
     "intake_recovered": bool, "health": health | None,
     "health_ok": bool | None, "health_wake": bool,
     "health_recovered": bool}`` — counts taken after the recycle,
-    so ``pending`` includes the items just freed.
+    so ``pending`` includes the items just freed. ``recycled``
+    merges the lease releases and the heartbeat-stale recycles,
+    in queue order.
     """
     ensure_state(state)
     now = _now(now)
-    recycled = _recycle_stale(
+    # Claim lease first (P1): never-started claims past
+    # CLAIM_LEASE_SECONDS are released (or escalated at K
+    # attempts) by the sweeper — never by the claim paths, so
+    # a claim alone cannot race a turn still starting up. The
+    # 600 s heartbeat recycle below stays the backstop for
+    # started turns.
+    lease = sweep_claim_lease(state, now=now)
+    recycled_stale = _recycle_stale(
         state,
         stale_ttl,
         now,
@@ -1436,6 +1634,18 @@ def watchdog_sweep(
         active_heartbeat_stale=active_heartbeat_stale,
         warm_baton_timeout=warm_baton_timeout,
     )
+    # One recycled list, in queue order, across both releases:
+    # a lease-released item and a heartbeat-stale item are both
+    # freed claims the intake re-claims and re-wakes.
+    recycled_keys = {
+        (item["platform"], item["external_id"])
+        for item in lease["expired"] + lease["escalated"] + recycled_stale
+    }
+    recycled = [
+        item
+        for item in state["queue"]
+        if (item["platform"], item["external_id"]) in recycled_keys
+    ]
     last_poll = state.get("last_successful_poll")
     if not isinstance(last_poll, (int, float)):
         intake_age = None
@@ -1502,6 +1712,12 @@ def watchdog_sweep(
     ]
     return {
         "recycled": [item["external_id"] for item in recycled],
+        "lease_expired": [
+            item["external_id"] for item in lease["expired"]
+        ],
+        "lease_escalated": [
+            item["external_id"] for item in lease["escalated"]
+        ],
         "pending": counts_now[PENDING],
         "claimed_live": counts_now[CLAIMED],
         "sending": counts_now[SENDING],
@@ -1715,6 +1931,7 @@ def mark_ack(
     token,
     *,
     now: float | None = None,
+    card_text: str | None = None,
 ) -> bool:
     """Record that the acknowledgement went out for a claimed item.
 
@@ -1742,6 +1959,15 @@ def mark_ack(
         return False
     item["ack_sent_at"] = _now(now)
     item["ack_message_id"] = str(message_id)
+    # The text last written to the ack card, when the ack IS a
+    # script status card (send_claim_ack passes it): the sweeper
+    # edits the card only while this is set, and only when the
+    # desired text differs — so a turn's own --send-ack (which
+    # passes no card text) is never edited by the sweeper, and a
+    # card is never re-edited with identical text (Telegram
+    # answers that 400 "message is not modified").
+    if card_text is not None:
+        item["ack_card_text"] = card_text
     # An ack is explicit proof the turn started (two-phase rule):
     # the turn sent a message, so it is alive — record the start
     # and refresh the heartbeat, so the acking turn is never
@@ -1749,6 +1975,45 @@ def mark_ack(
     if item.get("turn_started_at") is None:
         item["turn_started_at"] = _now(now)
     item["heartbeat_at"] = _now(now)
+    return True
+
+
+def mark_claim_ack(
+    state: dict,
+    platform: str,
+    external_id,
+    message_id,
+    token,
+    *,
+    card_text: str,
+    now: float | None = None,
+) -> bool:
+    """Record the script's claim status card (see
+    telegram.send_claim_ack): the ack the intake sends at claim,
+    before any turn starts.
+
+    Same fence as ``mark_ack`` (claimed under the caller's
+    token, no reply recorded, no completed ack already
+    recorded; a tentative reservation from ``reserve_ack`` is
+    completed, not refused), and it records ``ack_card_text``
+    so the sweeper can keep the card current. Unlike
+    ``mark_ack`` it does NOT set ``turn_started_at`` and does
+    NOT refresh the heartbeat: the card is a receipt sent
+    before any turn starts, not proof a turn is alive — so the
+    claim lease still applies to a carded batch whose turn
+    never starts. (If ``mark_ack`` recorded it, every carded
+    batch would look started and the lease could never fire.)
+    """
+    item = _owned_item(state, platform, external_id, token, (CLAIMED,))
+    if item is None:
+        return False
+    if item["replied_at"] is not None:
+        return False
+    if item.get("ack_message_id") is not None:
+        return False
+    item["ack_sent_at"] = _now(now)
+    item["ack_message_id"] = str(message_id)
+    item["ack_card_text"] = card_text
     return True
 
 

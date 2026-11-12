@@ -657,12 +657,37 @@ class WatchdogHeartbeatWiringTests(unittest.TestCase):
         item["turn_started_at"] = None
         return state
 
-    def test_watchdog_recycles_never_started_claim_at_601s_not_599s(self):
+    def test_watchdog_releases_never_started_claim_at_lease(self):
+        # P1 claim lease: a never-started claim is released by
+        # the sweeper at 120s, not at the old 600s horizon — the
+        # 600s boundary below now applies to STARTED claims only.
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
             store = JsonStateStore(path)
             with store.transaction() as state:
                 state.update(self._claimed_state())
+            with mock.patch.dict(os.environ, {
+                    telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+                # 119 s in: the lease has not expired yet.
+                report = telegram.watchdog_sweep(store, now=1119.0)
+                self.assertEqual(report["recycled"], [])
+                self.assertEqual(report["lease_expired"], [])
+                # 121 s in: lease-released (and reported as such).
+                report = telegram.watchdog_sweep(store, now=1121.0)
+                self.assertEqual(report["recycled"], ["1"])
+                self.assertEqual(report["lease_expired"], ["1"])
+
+    def test_watchdog_recycles_started_claim_at_601s_not_599s(self):
+        # The 600s heartbeat horizon is untouched for a turn
+        # that STARTED: only its heartbeat decides, never the
+        # lease.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            store = JsonStateStore(path)
+            with store.transaction() as state:
+                state.update(self._claimed_state())
+                item = queue_core.find_item(state, "telegram", 1)
+                item["turn_started_at"] = 1000.0
             with mock.patch.dict(os.environ, {
                     telegram.BOT_USERNAME_ENV: "ExampleBot"}):
                 # 599 s in: not yet recyclable under the 600 s horizon.

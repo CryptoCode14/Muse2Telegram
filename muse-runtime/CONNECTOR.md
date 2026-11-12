@@ -109,7 +109,7 @@ so Telegram rejects the call with a 404.
 - Typing indicator: the agent fires `telegram-sender --typing <chat_id>`
   (sendChatAction) ONLY after deciding to reply, and again right before
   sending, so typing means "I am responding" and never shows when no
-  reply is coming. It stops when the reply lands.
+  reply is coming. The hook never fires it pre-wake. It stops when the reply lands.
 - Replies are sent with one `--send-and-close` call (fences, sends,
   records, closes) and thread under the question via
   `reply_to_message_id`. The fence refuses any `reply_to` that is not
@@ -121,16 +121,22 @@ so Telegram rejects the call with a 404.
   paths refresh it automatically). A claim whose heartbeat goes
   stale for 600s (`TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS`) is
   recycled on the next claim, so a turn that died mid-work blocks
-  its lane for minutes, not the full 30-minute stale TTL. A queue
-  watchdog hook polls every 60s and recycles dead claims the same
-  way, silently; it never sends a Telegram message and wakes an
-  agent only when the sweep itself fails, the intake goes stale
-  (no successful poll for over 120 seconds), a health check fails,
-  or a send is stuck in "sending" past the 1h horizon. It also verifies the
-  install on every sweep — the intake hook definition (valid and
-  enabled), the checkout, the venv, and the sender — and wakes an
-  agent when a check fails, once per episode. A recovery is
-  reported when a stale intake or a failed health check clears.
+  its lane for minutes, not the full 30-minute stale TTL. A claim
+  whose turn never starts is released sooner, by the 120s claim
+  lease: the watchdog sweeper frees it (re-queued, re-woken by the
+  next poll) and after 3 failed attempts stops looping, flags it
+  for follow-up, and wakes an agent once. A queue watchdog hook
+  polls every 60s and recycles dead claims the same way, silently;
+  it never sends a new Telegram message (it only edits the existing
+  ack status card to keep it current) and wakes an agent only when
+  the sweep itself fails, the intake goes stale (no successful poll
+  for over 120 seconds), a health check fails, a send is stuck in
+  "sending" past the 1h horizon, or a claim lease is exhausted. It
+  also verifies the install on every sweep — the intake hook
+  definition (valid and enabled), the checkout, the venv, and the
+  sender — and wakes an agent when a check fails, once per episode.
+  A recovery is reported when a stale intake or a failed health
+  check clears.
 - Batching: when a batch holds several messages the agent sends ONE
   reply for all of them, not one per message. Before sending it
   re-checks with `--claim-more CHAT_ID CLAIM_TOKEN` (messages that
@@ -141,7 +147,10 @@ so Telegram rejects the call with a 404.
   `covered-by-batch-reply`). The intake also waits out a 2s settle
   window (`TELEGRAM_BRIDGE_SETTLE_SECONDS`, set in the hook script) and
   re-fetches once so rapid follow-ups join the same batch instead of
-  becoming a second turn.
+  becoming a second turn. One wake covers the whole batch, not one
+  wake per message. On wake the hook sends one ack status card for
+  the batch (with the queue position); a script sweeper edits that
+  same message to keep it current, and the reply deletes it.
 - Inline keyboards (Pause/Resume/Status/Help/Who/Active) are attached
   ONLY to command replies (a typed `/command`, a button tap, or
   `/menu`), never to a normal conversation reply. The fence refuses
@@ -154,8 +163,10 @@ so Telegram rejects the call with a 404.
   chat only (verified live via getMyCommands).
 - /active lists who spoke in a group in the last hour from that
   group's buffer (`state.json` `groups[<chat_id>].buffer`). Reactions
-  are set on the message being answered, before the reply is sent,
-  and never on a message the agent is not replying to.
+  are set by the agent first: its first tool call in a turn reacts
+  on the triggering message with an emoji it chooses
+  (`--react-batch CLAIM_TOKEN EMOJI`), before any other work. No
+  script ever reacts.
 - Replies use HTML formatting (bold sparingly for key facts) with
   escaping; on a 400 the sender retries as plain text so a formatting
   failure never strands a reply.

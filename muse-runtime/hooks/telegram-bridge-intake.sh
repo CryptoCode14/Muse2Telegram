@@ -4,7 +4,14 @@
 #
 # Routing lives in telegram-bridge-decide.py (free-for-all + @mention):
 #   wake - a DM, a command, an @mention of this bot, or an open human
-#          message in the group with no @mention at all.
+#          message in the group with no @mention at all. On wake the
+#          hook sends the ack status card for the batch
+#          (--send-claim-ack, one message with the queue position)
+#          and then wakes the agent: the card is the receipt that
+#          covers the wait before any turn starts. The hook never
+#          fires the typing indicator: typing means "I am
+#          responding", so it fires only while a turn is actually
+#          running (the agent fires it after deciding to reply).
 #   hold - paused and no command; each item is held in the queue
 #          itself (wake_after +24h) for the resume turn to
 #          re-claim with --unhold and answer.
@@ -80,19 +87,16 @@ decision=$(printf '%s' "$payload" | python3 "$DECIDER")
 # prompt). The hook pre-loads the agent's context into the wake
 # payload instead of selecting a prompt file.
 action=${decision%% *}
-# Hook-layer helpers from the decider module (hydrate_payload,
-# typing_chat_id), run without executing its main(). Reads the
-# payload on stdin; prints the hydrated payload JSON on line 1 and
-# the pre-wake typing chat id (or an empty line) on line 2.
-hydrate_and_typing() {
+# Hook-layer helper from the decider module (hydrate_payload),
+# run without executing its main(). Reads the payload on stdin;
+# prints the hydrated payload JSON on line 1.
+hydrate_wake_payload() {
   python3 -c 'import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("telegram_bridge_decide", sys.argv[1])
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 payload = json.load(sys.stdin)
-print(json.dumps(mod.hydrate_payload(payload), separators=(",", ":")))
-typing = mod.typing_chat_id(payload)
-print("" if typing is None else typing)' "$DECIDER"
+print(json.dumps(mod.hydrate_payload(payload), separators=(",", ":")))' "$DECIDER"
 }
 case "$action" in
   wake)
@@ -100,18 +104,8 @@ case "$action" in
     # chars, null when context.md is missing — never fails the
     # wake). If hydration itself fails, wake with the original
     # payload instead of going silent.
-    typing_chat=""
-    if hydrated=$(printf '%s' "$payload" | hydrate_and_typing 2>/dev/null); then
+    if hydrated=$(printf '%s' "$payload" | hydrate_wake_payload 2>/dev/null); then
       payload=$(printf '%s' "$hydrated" | sed -n '1p')
-      typing_chat=$(printf '%s' "$hydrated" | sed -n '2p')
-    fi
-    # Typing must mean "I am responding": fire it pre-wake ONLY for
-    # a DM, a command, or an @mention, where a reply is definite.
-    # Never for an open group message, where the agent may stay
-    # silent. Best-effort: a failed typing call never blocks the
-    # wake.
-    if [ -n "$typing_chat" ]; then
-      "$TELEGRAM_BRIDGE_SEND_CMD" --typing "$typing_chat" >/dev/null 2>&1 || true
     fi
     # Record when this wake is issued, so --latency-report can
     # measure wake latency (wake issued -> turn started). The claim
@@ -120,6 +114,13 @@ case "$action" in
     claim_token=$(printf '%s' "$payload" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_token',''))")
     if [ -n "$claim_token" ]; then
       .venv/bin/python -m bridge_core.telegram --wake-issued "$claim_token" >/dev/null 2>&1 || true
+      # Send the ack status card for the batch (one message, with
+      # the queue position) before waking: the card is the receipt
+      # that covers the wait before any turn starts, and the
+      # sweeper edits that same message to keep it current. A
+      # failed card never blocks the wake — the turn's own
+      # --send-ack still works, and the wake is the priority.
+      .venv/bin/python -m bridge_core.telegram --send-claim-ack "$claim_token" >/dev/null 2>&1 || true
     fi
     wake "telegram-message" "$payload"
     ;;

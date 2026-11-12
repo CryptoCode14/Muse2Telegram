@@ -346,6 +346,7 @@ class LatencyReportCliTests(unittest.TestCase):
                 "re_woken_items": 0,
                 "extra_wakes": 0,
                 "wakes_without_turn": 0,
+                "lease_escalated_now": 0,
                 "stuck_claims_now": 0,
                 "stuck_sending_now": 0,
                 "stuck_sending": [],

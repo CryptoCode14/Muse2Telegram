@@ -139,13 +139,20 @@ def _is_command_allowed(item):
 
 
 # ---------------------------------------------------------------------------
-# Wake-payload hydration + pre-wake typing (hook layer, v2).
+# Wake-payload hydration (hook layer, v2).
 #
 # The unified prompt is static, so the per-batch context the old
 # tiers used to select must arrive in the payload instead. The
 # intake hook calls hydrate_payload() on a wake payload before
-# waking the agent, and typing_chat_id() to decide whether the
-# typing indicator may fire pre-wake.
+# waking the agent.
+#
+# There is deliberately NO pre-wake typing here any more (P1
+# latency, 2026-11-12): typing means "I am responding", and a
+# turn that never starts must never show it — the pre-wake
+# typing was the defect. Typing fires only while a turn is
+# actually running: the agent fires it after deciding to reply
+# (see prompts/unified.md), and --reply fires it right before
+# sending. The hook sends no typing at all.
 # ---------------------------------------------------------------------------
 
 #: context.md is pre-loaded into the wake payload, bounded to this
@@ -200,42 +207,6 @@ def hydrate_payload(payload, state_path=None):
     except Exception:
         out["context_md"] = None
     return out
-
-
-def _mentions_bot(text, bot_username):
-    """True when the text @mentions this bot as a standalone token
-    (same lookarounds as MENTION_ME_RE): its username or any
-    configured alias."""
-    if not bot_username:
-        return False
-    names = [bot_username.lower()] + ALIASES
-    rx = re.compile(
-        r"(?<![A-Za-z0-9_/.])@(?:" + "|".join(
-            re.escape(n) for n in names) + r")(?![A-Za-z0-9_])",
-        re.IGNORECASE,
-    )
-    return rx.search(text or "") is not None
-
-
-def typing_chat_id(payload, bot_username=None):
-    """The chat_id to fire the typing indicator in pre-wake, or
-    None when typing must NOT fire. Typing means "I am responding",
-    so it fires only where a reply is definite: a private DM, a
-    typed command, or a message @mentioning this bot. An open group
-    message returns None even though it wakes the agent — the agent
-    may stay silent there, and typing would promise a reply that
-    never comes. Only ever called on a wake payload."""
-    bot = (bot_username or MY_BOT or "").lower()
-    for it in (payload or {}).get("items") or []:
-        text = it.get("text") or ""
-        if it.get("chat_type") == "private":
-            return it.get("chat_id")
-        if text.strip().startswith("/"):
-            return it.get("chat_id")
-        if _mentions_bot(text, bot):
-            return it.get("chat_id")
-    return None
-
 
 
 def main():

@@ -15,8 +15,9 @@ hooks/telegram-bridge-intake.sh):
 - The decider prints only "wake" / "hold" / "done <ids>" / "empty"
   with no tier word, whatever the batch (a greeting that was "quick"
   and a long task that was "deep" both print bare "wake").
-- Typing fires pre-wake only for DM / command / @mention, never for
-  an open group message (decision function + the intake.sh wiring).
+- No pre-wake typing anywhere (P1): the hook never fires the
+  typing indicator — typing fires only while a turn is actually
+  running — and the decider carries no typing decision function.
 
 No network or credentials are used. The Telegram sender is mocked
 where a send is involved; the intake.sh shell helper is exercised by
@@ -37,7 +38,6 @@ HERE = Path(__file__).resolve()
 RUNTIME = HERE.parent.parent  # muse-runtime/
 
 PROMPT = RUNTIME / "prompts" / "unified.md"
-OLD_STANDARD = RUNTIME / "prompts" / "tier-standard.md"
 HOOK_DEFINITION = RUNTIME / "hooks" / "hook-definition-unified-prompt.md"
 DECIDER = RUNTIME / "hooks" / "telegram-bridge-decide.py"
 INTAKE = RUNTIME / "hooks" / "telegram-bridge-intake.sh"
@@ -91,20 +91,18 @@ def run_decider(payload, paused=False, aliases=None):
 
 
 class UnifiedPromptTests(unittest.TestCase):
-    def test_unified_prompt_is_smaller_than_old_standard(self):
+    def test_unified_prompt_states_its_exact_size(self):
+        # The size discipline is the header comment, not a
+        # comparison: the prompt grew past the superseded
+        # standard file (13339 chars) when the P1 reaction-first
+        # rule and claim-card note landed — both are required
+        # behaviour, not bloat — so the old "smaller than the old
+        # standard" check was retired with them. What must hold
+        # is that the header states the prompt's exact size, so
+        # the hook definition and SETUP.md can carry the same
+        # number (see test_hook_definition_embeds_unified_prompt_verbatim).
         text = PROMPT.read_text()
-        old = OLD_STANDARD.read_text()
         tokens = _modelled_tokens(text)
-        old_tokens = _modelled_tokens(old)
-        # Real measured number, in the failure message too: the
-        # unified prompt must be smaller than the old standard
-        # prompt it replaces (13306 chars / ~3300 modelled tokens).
-        self.assertLess(
-            tokens, old_tokens,
-            f"unified prompt is {len(text)} chars / ~{tokens} modelled "
-            f"tokens; old standard is {len(old)} chars / ~{old_tokens}",
-        )
-        # The header comment states the same measured size.
         m = re.search(r"Size: (\d+) chars, ~(\d+) modelled tokens",
                       text)
         self.assertIsNotNone(m, "header comment must state the size")
@@ -440,98 +438,50 @@ class DeciderOutputTests(unittest.TestCase):
         self.assertIn("TELEGRAM_BRIDGE_BOT_USERNAME", proc.stderr)
 
 
-class TypingPreWakeTests(unittest.TestCase):
-    def setUp(self):
-        self.decider = load_decider()
+class NoPreWakeTypingTests(unittest.TestCase):
+    """P1: no pre-wake typing anywhere. Typing means "I am
+    responding", so it fires only while a turn is actually
+    running (the agent fires it after deciding to reply, and
+    --reply fires it right before sending). The defect was the
+    hook firing it pre-wake, while the turn might never start.
+    The decider carries no typing decision any more, and the
+    intake hook sends no --typing at all."""
 
-    def _payload(self, *items):
-        return {"items": list(items)}
+    def test_decider_has_no_typing_function(self):
+        decider = load_decider()
+        self.assertFalse(hasattr(decider, "typing_chat_id"))
+        self.assertFalse(hasattr(decider, "_mentions_bot"))
 
-    def _item(self, chat_id, chat_type, text, **kw):
-        item = {"update_id": 1, "chat_id": chat_id,
-                "chat_type": chat_type, "sender_id": 111, "text": text}
-        item.update(kw)
-        return item
-
-    def test_dm_fires_typing(self):
-        out = self.decider.typing_chat_id(self._payload(
-            self._item(111, "private", "hey")))
-        self.assertEqual(out, 111)
-
-    def test_command_fires_typing(self):
-        out = self.decider.typing_chat_id(self._payload(
-            self._item(-777, "group", "/who", is_owner=True)))
-        self.assertEqual(out, -777)
-
-    def test_mention_fires_typing(self):
-        out = self.decider.typing_chat_id(self._payload(
-            self._item(-777, "group", "@ExampleBot what do you think?")),
-            bot_username=BOT_USERNAME)
-        self.assertEqual(out, -777)
-
-    def test_open_group_message_does_not_fire_typing(self):
-        out = self.decider.typing_chat_id(self._payload(
-            self._item(-777, "group", "hello everyone", sender_id=222)),
-            bot_username=BOT_USERNAME)
-        self.assertIsNone(out)
-
-    def test_other_bot_message_does_not_fire_typing(self):
-        out = self.decider.typing_chat_id(self._payload(
-            self._item(-777, "group", "beep boop", sender_id=333,
-                       is_bot=True, sender_name="@SomeOtherBot")),
-            bot_username=BOT_USERNAME)
-        self.assertIsNone(out)
-
-    def test_alias_fires_typing(self):
-        # "@Example" is a configured alias here: typing fires for it
-        # just like for @ExampleBot.
-        with mock.patch.dict(os.environ,
-                             {"TELEGRAM_BRIDGE_BOT_ALIASES": "Example"}):
-            decider = load_decider()
-            out = decider.typing_chat_id(self._payload(
-                self._item(-777, "group", "@Example what do you think?",
-                           sender_id=222)),
-                bot_username=BOT_USERNAME)
-            self.assertEqual(out, -777)
-
-    def test_mention_of_another_bot_does_not_fire_typing(self):
-        out = self.decider.typing_chat_id(self._payload(
-            self._item(-777, "group", "@SomeOtherBot check this out",
-                       sender_id=222)),
-            bot_username=BOT_USERNAME)
-        self.assertIsNone(out)
-
-    def test_first_definite_item_wins(self):
-        out = self.decider.typing_chat_id(self._payload(
-            self._item(-777, "group", "hello everyone", sender_id=222),
-            self._item(111, "private", "hey")),
-            bot_username=BOT_USERNAME)
-        self.assertEqual(out, 111)
-
-    def test_intake_shell_wiring(self):
-        # The shell side: no tier injection any more, hydration in
-        # the wake branch, and the --typing call guarded so it only
-        # runs when typing_chat_id returned a chat.
+    def test_intake_shell_sends_no_typing(self):
+        # The hook never fires the typing indicator: no --typing
+        # call anywhere in the script, and no typing helper.
         text = INTAKE.read_text()
-        self.assertNotIn("inject_tier", text)
-        self.assertNotIn('tier="standard"', text)
-        self.assertIn("hydrate_and_typing", text)
-        self.assertIn("hydrate_payload", text)
-        self.assertIn("typing_chat_id", text)
-        self.assertIn(
-            '"$TELEGRAM_BRIDGE_SEND_CMD" --typing "$typing_chat"', text)
-        self.assertIn('if [ -n "$typing_chat" ]; then', text)
-        # The hold branch stores the payload unhydrated (the resume
-        # turn reads context.md itself).
-        hold = text.split("hold)")[1].split("done)")[0]
-        self.assertNotIn("hydrate", hold)
+        self.assertNotIn("--typing", text)
+        self.assertNotIn("typing_chat_id", text)
+        self.assertNotIn("hydrate_and_typing", text)
+        self.assertNotIn("typing_chat", text)
+
+    def test_intake_shell_sends_claim_ack_on_wake(self):
+        # The wake branch sends the ack status card after the
+        # wake-issue stamp and before waking: the card is the
+        # receipt that covers the pre-turn wait, and it never
+        # blocks the wake (best-effort, || true).
+        text = INTAKE.read_text()
+        wake = text.split("\n  wake)")[1].split("\n  hold)")[0]
+        self.assertIn("--send-claim-ack", wake)
+        self.assertIn("--wake-issued", wake)
+        self.assertLess(
+            wake.index("--wake-issued"), wake.index("--send-claim-ack"))
+        self.assertLess(
+            wake.index("--send-claim-ack"), wake.index('wake "telegram-message"'))
+        self.assertIn('|| true', wake)
 
     def test_intake_shell_helper_runs_verbatim(self):
-        # Extract hydrate_and_typing() verbatim from intake.sh and
-        # run it: a DM payload hydrates and yields its chat id; an
-        # open group payload hydrates and yields an empty typing line.
+        # Extract hydrate_wake_payload() verbatim from intake.sh
+        # and run it: the payload hydrates and the output is ONE
+        # line (the hydrated payload) — no typing line any more.
         text = INTAKE.read_text()
-        start = text.index("hydrate_and_typing() {")
+        start = text.index("hydrate_wake_payload() {")
         end = text.index("\n}\n", start) + len("\n}\n")
         func = text[start:end]
         with tempfile.TemporaryDirectory() as tmp:
@@ -546,25 +496,23 @@ class TypingPreWakeTests(unittest.TestCase):
                 f'export TELEGRAM_BRIDGE_BOT_USERNAME={BOT_USERNAME}\n'
                 f'source {func_path}\n'
             )
-            for payload, expected_typing in (
-                ('{"claim_token":"t","items":[{"update_id":1,'
-                 '"chat_id":111,"chat_type":"private","sender_id":111,'
-                 '"text":"hey"}]}', "111"),
-                ('{"claim_token":"t","items":[{"update_id":2,'
-                 '"chat_id":-777,"chat_type":"group","sender_id":222,'
-                 '"text":"hello all"}]}', ""),
-            ):
-                full = script + f"printf '%s' '{payload}' | hydrate_and_typing\n"
-                proc = subprocess.run(
-                    ["bash", "-c", full],
-                    capture_output=True, text=True, timeout=30)
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                lines = proc.stdout.splitlines()
-                self.assertEqual(len(lines), 2, proc.stdout)
-                hydrated = json.loads(lines[0])
-                self.assertEqual(hydrated["context_md"], "test context")
-                self.assertNotIn("tier", hydrated)
-                self.assertEqual(lines[1], expected_typing)
+            payload = ('{"claim_token":"t","items":[{"update_id":1,'
+                       '"chat_id":111,"chat_type":"private","sender_id":111,'
+                       '"text":"hey"}]}')
+            full = script + f"printf '%s' '{payload}' | hydrate_wake_payload\n"
+            proc = subprocess.run(
+                ["bash", "-c", full],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lines = proc.stdout.splitlines()
+            self.assertEqual(len(lines), 1, proc.stdout)
+            hydrated = json.loads(lines[0])
+            self.assertEqual(hydrated["context_md"], "test context")
+            self.assertNotIn("tier", hydrated)
+
+    def test_prompt_typing_line_says_hook_never_fires_pre_wake(self):
+        text = PROMPT.read_text()
+        self.assertIn("The hook never fires it pre-wake", text)
 
 
 if __name__ == "__main__":

@@ -290,6 +290,7 @@ class WatchdogSweepTests(unittest.TestCase):
             report = queue_core.watchdog_sweep(state, now=1050.0)
         self.assertEqual(report, {
             "recycled": [], "pending": 0, "claimed_live": 1, "sending": 0,
+            "lease_expired": [], "lease_escalated": [],
             "stuck_sending": [],
             # No poll ever recorded: no age to judge, never stale.
             "intake_age_seconds": None, "intake_stale": False,

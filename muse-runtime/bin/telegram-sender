@@ -48,6 +48,13 @@ Contract (from bridge_core/telegram.py):
       message before the full reply goes out. Best effort: a
       failure never blocks the reply that follows. Exit 0 on
       success, nonzero on failure. Reads no stdin.
+  telegram-sender --edit <chat_id> <message_id>
+      edit a message's text (editMessageText), e.g. the ack
+      status card the sweeper keeps current. The new text is
+      read from stdin (1-4096 characters). Best effort like
+      --delete, with the send exit contract (0 sent, 2 the edit
+      provably did not go through, 3 retryable, 1 unknown), so
+      the bridge can tell a stale edit target from a throttle.
   telegram-sender --register-commands <chat_id>
       register the command menu (setMyCommands) scoped to one
       private chat only, so the commands appear in the Telegram UI
@@ -552,6 +559,43 @@ def delete_message(chat_id, message_id):
     return bool(body.get("ok"))
 
 
+def edit_message_text(chat_id, message_id, text):
+    """Edit a message's text (editMessageText). Returns True when
+    Telegram accepted it.
+
+    Raises DefinitiveSendError / RetryableSendError exactly like
+    ``send_message`` (see there): a 400 is retried once as plain
+    text, 403/404 and ok:false are definitive, 429 gets one
+    Retry-After wait + retry and then is retryable, 5xx is
+    retryable. Any other failure propagates (unknown — the edit
+    may have gone through). Editing to identical text is a 400
+    ("message is not modified"): the caller must not edit a card
+    whose text has not changed (see bridge_core.telegram
+    refresh_ack_cards, which only edits on a text change)."""
+    html = {"chat_id": chat_id, "message_id": message_id,
+            "text": _sanitize_html(text), "parse_mode": "HTML"}
+    plain = {"chat_id": chat_id, "message_id": message_id,
+             "text": text}
+    retry_state = {"retried_429": False}
+    for fields in (html, plain):
+        try:
+            body = _post_with_429_retry(
+                lambda fields=fields: _post("editMessageText", fields),
+                retry_state,
+            )
+        except _TryNextVariant:
+            continue
+        if not body.get("ok"):
+            print(
+                f"telegram error: {body.get('description', 'unknown')}",
+                file=sys.stderr,
+            )
+            raise DefinitiveSendError(None)
+        return True
+    print("telegram error: all edit attempts rejected (400)", file=sys.stderr)
+    raise DefinitiveSendError(400)
+
+
 def register_commands(chat_id):
     """Register the command menu, scoped to one private chat only
     (BotCommandScopeChat), so the commands appear in the Telegram UI
@@ -618,6 +662,39 @@ def main() -> int:
                   file=sys.stderr)
             return 2
         return _run_api_call(delete_message, chat_id, message_id)
+    if len(sys.argv) == 4 and sys.argv[1] == "--edit":
+        chat_id = _int_arg(sys.argv[2], "chat_id")
+        message_id = _int_arg(sys.argv[3], "message_id")
+        if chat_id is None or message_id is None:
+            print("usage: telegram-sender --edit <chat_id> <message_id>",
+                  file=sys.stderr)
+            return 2
+        text = sys.stdin.read()
+        if not text.strip() or len(text) > 4096:
+            print("edit text must be 1-4096 characters", file=sys.stderr)
+            return 2
+        try:
+            ok = edit_message_text(chat_id, message_id, text)
+        except DefinitiveSendError as exc:
+            print(f"telegram rejected: {exc}", file=sys.stderr)
+            return 2
+        except RetryableSendError as exc:
+            if exc.retry_after is not None:
+                print(f"telegram HTTP {exc.code} "
+                      f"retry-after={exc.retry_after}", file=sys.stderr)
+            else:
+                print(f"telegram HTTP {exc.code}", file=sys.stderr)
+            return 3
+        except DynamicCredentialError as exc:
+            print(f"credential unavailable: {exc}", file=sys.stderr)
+            return 1
+        except urllib.error.HTTPError as exc:
+            print(f"telegram HTTP {exc.code}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001 - any edit failure is "unknown" upstream
+            print(f"edit failed: {exc}", file=sys.stderr)
+            return 1
+        return 0 if ok else 1
     if len(sys.argv) == 3 and sys.argv[1] == "--register-commands":
         chat_id = _int_arg(sys.argv[2], "chat_id")
         if chat_id is None:
@@ -690,6 +767,7 @@ def main() -> int:
             "telegram-sender --typing <chat_id> | "
             "telegram-sender --react <chat_id> <message_id> <emoji> | "
             "telegram-sender --delete <chat_id> <message_id> | "
+            "telegram-sender --edit <chat_id> <message_id> | "
             "telegram-sender --register-commands <chat_id> | "
             "telegram-sender --photo <chat_id> <file_path> [--reply-to <id>] [--keyboard] | "
             "telegram-sender --document <chat_id> <file_path> [--reply-to <id>] [--keyboard]",

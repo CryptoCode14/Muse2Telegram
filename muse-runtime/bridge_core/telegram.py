@@ -78,7 +78,44 @@ Keeps the operational interface the wake hook drives:
                            success, {"ok": false, "stage":
                            "already-acked"} when an ack is already
                            recorded, or the fence/config/rejected/
-                           retryable/unknown failure result.
+                           retryable/unknown failure result. The
+                           intake already sends a claim status card
+                           at claim (see --send-claim-ack), so this
+                           is for items the hook did not card (e.g.
+                           one claimed later with --claim-more); it
+                           answers already-acked when a card is out.
+  --send-claim-ack CLAIM_TOKEN
+                           send the ack status card for a claimed
+                           batch (one message for the whole batch,
+                           with the queue position), without closing
+                           anything. The intake hook calls this on
+                           the wake path, after --wake-issued: the
+                           card goes out only for a batch this Muse
+                           will actually answer, within one poll cycle
+                           of the claim. The card is a receipt, not
+                           an answer, and the sweeper edits that same
+                           message to keep it current (delayed /
+                           escalated) instead of sending a new one.
+                           Prints {"ok": true, "message_id": ...,
+                           "queue_position": n} on success,
+                           {"ok": false, "stage": "already-acked"}
+                           when a card is already recorded, or the
+                           stale-token/config/rejected/retryable/
+                           unknown result. A failed card never blocks
+                           the wake.
+  --react-batch CLAIM_TOKEN EMOJI
+                           the agent's FIRST tool call in a turn:
+                           react on every claimed message of the
+                           batch with the agent-chosen emoji, before
+                           any other work (including before
+                           --heartbeat). No script ever calls this:
+                           no scripted reaction exists anywhere in
+                           the bridge. Prints {"ok": true,
+                           "reacted": [...], "skipped": [...]}
+                           (skipped: button taps with no user message,
+                           and any reaction the sender refused), or
+                           {"ok": false, "stage": "stale-token" |
+                           "config" | "input"}.
   --claim-more CHAT_ID TOKEN [BATCH_SIZE]
                            pull messages that arrived during the turn
                            into this turn's batch (same lane, same
@@ -117,13 +154,27 @@ Keeps the operational interface the wake hook drives:
                            when the token owns no live batch.
   --watchdog               one watchdog pass: recycle claimed items
                            whose heartbeat went stale (a turn that
-                           died mid-work) back to pending, and print
-                           the sweep report JSON. Never touches
-                           sending / replied / live claims, never
-                           sends anything. The watchdog hook calls
-                           this every few minutes; the intake's next
-                           poll re-claims and re-wakes anything
-                           recycled here.
+                           died mid-work) back to pending, release
+                           never-started claims past the 120s claim
+                           lease (escalating at 3 attempts), refresh
+                           the ack status cards (EDITING the existing
+                           card messages, never sending a new one),
+                           and print the sweep report JSON. Never
+                           touches sending / replied / live claims.
+                           The watchdog hook calls this every 60s;
+                           the intake's next poll re-claims and
+                           re-wakes anything recycled here. The
+                           report carries "lease_expired" /
+                           "lease_escalated" (the hook wakes an
+                           agent once per escalation) and an
+                           "ack_cards" entry for the card pass.
+  --clear-lease ID         operator re-queue for a lease-escalated
+                           item: clear the escalation, its 24 h
+                           backoff, and the attempt counter, so the
+                           intake's next poll re-claims and re-wakes
+                           it. Only a pending, escalated item can be
+                           cleared. Prints {"ok": true} when one was
+                           cleared, {"ok": false} otherwise.
   --latency-report         read-only: per-stage latency medians from
                            the state file's items (ack, pickup, wake,
                            turn, total, plus the claim-to-wake
@@ -945,6 +996,12 @@ def fetch_updates(offset: int) -> dict:
 #: costs no model tokens (just network). A single-run lock (see
 #: run_once) keeps overlapping harness ticks from running two long
 #: polls at once.
+#: P1 latency, 2026-11-12: the synthesis proposed testing 30s ->
+#: 10s, but the change was NOT made: a shorter poll triples the
+#: getUpdates rate against the same live traffic, and no live
+#: load/rate measurement is possible from the sandbox (no live bot
+#: token or traffic here), so 30s stays until a live measurement
+#: justifies a change. Do not lower it on assumption.
 LONG_POLL_SECONDS_ENV = "TELEGRAM_BRIDGE_LONG_POLL_SECONDS"
 DEFAULT_LONG_POLL_SECONDS = 30
 MAX_LONG_POLL_SECONDS = 50
@@ -2882,6 +2939,12 @@ def _payload_item_minimal(item: dict) -> dict:
         "is_owner": False,
         "is_group_admin": False,
         "message_id": item.get("message_id"),
+        # The ack status card's message id, when the intake sent
+        # one at claim (see send_claim_ack): the card is the
+        # receipt the sweeper keeps current and the reply deletes.
+        # None at claim time (the card goes out after the payload
+        # is built) and on items the intake never carded.
+        "ack_message_id": item.get("ack_message_id"),
         "source": item.get("source"),
         "item_class": item.get("item_class"),
         "is_reply": bool(item.get("is_reply")),
@@ -2924,6 +2987,12 @@ def _payload_item(state: dict, item: dict, expired_ids: set) -> dict:
         # button taps (source "callback_query"): a tap has no user
         # message, so its reply is standalone and gets no reaction.
         "message_id": item.get("message_id"),
+        # The ack status card's message id, when the intake sent
+        # one at claim (see send_claim_ack): the card is the
+        # receipt the sweeper keeps current and the reply deletes.
+        # None at claim time (the card goes out after the payload
+        # is built) and on items the intake never carded.
+        "ack_message_id": item.get("ack_message_id"),
         # Where the item came from: "message" (typed/sent) or
         # "callback_query" (inline-keyboard button tap). Legacy
         # items carry None, which behaves like "message".
@@ -4203,6 +4272,169 @@ def send_ack(
     return {"ok": True, "message_id": message_id}
 
 
+#: Ack status card texts (P1 latency). The intake sends one card
+#: per claimed batch at claim time (see ``send_claim_ack``) and
+#: the sweeper edits that SAME message to keep it current (see
+#: ``refresh_ack_cards``) — never a second card, never a resend.
+#: The card is a receipt, not an answer: the agent still answers
+#: every command itself, and the card is deleted when the reply
+#: goes out (see ``send_reply``). No em dashes, matching the
+#: reply rules: the card is user-visible text.
+def claim_ack_text(position: int) -> str:
+    """The card text for a freshly claimed batch: the queue
+    position, honestly counted (see ``_queue_position``)."""
+    if position <= 1:
+        return "Got it, you're first in line. I'll reply here when ready."
+    return (
+        f"Got it, you're #{position} in the queue. "
+        "I'll reply here when ready."
+    )
+
+
+#: The card text once the claim lease has released the batch and
+#: it is waiting to be re-claimed: the reply is delayed, but the
+#: work is not dropped.
+CLAIM_ACK_DELAYED_TEXT = (
+    "Still in the queue, the reply is delayed, but I haven't "
+    "dropped it. I'll reply here when ready."
+)
+
+#: The card text once the sweeper has escalated the item (K
+#: lease expiries): the loop has stopped and an operator has
+#: been woken, so the card says flagged, not forgotten.
+CLAIM_ACK_ESCALATED_TEXT = (
+    "This is taking much longer than usual, I've flagged it for "
+    "a follow-up. I'll reply here when I can."
+)
+
+
+def _queue_position(state: dict, batch_items: list) -> int:
+    """This batch's queue position: 1 + the number of OTHER
+    conversation lanes with a claimed batch older than this
+    one (by claimed_at). A lane is (platform, chat_id); the
+    batch's own lane never counts against itself. Counts
+    batches ahead, not messages: a batch ahead of you is one
+    turn's wait, whatever its size."""
+    if not batch_items:
+        return 1
+    own_claimed = [
+        item.get("claimed_at")
+        for item in batch_items
+        if isinstance(item.get("claimed_at"), (int, float))
+    ]
+    if not own_claimed:
+        return 1
+    earliest = min(own_claimed)
+    own_lane = (batch_items[0].get("platform"), batch_items[0].get("chat_id"))
+    ahead = set()
+    for item in state.get("queue", []) or []:
+        if item.get("status") != queue_core.CLAIMED:
+            continue
+        if item.get("replied_at") is not None:
+            continue
+        lane = (item.get("platform"), item.get("chat_id"))
+        if lane == own_lane:
+            continue
+        claimed_at = item.get("claimed_at")
+        if isinstance(claimed_at, (int, float)) and claimed_at < earliest:
+            ahead.add(lane)
+    return 1 + len(ahead)
+
+
+def send_claim_ack(
+    store: JsonStateStore,
+    token,
+    *,
+    now: float | None = None,
+) -> dict:
+    """Send the ack status card for a claimed batch, without
+    closing anything. The intake hook calls this on the wake
+    path, after the decider has said "wake" and after
+    --wake-issued stamps the batch — so the card goes out only
+    for a batch this Muse will actually answer, within one poll
+    cycle of the claim, with the queue position in it. The card
+    is one message for the whole batch, threaded under the
+    batch's first item when it has a message_id (standalone
+    for a button-tap batch), and recorded on that first item
+    (``ack_message_id`` + ``ack_card_text``), so the sweeper
+    can edit it and the reply can delete it.
+
+    The fence is the same ownership check as a full send, plus
+    the one-ack-per-item guard (``reserve_ack`` /
+    ``mark_claim_ack``): a second concurrent claim-ack is
+    refused as "already-acked" without sending, so the card
+    can never go out twice. Unlike ``send_ack`` this does NOT
+    prove the turn started: the card is recorded with
+    ``mark_claim_ack``, which leaves ``turn_started_at`` and
+    the heartbeat alone — a carded batch whose turn never
+    starts is still lease-released by the sweeper.
+
+    Returns {"ok": true, "message_id": ..., "queue_position": n}
+    on success, {"ok": false, "stage": "already-acked"} when a
+    card is already recorded (or reserved), {"ok": false,
+    "stage": "stale-token"} when the token owns no live batch,
+    {"ok": false, "stage": "config"} when no send command is
+    configured, {"ok": false, "stage": "rejected"} /
+    "retryable" / "unknown" when the send did not go out (the
+    reservation is cleared on those, so a retry is safe).
+    Nothing is recorded on "unknown": the item stays claimed
+    and the wake proceeds anyway — a missing card never blocks
+    the wake, and the turn's own --send-ack still works.
+    """
+    send_cmd = os.environ.get(SEND_CMD_ENV)
+    if not send_cmd:
+        return {"ok": False, "stage": "config"}
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        items = [
+            item
+            for item in state.get("queue", [])
+            if item.get("status") == queue_core.CLAIMED
+            and item.get("claim_token") == token
+            and item.get("replied_at") is None
+        ]
+        if token is None or not items:
+            return {"ok": False, "stage": "stale-token"}
+        items.sort(key=lambda item: item.get("received_at") or 0)
+        anchor = items[0]
+        chat_id = anchor.get("chat_id")
+        if type(chat_id) is not int:
+            return {"ok": False, "stage": "fence"}
+        position = _queue_position(state, items)
+        text = claim_ack_text(position)
+        reply_to = anchor.get("message_id")
+        if not queue_core.reserve_ack(
+            state, PLATFORM, anchor["external_id"], token, now=now
+        ):
+            return {"ok": False, "stage": "already-acked"}
+    send_result = _run_send_command(
+        send_cmd, chat_id, text, reply_to=reply_to
+    )
+    outcome, message_id = send_result
+    if outcome != "sent":
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            queue_core.clear_ack(state, PLATFORM, anchor["external_id"], token)
+        if outcome == "rejected":
+            return {"ok": False, "stage": "rejected"}
+        if outcome == "retryable":
+            return {
+                "ok": False,
+                "stage": "retryable",
+                "retry_after": _retryable_delay_seconds(
+                    getattr(send_result, "retry_after", None)
+                ),
+            }
+        return {"ok": False, "stage": "unknown"}
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        queue_core.mark_claim_ack(
+            state, PLATFORM, anchor["external_id"], message_id, token,
+            card_text=text, now=now,
+        )
+    return {"ok": True, "message_id": message_id, "queue_position": position}
+
+
 def heartbeat_batch(store: JsonStateStore, token, *, now: float | None = None) -> dict:
     """Refresh the heartbeat of every claimed item under one batch
     token: the owning turn's proof it is still alive and working.
@@ -4224,27 +4456,202 @@ def heartbeat_batch(store: JsonStateStore, token, *, now: float | None = None) -
     return {"ok": True, "heartbeated": refreshed}
 
 
+def react_batch(store: JsonStateStore, token, emoji) -> dict:
+    """React on every claimed message of a batch, in one call.
+
+    The agent's FIRST tool call in a turn (see
+    prompts/unified.md): it reacts on the triggering
+    message(s) with an emoji it chooses as fitting, before any
+    other work — including before --heartbeat — so the reaction
+    lands within seconds of the bot reading the message. No
+    script ever calls this: no scripted reaction exists
+    anywhere in the bridge (Westin, 2026-11-12); the reaction
+    always comes from the agent itself.
+
+    Best-effort per message, fenced by the claim token: only
+    claimed, unreplied items under the token are reacted to,
+    each with the same agent-chosen emoji. An item with no
+    message_id (a button tap) is skipped, never reacted to —
+    there is no user message to react to. A failed reaction
+    never fails the turn: the result lists what was reacted to
+    and what was skipped, and the agent heartbeats and works
+    on regardless.
+
+    Returns {"ok": true, "reacted": [message_id, ...],
+    "skipped": [update_id, ...]} on success, {"ok": false,
+    "stage": "stale-token"} when the token owns no live batch,
+    and {"ok": false, "stage": "config"} when no send command
+    is configured. An empty emoji is refused as "input".
+    """
+    if not isinstance(emoji, str) or not emoji.strip():
+        return {"ok": False, "stage": "input"}
+    send_cmd = os.environ.get(SEND_CMD_ENV)
+    if not send_cmd:
+        return {"ok": False, "stage": "config"}
+    state = _ensure_adapter_state(store.load())
+    items = [
+        item
+        for item in state.get("queue", [])
+        if item.get("status") == queue_core.CLAIMED
+        and item.get("claim_token") == token
+        and item.get("replied_at") is None
+    ]
+    if token is None or not items:
+        return {"ok": False, "stage": "stale-token"}
+    items.sort(key=lambda item: item.get("received_at") or 0)
+    chat_id = items[0].get("chat_id")
+    reacted = []
+    skipped = []
+    for item in items:
+        message_id = item.get("message_id")
+        if message_id is None:
+            skipped.append(item["external_id"])
+            continue
+        if _run_sender_action(
+            send_cmd, ["--react", chat_id, message_id, emoji]
+        ):
+            reacted.append(message_id)
+        else:
+            skipped.append(item["external_id"])
+    return {"ok": True, "reacted": reacted, "skipped": skipped}
+
+
+def _desired_ack_card_text(state: dict, item: dict) -> str | None:
+    """The text the sweeper wants on one item's ack card, or
+    None when the card needs no update.
+
+    Only items with a recorded script card (``ack_card_text``
+    set — a turn's own --send-ack sets none) and a recorded
+    card message id are candidates, and only while unreplied:
+    a replied or done item's card is deleted by the reply, not
+    edited. Escalated wins over delayed: an escalated item's
+    card says flagged; a pending item that was lease-released
+    says delayed; a claimed item's card says its live queue
+    position. A pending item that was never lease-released has
+    no card to update (it never had one, or its turn already
+    closed it)."""
+    if item.get("ack_message_id") is None:
+        return None
+    if item.get("ack_card_text") is None:
+        return None
+    if item.get("replied_at") is not None:
+        return None
+    if item.get("status") == queue_core.DONE:
+        return None
+    if item.get("lease_escalated"):
+        return CLAIM_ACK_ESCALATED_TEXT
+    if item.get("status") == queue_core.CLAIMED:
+        batch = [
+            other
+            for other in state.get("queue", [])
+            if other.get("status") == queue_core.CLAIMED
+            and other.get("claim_token") == item.get("claim_token")
+            and other.get("replied_at") is None
+        ]
+        return claim_ack_text(_queue_position(state, batch))
+    if item.get("status") == queue_core.PENDING and item.get(
+        "lease_attempts", 0
+    ) > 0:
+        return CLAIM_ACK_DELAYED_TEXT
+    return None
+
+
+def refresh_ack_cards(store: JsonStateStore, *, now: float | None = None) -> dict:
+    """One sweeper pass over the ack status cards: edit each
+    card whose desired text changed, never send a new one.
+
+    Reads the state, computes the desired text per card (see
+    ``_desired_ack_card_text``: escalated, delayed, or live
+    queue position), edits only the cards whose text actually
+    differs — an identical-text edit is a Telegram 400, so it
+    is skipped, not attempted — and records the new text on
+    the items whose edit succeeded. Best-effort throughout: a
+    failed edit leaves the old text recorded (the next sweep
+    retries it), and a missing send command reports "config"
+    without failing anything. The watchdog sweep calls this
+    after its queue pass, so a lease release or escalation
+    updates its card within one sweep (~60 s).
+
+    Returns {"ok": true, "checked": n, "edited": n, "failed":
+    [external_id, ...]} (checked counts the cards examined,
+    edited the ones whose text changed on Telegram), or
+    {"ok": false, "stage": "config", "checked": n} when no
+    send command is configured.
+    """
+    send_cmd = os.environ.get(SEND_CMD_ENV)
+    state = _ensure_adapter_state(store.load())
+    cards = [
+        item
+        for item in state.get("queue", [])
+        if item.get("ack_message_id") is not None
+        and item.get("ack_card_text") is not None
+        and item.get("replied_at") is None
+        and item.get("status") != queue_core.DONE
+    ]
+    if not send_cmd:
+        return {"ok": False, "stage": "config", "checked": len(cards)}
+    pending_edits = []
+    for item in cards:
+        desired = _desired_ack_card_text(state, item)
+        if desired is None or desired == item.get("ack_card_text"):
+            continue
+        pending_edits.append((item, desired))
+    edited = []
+    failed = []
+    for item, desired in pending_edits:
+        if edit_message(
+            send_cmd,
+            item.get("chat_id"),
+            item.get("ack_message_id"),
+            desired,
+        ):
+            edited.append((item["external_id"], desired))
+        else:
+            failed.append(item["external_id"])
+    if edited:
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            for external_id, desired in edited:
+                item = queue_core.find_item(state, PLATFORM, external_id)
+                if item is not None and item.get("ack_message_id") is not None:
+                    item["ack_card_text"] = desired
+    return {
+        "ok": True,
+        "checked": len(cards),
+        "edited": len(edited),
+        "failed": failed,
+    }
+
+
 def watchdog_sweep(store: JsonStateStore, *, now: float | None = None) -> dict:
     """Run one watchdog pass over the queue and report it.
 
     Recycles claimed items whose heartbeat went stale (a turn that
-    died mid-work) back to pending, so the intake's next poll
-    re-claims and re-wakes them. Never touches ``sending`` items,
-    replied items, or live-heartbeat claims, and never sends
-    anything. Also verifies the bridge install (intake hook
-    definition, checkout, venv, sender — see
-    ``queue_core.check_bridge_health``). Returns the sweep report
-    (see ``queue_core.watchdog_sweep``).
+    died mid-work) back to pending, releases never-started claims
+    past the claim lease (see ``queue_core.sweep_claim_lease``),
+    and reports queue health and intake liveness. Never touches
+    ``sending`` items, replied items, or live-heartbeat claims.
+    After the queue pass it refreshes the ack status cards
+    (``refresh_ack_cards``): it EDITS the existing card messages
+    to their current text, it never sends a new Telegram message.
+    Returns the sweep report (see ``queue_core.watchdog_sweep``)
+    with an ``"ack_cards"`` entry for the card pass.
     """
     with store.transaction() as state:
         _ensure_adapter_state(state)
-        return queue_core.watchdog_sweep(
+        report = queue_core.watchdog_sweep(
             state,
             heartbeat_stale=_heartbeat_stale(),
             active_heartbeat_stale=_active_heartbeat_stale(),
             health=_bridge_health(),
             now=now,
         )
+    # Card edits run outside the transaction (they call the
+    # sender subprocess): a failed edit never fails the sweep,
+    # and the next sweep retries it — the recorded card text
+    # only advances on a successful edit.
+    report["ack_cards"] = refresh_ack_cards(store, now=now)
+    return report
 
 
 def mark_wake_issued(store: JsonStateStore, token, *, now: float | None = None) -> dict:
@@ -4330,6 +4737,8 @@ def latency_report(state: dict, *, now: float | None = None) -> dict:
     woken more than once) and ``extra_wakes`` (wakes beyond the
     first per item), ``wakes_without_turn`` (items with a wake
     issued and no recorded turn start — the Issue 1 failure mode),
+    ``lease_escalated_now`` (items escalated by the claim lease
+    right now — K never-started attempts, waiting on an operator),
     ``stuck_claims_now`` (claimed items recyclable right now under
     the same rule the watchdog sweep uses), and
     ``stuck_sending_now`` / ``stuck_sending`` (sending items past
@@ -4423,6 +4832,9 @@ def latency_report(state: dict, *, now: float | None = None) -> dict:
             "re_woken_items": re_woken_items,
             "extra_wakes": extra_wakes,
             "wakes_without_turn": wakes_without_turn,
+            "lease_escalated_now": sum(
+                1 for item in items if item.get("lease_escalated")
+            ),
             "stuck_claims_now": len(stuck_claims),
             "stuck_sending_now": len(stuck_sending),
             "stuck_sending": stuck_sending,
@@ -4535,21 +4947,24 @@ def send_batch_and_close(
 BEST_EFFORT_TIMEOUT_SECONDS = 10.0
 
 
-def _run_sender_action(send_cmd, argv_parts) -> bool:
+def _run_sender_action(send_cmd, argv_parts, stdin_text=None) -> bool:
     """Run one best-effort sender subcommand ([send_cmd, *argv_parts]).
 
     Returns True only when the sender exits 0. Any failure — the
     command is unconfigured, cannot start, times out, or exits
     nonzero — returns False and is logged to stderr; the caller
-    proceeds anyway. Never reads stdin and never returns a message
-    id: typing, reactions and deletes have no reply to record.
+    proceeds anyway. ``stdin_text`` is passed on stdin when the
+    subcommand reads text (``--edit``); typing, reactions and
+    deletes read no stdin and have no reply to record. Never
+    returns a message id: typing, reactions, deletes and edits
+    have no reply to record.
     """
     if not send_cmd:
         return False
     try:
         proc = subprocess.run(
             [send_cmd, *[str(part) for part in argv_parts]],
-            input=None,
+            input=stdin_text,
             capture_output=True,
             text=True,
             timeout=BEST_EFFORT_TIMEOUT_SECONDS,
@@ -4585,6 +5000,37 @@ def delete_message(send_cmd, chat_id, message_id) -> bool:
     except (TypeError, ValueError):
         return False
     return _run_sender_action(send_cmd, ["--delete", chat_id, message_id])
+
+
+def edit_message(send_cmd, chat_id, message_id, text) -> bool:
+    """Edit one Telegram message's text via the sender's --edit
+    subcommand ([send_cmd, --edit, CHAT_ID, MESSAGE_ID], new text
+    on stdin).
+
+    Best-effort, like ``delete_message``: returns True only when
+    the sender exits 0 (Telegram accepted the editMessageText).
+    Any failure returns False and the caller proceeds with the
+    stale text — a failed edit never blocks a reply or a sweep.
+    The sweeper uses this to keep the ack status card current
+    (see ``refresh_ack_cards``); it never edits a card whose
+    text has not changed, because Telegram answers an
+    identical-text edit with 400 "message is not modified".
+    ``send_cmd`` is the deployment's send executable, or None
+    when unconfigured (a plain failure, never a crash).
+    Non-integer ids, or empty / over-long text (Telegram caps
+    messages at 4096 chars), are refused without calling the
+    sender.
+    """
+    try:
+        chat_id = int(chat_id)
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(text, str) or not text.strip() or len(text) > 4096:
+        return False
+    return _run_sender_action(
+        send_cmd, ["--edit", chat_id, message_id], stdin_text=text
+    )
 
 
 def _warm_hold(
@@ -5323,6 +5769,70 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         print(json.dumps(result))
         return 0
 
+    if args[:1] == ["--send-claim-ack"]:
+        # --send-claim-ack CLAIM_TOKEN: send the ack status card
+        # for a claimed batch (one message, with the queue
+        # position), without closing anything. The intake hook
+        # calls this on the wake path, after --wake-issued, so
+        # the card goes out only for a batch this Muse will
+        # actually answer. Best-effort: a failed card never
+        # blocks the wake (the hook calls it with || true).
+        # Prints {"ok": true, "message_id": ..., "queue_position":
+        # n} on success, {"ok": false, "stage": "already-acked"}
+        # when a card is already recorded, or the
+        # stale-token/config/rejected/retryable/unknown result.
+        if len(args) != 2:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --send-claim-ack CLAIM_TOKEN",
+            }))
+            return 2
+        print(json.dumps(send_claim_ack(store, args[1])))
+        return 0
+
+    if args[:1] == ["--react-batch"]:
+        # --react-batch CLAIM_TOKEN EMOJI: the agent's FIRST tool
+        # call in a turn — react on every claimed message of the
+        # batch with the agent-chosen emoji, before any other work
+        # (including before --heartbeat). No script ever calls
+        # this: no scripted reaction exists anywhere in the
+        # bridge. Prints {"ok": true, "reacted": [...],
+        # "skipped": [...]} (skipped: button taps with no user
+        # message, and any reaction the sender refused), or {"ok":
+        # false, "stage": "stale-token" | "config" | "input"}.
+        if len(args) != 3 or not args[2].strip():
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --react-batch CLAIM_TOKEN EMOJI",
+            }))
+            return 2
+        print(json.dumps(react_batch(store, args[1], args[2])))
+        return 0
+
+    if args[:1] == ["--clear-lease"]:
+        # --clear-lease UPDATE_ID: operator re-queue for a
+        # lease-escalated item — clears the escalation, its 24 h
+        # backoff, and the attempt counter, so the intake's next
+        # poll re-claims and re-wakes it. Only a pending,
+        # escalated item can be cleared. Prints {"ok": true} when
+        # one was cleared, {"ok": false} otherwise.
+        if len(args) != 2:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --clear-lease UPDATE_ID",
+            }))
+            return 2
+        try:
+            target = int(args[1])
+        except ValueError:
+            print(json.dumps({"ok": False, "error": "invalid-update-id"}))
+            return 2
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            ok = queue_core.clear_lease_escalation(state, PLATFORM, target)
+        print(json.dumps({"ok": ok}))
+        return 0
+
     if args[:1] == ["--heartbeat"]:
         # --heartbeat CLAIM_TOKEN: refresh the heartbeat of every
         # claimed item under the token — the owning turn's proof it
@@ -5359,12 +5869,15 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
     if args[:1] == ["--watchdog"]:
         # --watchdog: one watchdog pass — recycle claimed items
         # whose heartbeat went stale (a turn that died mid-work)
-        # back to pending, verify the bridge install (intake hook
-        # definition, checkout, venv, sender), and report queue
-        # health. Never touches sending / replied / live claims,
-        # never sends anything.
+        # back to pending, release never-started claims past the
+        # 120s claim lease (escalating at 3 attempts), refresh the
+        # ack status cards (editing the existing card messages,
+        # never sending a new one), verify the bridge install
+        # (intake hook definition, checkout, venv, sender), and
+        # report queue health. Never touches sending / replied /
+        # live claims, never sends a new Telegram message.
         # Prints the sweep report JSON. The hook script calls this
-        # every few minutes; the intake's next poll re-claims and
+        # every 60 seconds; the intake's next poll re-claims and
         # re-wakes anything recycled here.
         if len(args) != 1:
             print(json.dumps({
