@@ -88,6 +88,10 @@ Commands work from the owner and from the group creator/admins. Anyone else's co
 
 The hook applies this routing before any agent wakes, so messages that are not for your Muse cost nothing. When your Muse is woken for a group message, the payload includes the recent room history, so it can see what the other bots said before replying. Bots never reply to each other on their own; they only answer another bot's message if it @mentions them or you asked them to.
 
+## Collab protocol (trusted multi-bot groups)
+
+The routing above is the silence-first default. If your group is trusted, has more than one bot, and you want the bots to work as teammates — subagents for different jobs that see each other, talk to each other, and say what they are doing — adopt `COLLAB_PROTOCOL.md` as a skill at install (see Step 4 in `SETUP.md`, skill `telegram-collab-protocol`). In that kind of group it wins over `CHAT_RULES.md`: free reign to status-update, ask each other questions, discuss, and hand work off, with ack-only text still a reaction, an ack still terminal, and one owner per task. In a guarded group, or a group with only one bot, it does not apply.
+
 ## Gotchas
 
 - Build the Telegram URL with the raw surrogate, exactly like the bridge intake does. The `url_with_surrogate_path_segment` helper percent-encodes the surrogate, and the encoded form is not substituted, so Telegram rejects the call with a 404. The sender in this folder already does it the right way.

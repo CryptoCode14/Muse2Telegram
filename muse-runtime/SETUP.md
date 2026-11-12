@@ -106,6 +106,10 @@ muse-runtime/
   CHAT_RULES.md       group-chat reply rules — adopt as a skill when
                       installing (reply behaviour, not personality;
                       the wake prompts carry the short version)
+  COLLAB_PROTOCOL.md  collab protocol for a trusted multi-bot group
+                      — adopt as a skill when installing, ONLY for
+                      that kind of group (teammates, not silence;
+                      see Step 4)
   requirements.txt    standard library only (no third-party packages)
   bridge_core/        the Telegram adapter + queue + state store
     telegram.py       intake, queueing, send fence, group modes
@@ -188,6 +192,24 @@ Copy the pieces to where they live on this host. Use these exact paths
   instead of text). It governs reply behaviour only, not any bot's
   personality or tone. Keep a copy where the installing Muse can
   read it with the prompts.
+- Collab protocol (multi-bot groups only): if the group is trusted,
+  has more than one bot, and the owner wants the bots to work as
+  teammates, adopt `muse-runtime/COLLAB_PROTOCOL.md` as a skill
+  too — copy it to `~/workspace/custom-skills/telegram-collab-protocol/COLLAB_PROTOCOL.md`
+  and create a `SKILL.md` in that folder with the skill name
+  `telegram-collab-protocol`, "When to use: in a trusted multi-bot
+  group where the owner wants the bots to collaborate as
+  teammates", and "Read COLLAB_PROTOCOL.md in this skill folder
+  for the full rules", plus the short version (free reign to
+  say what you are doing, ask each other questions, hand work
+  off; ack-only text stays a reaction; an ack is terminal; one
+  owner per task). Fill in the placeholders in COLLAB_PROTOCOL.md
+  at install ([USER], [YOUR MUSE NAME], [BOT LIST], [GROUP]).
+  In a trusted multi-bot group where this skill is adopted, it
+  wins over CHAT_RULES.md; in a guarded group, or a group with
+  only one bot, CHAT_RULES.md still governs and this skill does
+  not apply. Do not adopt it for a group that does not meet all
+  three conditions in COLLAB_PROTOCOL.md.
 - State: the bridge state lives at `~/workspace/telegram-bridge/state.json`.
   It is created on first run. It holds the owner id, the adopted
   groups (`group_ids` + one record per group in `groups`: mode, admin
