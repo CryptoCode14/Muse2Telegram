@@ -208,6 +208,27 @@ class UnifiedPromptTests(unittest.TestCase):
         self.assertIn("hook-definition-unified-prompt.md", doc)
 
 
+class WatchdogDefinitionTests(unittest.TestCase):
+    def test_watchdog_json_is_a_reference_not_a_drop_in(self):
+        # The shipped watchdog JSON holds the hook's settings, but
+        # no runtime-stamped fields: a verbatim copy does not parse
+        # (created_at_ms is missing), so SETUP must tell the
+        # installer to create the hook through the hook tool.
+        path = RUNTIME / "hooks" / "telegram-bridge-watchdog.json"
+        data = json.loads(path.read_text())
+        self.assertEqual(data["id"], "telegram-bridge-watchdog")
+        self.assertEqual(data["poll_interval_secs"], 120)
+        self.assertEqual(
+            data["script_path"],
+            "~/hooks/scripts/telegram-bridge-watchdog.sh",
+        )
+        self.assertIn("prompt", data)
+        self.assertNotIn("created_at_ms", data)
+        self.assertNotIn("updated_at_ms", data)
+        setup = (RUNTIME / "SETUP.md").read_text()
+        self.assertIn("do not copy the JSON file verbatim", setup)
+
+
 class ContextHydrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

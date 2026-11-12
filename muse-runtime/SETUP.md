@@ -420,9 +420,12 @@ install the superseded `router.md` or `tier-*.md` files.
 **Done looks like:** the hook is enabled, polling every 5s, and a dry
 run (no messages waiting) exits silently.
 
-Also install the queue watchdog hook from
+Also create the queue watchdog hook using the settings in
 `muse-runtime/hooks/telegram-bridge-watchdog.json` (poll every **120
-seconds**). It recycles claimed items whose heartbeat went stale — a
+seconds**) — create it through the hook tool, which stamps its own
+created and updated times; do not copy the JSON file verbatim, it
+has no timestamps and will not parse. It recycles claimed items
+whose heartbeat went stale — a
 turn that died mid-work — back to pending, so the intake's next poll
 re-claims and re-wakes them. It never sends a Telegram message and
 wakes an agent only when the sweep itself fails. **Done looks like:**
