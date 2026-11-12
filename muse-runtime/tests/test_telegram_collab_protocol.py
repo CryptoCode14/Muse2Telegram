@@ -52,8 +52,6 @@ _BANNED = [
 
 _TEMPLATE_CANDIDATES = [
     Path(__file__).resolve().parents[1],
-    Path.home() / "workspace" / "muse-agent-bridge-fork"
-    / "muse-runtime",
 ]
 
 

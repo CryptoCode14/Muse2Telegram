@@ -359,7 +359,7 @@ Batch size and stale TTL can be tuned with ``$TELEGRAM_BRIDGE_BATCH_SIZE``
 and ``$TELEGRAM_BRIDGE_STALE_TTL`` (seconds). The heartbeat horizon —
 how long a claim may go without a heartbeat before it counts as
 abandoned — is ``$TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS`` (default
-120): the owning turn heartbeats while it works (``--heartbeat``,
+600): the owning turn heartbeats while it works (``--heartbeat``,
 plus automatic refresh on ack / claim-more), and a claim whose
 heartbeat goes stale is recycled on the next claim instead of
 blocking its lane for the full stale TTL. The settle window before
@@ -434,11 +434,11 @@ HOOK_DEFINITIONS_ENV = "TELEGRAM_BRIDGE_HOOK_DEFINITIONS_DIR"
 #: in a second or two); the ceiling only bounds a hung sender.
 SEND_TIMEOUT_SECONDS = 200.0
 
-#: Fixed acknowledgement text (Westin's words) for long work. A turn
-#: that will take 10+ minutes sends this first, so the owner knows
-#: the turn is working instead of wondering whether it errored. The
-#: text is fixed — never customized per turn — and short. Comma, not
-#: a dash, per Westin's style (no em dashes in replies).
+#: Fixed acknowledgement text for long work. A turn that will take
+#: 10+ minutes sends this first, so the owner knows the turn is
+#: working instead of wondering whether it errored. The text is
+#: fixed — never customized per turn — and short. Comma, not a dash,
+#: per the owner's style (no em dashes in replies).
 ACK_TEXT = "Got it, looking into this, will reply when ready."
 
 #: Environment variables tuning the pending-expiry sweep (claim-time
@@ -506,12 +506,13 @@ def poll_lock_path() -> Path:
 #: Environment variable naming this deployment's bot username, used
 #: by the intake classifier to recognise messages addressed to the
 #: bot. Telegram usernames are case-insensitive; a leading "@" in
-#: the value is ignored.
+#: the value is ignored. There is no default: the variable must be
+#: set, or the bridge refuses to run instead of silently
+#: identifying as some other bot.
 BOT_USERNAME_ENV = "TELEGRAM_BRIDGE_BOT_USERNAME"
-DEFAULT_BOT_USERNAME = "usedhonda_muse_bot"
 
 #: Optional comma-separated short names that also @mention this bot
-#: (e.g. "Dorian" for a bot whose username is DorianCodingBot).
+#: (e.g. "Example" for a bot whose username is ExampleBot).
 #: Set with TELEGRAM_BRIDGE_BOT_ALIASES, no "@", case-insensitive.
 #: Unset means only the bot's username counts as a mention of it.
 #: Aliases are read by the intake classifier, the preclaim filter,
@@ -601,7 +602,13 @@ def _env_seconds(name: str, default):
 
 
 def _bot_username() -> str:
-    raw = os.environ.get(BOT_USERNAME_ENV, "") or DEFAULT_BOT_USERNAME
+    raw = os.environ.get(BOT_USERNAME_ENV, "")
+    if not raw.strip():
+        raise RuntimeError(
+            "TELEGRAM_BRIDGE_BOT_USERNAME is not set: set it to this "
+            "bot's Telegram username (without '@') before running "
+            "the bridge."
+        )
     return raw.strip().lstrip("@").lower()
 
 

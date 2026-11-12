@@ -52,6 +52,9 @@ the user what is missing.
   bot token surrogate. Do not substitute a raw token anywhere.
 - Surrogate-aware egress for `api.telegram.org` in the hook execution
   context. An ordinary shell with HTTPS access alone is insufficient.
+- Voice notes only: a local Whisper install (see the optional voice
+  step after Step 4). Without it, voice notes fail gracefully and
+  the agent asks the sender for text — nothing else breaks.
 
 ## Step 1 — Create the bot in BotFather
 
@@ -87,8 +90,22 @@ The registered connection is named `custom.telegram-muse-bot`. The token
 is stored in the Secure Vault. It must never appear in a file, a command
 argument, an environment variable, or a log.
 
+How the flow works: the secure registration page is the runtime's own
+page for entering a secret (in this runtime, the
+`credentials.request_api_access` flow) — the user pastes the token
+there, the runtime stores it in the Secure Vault under the provider
+name above, and the bridge and sender never see the token itself:
+at call time they ask the runtime's `dynamic_credentials` helper for
+a surrogate, and the egress layer swaps the surrogate for the real
+token on the way to `api.telegram.org`. That is why the registration
+details have to match exactly — the provider name, the placement,
+and the host list are what the helper and the egress layer key on.
+
 **Done looks like:** the registration succeeds and the connector
 `custom.telegram-muse-bot` exists. Do not proceed until it does.
+Verify it by running the intake once in Step 6: a missing or
+mis-registered credential fails there, loudly, before any message
+is answered.
 
 ## Step 3 — Get the bridge code
 
@@ -115,6 +132,11 @@ muse-runtime/
     telegram.py       intake, queueing, send fence, group modes
     queue.py          the queue core
     store.py          the JSON state store
+    delivery_ledger.py  delivery ledger (send outcomes, no black hole)
+    memory_recall.py  keyword recall with bounded summaries
+    message_cache.py  disk-backed message cache with reply chains
+    prompt_assembly.py  prompt assembly helpers
+    prompt_pin.py     byte-stable prompt pin
     __init__.py
   tests/              offline tests (local fixtures, fake responses)
   bin/telegram-sender the send executable (sendMessage / sendPhoto /
@@ -126,9 +148,16 @@ muse-runtime/
                                 verifies the install)
     telegram-bridge-watchdog.json
                                 the watchdog hook definition (60s poll)
+    hook-definition-unified-prompt.md
+                                exact text + install steps for the
+                                unified prompt as the hook definition
+                                prompt
+    wake-prompt.md      pointer to the unified prompt (the old
+                                wake prompt lived here; do not install
+                                the superseded files below)
   prompts/
     unified.md        the hook-definition prompt (one static prompt
-                      for every wake; 12220 chars, ~3055 modelled
+                      for every wake; 13215 chars, ~3304 modelled
                       tokens)
     router.md, tier-quick.md, tier-standard.md, tier-deep.md
                       superseded in v2; kept for history only,
@@ -151,7 +180,15 @@ suite.
 ## Step 4 — Install the files
 
 Copy the pieces to where they live on this host. Use these exact paths
-(the bridge, hook, and prompts all assume them):
+(the bridge, hook, and prompts all assume them). Create the
+destination directories first — none of them exist on a fresh host:
+
+```text
+mkdir -p ~/workspace/custom-connectors/custom.telegram-muse-bot/bin
+mkdir -p ~/hooks/scripts ~/hooks/definitions
+mkdir -p ~/workspace/telegram-bridge
+mkdir -p ~/workspace/custom-skills/telegram-collab-protocol
+```
 
 - Sender: copy `muse-runtime/bin/telegram-sender` to the connector bin
   (e.g. `~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender`).
@@ -232,6 +269,32 @@ Copy the pieces to where they live on this host. Use these exact paths
   groups (`group_ids` + one record per group in `groups`: mode, admin
   list, member count, safety trip, notice, room buffer), the default
   mode, and the queue. It is **never** committed to the repo and never shared.
+- Compact context: create `~/workspace/telegram-bridge/context.md`
+  (the `mkdir -p` above already made the directory). It is the woken
+  agent's compact context — a short file, in your own words, saying
+  who the user is, how they talk, and what matters to them, for
+  example:
+
+  ```text
+  # Context for [YOUR MUSE NAME]
+
+  [USER] is the owner. [Describe them in a sentence or two: what
+  they do, what they care about.]
+
+  How [USER] talks: [short and direct / detailed / formal — whatever
+  is true, so replies land in their voice.]
+
+  What matters: [the two or three things the bot must get right —
+  e.g. the business, the family, the projects in flight.]
+  ```
+
+  The hook pre-loads this file into every wake payload as
+  `context_md` (bounded to 6000 chars). If the file is missing,
+  `context_md` arrives as `null` and the woken agent works without
+  the compact context (it may read `~/MEMORY.md` for detail instead);
+  the bridge does not fail the wake, but the agent starts each turn
+  knowing less about the user. Write the file before the first live
+  wake.
 
 Set these env vars for every bridge command and in the hook script:
 
@@ -246,18 +309,38 @@ TELEGRAM_BRIDGE_SETTLE_SECONDS=2
 ```
 
 In the hook script, set `TELEGRAM_BRIDGE_BOT_USERNAME` to your bot's
-username. The decider falls back to a default when the env var is unset
-— do not rely on the fallback; set it.
+username. There is no default: the decider and the bridge refuse to
+run when it is unset (or set to the literal placeholder
+`YOUR_BOT_USERNAME` in the shipped script) instead of silently
+answering as some other bot — so set it, and check the failure
+message if a run refuses to start.
 
 `TELEGRAM_BRIDGE_BOT_ALIASES` is optional: comma-separated short
-names (no "@", e.g. `Dorian` for a bot whose username is
-`DorianCodingBot`). An `@<alias>` @mention wakes this bot just like
+names (no "@", e.g. `Example` for a bot whose username is
+`ExampleBot`). An `@<alias>` @mention wakes this bot just like
 `@<username>`, in the decider, the adapter's preclaim filter, and
 the typing indicator, and the unified prompt says so. This is
 per-bot: every bot that installs the repo sets its own aliases, and
-each bot only wakes for its own username and aliases — `@Dorian`
-wakes Dorian, `@Gus` wakes Gus, and so on. Unset, only the username
-counts.
+each bot only wakes for its own username and aliases — `@Example`
+wakes ExampleBot, and so on. Unset, only the username counts.
+
+## Optional step — voice transcription (Whisper)
+
+Voice notes need a local Whisper install; without it they fail
+gracefully and the woken agent asks the sender to send text
+instead. Only do this step if the owner wants voice notes answered.
+It is the same setup as in `README.md` ("Voice messages"):
+
+```text
+python3 -m venv ~/workspace/whisper-venv && ~/workspace/whisper-venv/bin/pip install numpy faster-whisper
+~/workspace/whisper-venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-tiny', local_dir='~/workspace/models/whisper-tiny')"
+```
+
+That installs the `faster-whisper` transcriber and the tiny model
+(free, ~75MB) at the paths the wake prompt checks
+(`~/workspace/whisper-venv/bin/python` and
+`~/workspace/models/whisper-tiny`). Skip the step and voice notes
+simply stay text-only.
 
 ## Step 5 — Ask the mode question (trusted or guarded)
 
@@ -309,9 +392,18 @@ cd <bridge checkout> && TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/s
 Send a DM to the bot first ("How are you?"), then run the intake. The
 first DM only registers the user as a candidate; a second DM is the one
 that gets a reply. This run proves the credential works from the
-sandbox: a clean run exits 0 with no output when nothing waits, and a
-`403` means the credential is not available to the calling context
-(check the registration in Step 2).
+sandbox: a clean run exits 0 with no output when nothing waits.
+
+A missing or mis-registered credential does NOT show up as a clean
+`403`. The bridge asks the runtime's credential helper for the token
+surrogate before it makes any HTTP call, and the helper raises when
+the credential is unavailable — so the intake fails outright
+(nonzero exit, traceback in
+`~/workspace/telegram-bridge/intake-errors.log`), before Telegram is
+ever contacted. If you do see a `403` in that log, it came back from
+Telegram itself, which means the token was rejected (wrong or
+revoked token), not that the registration is missing: re-check the
+token in Step 2, never the registration alone.
 
 ## Step 7 — Adopt the owner
 
@@ -409,6 +501,20 @@ This calls `setMyCommands` with /pause, /resume, /status, /help, /who,
 
 ## Step 10 — Install and enable the hook
 
+A hook is a definition the Muse runtime's hook tool registers: a
+JSON record naming the hook (id), the script to run, the poll
+interval, the prompt text, and whether it is enabled. The hook tool
+stamps the record with its own created and updated times
+(`created_at_ms` / `updated_at_ms`) when it creates the hook — the
+shipped JSON files in this repo do not carry those fields, so a
+definition copied verbatim from the repo never parses and never
+runs. Create both hooks below through the hook tool, never by
+copying a JSON file into the definitions folder and never by editing
+a definition file by hand. This repo does not document the hook
+tool's UI path or command — where you run it depends on your Muse
+runtime, so use the runtime's own hook tool and ask the user if you
+cannot find it.
+
 Create a hook that runs `telegram-bridge-intake.sh` on a **5 second**
 poll interval. The hook script polls Telegram (long-poll 30s), feeds the
 payload to the decider, and wakes your Muse only when a message needs
@@ -419,7 +525,7 @@ The hook definition prompt is the unified prompt in
 definition prompt (replacing the placeholders), following the exact
 install steps in `muse-runtime/hooks/hook-definition-unified-prompt.md`.
 It is the woken agent's full instruction for the turn: one static text
-for every wake (13054 chars, ~3264 modelled tokens). There is no
+for every wake (13215 chars, ~3304 modelled tokens). There is no
 per-batch prompt selection any more: the decider prints only `wake` /
 `hold` / `done` / `empty`, and the intake hook pre-loads the agent's
 context into the wake payload as `context_md` (the bounded contents of

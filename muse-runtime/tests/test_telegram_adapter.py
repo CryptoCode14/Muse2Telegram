@@ -111,6 +111,9 @@ def run_cli(path, argv, fetch=None, stdin_text="", api_call=None, rate_path=None
         # shares the live lock (and never flakes against the live
         # intake holding it).
         telegram.POLL_LOCK_PATH_ENV: str(Path(path).parent / "poll.lock"),
+        # The bridge refuses to run without its bot username (no
+        # default): the fixture name stands in for a real bot.
+        telegram.BOT_USERNAME_ENV: "ExampleBot",
     }
     try:
         with mock.patch.dict(os.environ, env):
@@ -731,12 +734,12 @@ class IntakeClassificationTests(unittest.TestCase):
                 msg_update(2, GROUP, "group", 222, "plain agent chatter",
                            "kai_bot", True),
                 # A mention of the bot (any case) is a request.
-                msg_update(3, GROUP, "group", 333, "hey @Usedhonda_Muse_Bot check this"),
+                msg_update(3, GROUP, "group", 333, "hey @ExampleBot check this"),
                 # A bot command is a request.
                 msg_update(4, GROUP, "group", 333, "/status please"),
                 # A bot addressing this bot is a request, exactly
                 # like a human addressing it.
-                msg_update(5, GROUP, "group", 222, "@usedhonda_muse_bot take this",
+                msg_update(5, GROUP, "group", 222, "@ExampleBot take this",
                            "kai_bot", True),
                 # The owner's DM is a request.
                 msg_update(6, OWNER, "private", OWNER, "a dm ask"),
@@ -799,6 +802,12 @@ class IntakeProtectionClassificationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "state.json"
+        # These tests call telegram.ingest directly, which ensures
+        # adapter state and now needs the bot username (no default).
+        self._env = mock.patch.dict(os.environ, {
+            telegram.BOT_USERNAME_ENV: "ExampleBot"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
         run_cli(self.path, ["--adopt", str(OWNER)])
 
     def tearDown(self):
@@ -985,6 +994,12 @@ class ExpiredContextTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "state.json"
+        # This test calls telegram.ingest directly, which ensures
+        # adapter state and now needs the bot username (no default).
+        self._env = mock.patch.dict(os.environ, {
+            telegram.BOT_USERNAME_ENV: "ExampleBot"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
         run_cli(self.path, ["--adopt", str(OWNER)])
 
     def tearDown(self):
@@ -2044,3 +2059,25 @@ class DoneDefaultReasonTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BotUsernameRequiredTests(unittest.TestCase):
+    """No default bot username any more: _bot_username() must fail
+    loudly (unset or blank) instead of silently identifying as some
+    other bot."""
+
+    def test_unset_bot_username_fails_loudly(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                RuntimeError, "TELEGRAM_BRIDGE_BOT_USERNAME"
+            ):
+                telegram._bot_username()
+
+    def test_blank_bot_username_fails_loudly(self):
+        with mock.patch.dict(
+            os.environ, {telegram.BOT_USERNAME_ENV: "   "}
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "TELEGRAM_BRIDGE_BOT_USERNAME"
+            ):
+                telegram._bot_username()

@@ -24,7 +24,7 @@ OWNER = 111
 GROUP = -777
 STRANGER = 222
 OTHER_BOT = 333
-BOT_USERNAME = "Westinmusebot"
+BOT_USERNAME = "ExampleBot"
 
 
 def msg_update(uid, chat_id, chat_type, sender_id, text, username=None,
@@ -167,7 +167,7 @@ class GroupModeTests(unittest.TestCase):
         # No group is adopted yet: the setup default is guarded.
         self.assertEqual(state["default_group_mode"], "guarded")
         self.assertEqual(state["group_ids"], [])
-        self.assertEqual(state["trusted_bots"], ["westinmusebot"])
+        self.assertEqual(state["trusted_bots"], ["examplebot"])
 
     def test_payload_carries_mode_fields_trusted(self):
         self.preset_state(mode="trusted")
@@ -218,7 +218,7 @@ class GroupModeTests(unittest.TestCase):
         state = self.load_state()
         self.assertEqual(self.group_state(state)["mode"], "trusted")
         # The list is unchanged too: no Telegram command manages it.
-        self.assertEqual(state["trusted_bots"], ["westinmusebot"])
+        self.assertEqual(state["trusted_bots"], ["examplebot"])
 
     def test_stranger_mode_word_does_not_change_mode(self):
         self.preset_state(mode="trusted")
@@ -265,7 +265,7 @@ class GroupModeTests(unittest.TestCase):
         self.preset_state(mode="trusted")
         payload = self.run_updates([
             msg_update(1, GROUP, "group", 444, "hello?",
-                     username="Westinmusebot", is_bot=True),
+                     username="ExampleBot", is_bot=True),
         ])
         self.assertIsNotNone(payload)
         self.assertFalse(payload["group_safety_tripped"])
@@ -378,7 +378,7 @@ class GroupModeTests(unittest.TestCase):
         )
         self.assertTrue(result["ok"])
         self.assertEqual(result["trusted_bots"],
-                         ["businessbot", "westinmusebot", "workbot"])
+                         ["businessbot", "examplebot", "workbot"])
         state = self.load_state()
         # Adding a bot does not change the mode and does not clear
         # a safety trip.
@@ -421,7 +421,7 @@ class GroupModeTests(unittest.TestCase):
         result = run_cli(self.state_path, ["--group-mode"],
                          rate_path=self.rate_path)
         self.assertTrue(result["ok"])
-        self.assertEqual(result["trusted_bots"], ["westinmusebot"])
+        self.assertEqual(result["trusted_bots"], ["examplebot"])
         self.assertEqual(len(result["groups"]), 1)
         view = result["groups"][0]
         self.assertEqual(view["chat_id"], GROUP)

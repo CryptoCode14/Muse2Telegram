@@ -337,7 +337,7 @@ class PromptPinTests(unittest.TestCase):
 
 class MemoryRecallTests(unittest.TestCase):
     MEMORY = (
-        "Westin likes his hockey game on Friday night at the rink.\n"
+        "Alex likes their hockey game on Friday night at the rink.\n"
         "The team plays hard and the goalie stands tall.\n\n"
         "The Delta feed store opens at 9am and closes at 5pm on weekdays.\n"
         "Customers come in for chicken feed and horse feed.\n\n"

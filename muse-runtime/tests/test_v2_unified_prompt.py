@@ -42,7 +42,7 @@ HOOK_DEFINITION = RUNTIME / "hooks" / "hook-definition-unified-prompt.md"
 DECIDER = RUNTIME / "hooks" / "telegram-bridge-decide.py"
 INTAKE = RUNTIME / "hooks" / "telegram-bridge-intake.sh"
 
-BOT_USERNAME = "Westinmusebot"
+BOT_USERNAME = "ExampleBot"
 
 
 def _modelled_tokens(text):
@@ -50,6 +50,9 @@ def _modelled_tokens(text):
 
 
 def load_decider():
+    # The decider refuses to import without its bot username; set
+    # the fixture name first so the module loads.
+    os.environ["TELEGRAM_BRIDGE_BOT_USERNAME"] = BOT_USERNAME
     spec = importlib.util.spec_from_file_location(
         "telegram_bridge_decide_v2test", DECIDER
     )
@@ -349,18 +352,18 @@ class DeciderOutputTests(unittest.TestCase):
         self.assertEqual(out, "wake")
 
     def test_at_alias_wakes(self):
-        # "@Westin" is a configured alias of the test bot
-        # (Westinmusebot): it wakes just like @Westinmusebot.
+        # "@Example" is a configured alias of the test bot
+        # (ExampleBot): it wakes just like @ExampleBot.
         out = run_decider({"items": [
-            self._item(1, "@Westin check this", chat_type="group",
-                       sender_id=222)]}, aliases="Westin")
+            self._item(1, "@Example check this", chat_type="group",
+                       sender_id=222)]}, aliases="Example")
         self.assertEqual(out, "wake")
 
     def test_at_unaliased_short_name_still_closes(self):
-        # No aliases configured: "@Westin" mentions someone else,
+        # No aliases configured: "@Example" mentions someone else,
         # so the decider closes it with no wake.
         out = run_decider({"items": [
-            self._item(1, "@Westin check this", chat_type="group",
+            self._item(1, "@Example check this", chat_type="group",
                        sender_id=222)]})
         self.assertEqual(out, "done 1")
 
@@ -383,6 +386,26 @@ class DeciderOutputTests(unittest.TestCase):
         ):
             out = run_decider(payload)
             self.assertNotIn("tier", out.lower(), out)
+
+    def test_decider_refuses_to_run_without_bot_username(self):
+        # No default any more: without TELEGRAM_BRIDGE_BOT_USERNAME
+        # the decider must fail loudly instead of silently answering
+        # as some other bot.
+        env = dict(os.environ)
+        env.pop("TELEGRAM_BRIDGE_BOT_USERNAME", None)
+        tmpdir = tempfile.mkdtemp()
+        env["TELEGRAM_BRIDGE_PAUSED_PATH"] = os.path.join(tmpdir, "PAUSED")
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(DECIDER)],
+                input=json.dumps({"items": [self._item(1, "hey")]}),
+                capture_output=True, text=True, env=env, timeout=30,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("TELEGRAM_BRIDGE_BOT_USERNAME", proc.stderr)
 
 
 class TypingPreWakeTests(unittest.TestCase):
@@ -410,7 +433,7 @@ class TypingPreWakeTests(unittest.TestCase):
 
     def test_mention_fires_typing(self):
         out = self.decider.typing_chat_id(self._payload(
-            self._item(-777, "group", "@Westinmusebot what do you think?")),
+            self._item(-777, "group", "@ExampleBot what do you think?")),
             bot_username=BOT_USERNAME)
         self.assertEqual(out, -777)
 
@@ -428,13 +451,13 @@ class TypingPreWakeTests(unittest.TestCase):
         self.assertIsNone(out)
 
     def test_alias_fires_typing(self):
-        # "@Westin" is a configured alias here: typing fires for it
-        # just like for @Westinmusebot.
+        # "@Example" is a configured alias here: typing fires for it
+        # just like for @ExampleBot.
         with mock.patch.dict(os.environ,
-                             {"TELEGRAM_BRIDGE_BOT_ALIASES": "Westin"}):
+                             {"TELEGRAM_BRIDGE_BOT_ALIASES": "Example"}):
             decider = load_decider()
             out = decider.typing_chat_id(self._payload(
-                self._item(-777, "group", "@Westin what do you think?",
+                self._item(-777, "group", "@Example what do you think?",
                            sender_id=222)),
                 bot_username=BOT_USERNAME)
             self.assertEqual(out, -777)

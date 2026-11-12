@@ -25,7 +25,7 @@ GROUP = -777
 OTHER_GROUP = -888
 STRANGER = 222
 OTHER_BOT = 333
-BOT_USERNAME = "Westinmusebot"
+BOT_USERNAME = "ExampleBot"
 
 
 def msg_update(uid, chat_id, chat_type, sender_id, text, username=None,

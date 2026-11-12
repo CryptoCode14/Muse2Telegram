@@ -10,6 +10,13 @@
 #   done - nothing in the batch needs this Muse; close each item with
 #          no reply so it never wakes anyone.
 set -euo pipefail
+# The hook runtime provides wake/silent/log. Outside the Muse hook
+# runtime HATCH_HOOK_RUNTIME is unset; say so plainly instead of
+# failing with an "unbound variable" error under set -u.
+if [ -z "${HATCH_HOOK_RUNTIME:-}" ]; then
+  echo "telegram-bridge-intake.sh requires the Muse hook runtime (HATCH_HOOK_RUNTIME is not set)" >&2
+  exit 1
+fi
 source "$HATCH_HOOK_RUNTIME"
 # muse-runtime/ holds bridge_core/ and .venv. Derive it from this
 # script's own location when run from the repo; after install to
@@ -24,7 +31,13 @@ cd "$BRIDGE_HOME"
 export TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json
 export TELEGRAM_BRIDGE_SEND_CMD=~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender
 export TELEGRAM_BRIDGE_BOT_USERNAME="YOUR_BOT_USERNAME"  # <-- set to your bot username
-# export TELEGRAM_BRIDGE_BOT_ALIASES=""  # <-- optional: short names that also @mention this bot, comma-separated, no @ (e.g. "Dorian")
+# Refuse the literal placeholder: it looks like a username but is
+# not one, and polling as it would answer @mentions meant for nobody.
+if [ "$TELEGRAM_BRIDGE_BOT_USERNAME" = "YOUR_BOT_USERNAME" ]; then
+  echo "TELEGRAM_BRIDGE_BOT_USERNAME is still the placeholder YOUR_BOT_USERNAME: set it to your bot's Telegram username (no '@') in telegram-bridge-intake.sh" >&2
+  exit 1
+fi
+# export TELEGRAM_BRIDGE_BOT_ALIASES=""  # <-- optional: short names that also @mention this bot, comma-separated, no @ (e.g. "Example")
 export TELEGRAM_BRIDGE_PAUSED_PATH=~/workspace/telegram-bridge/PAUSED
 export TELEGRAM_BRIDGE_HELD_PATH=~/workspace/telegram-bridge/held.jsonl
 # Settle window (seconds): when a message lands, intake waits out

@@ -14,6 +14,7 @@ Invariant: a message addressed to the bot is answered (or held
 pending for retry), never silently dropped.
 """
 import unittest
+import os
 from unittest import mock
 
 from bridge_core import queue as queue_core
@@ -79,6 +80,14 @@ def claim_and_payload(state):
 
 
 class LegacyStateTests(unittest.TestCase):
+    def setUp(self):
+        # telegram.ingest ensures adapter state, which now needs the
+        # bot username (no default): the fixture name stands in.
+        self._env = mock.patch.dict(os.environ, {
+            telegram.BOT_USERNAME_ENV: "ExampleBot"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
     def test_legacy_state_migrates_and_payloads(self):
         """A pre-multi-group state (group_id/group_buffer keys) must
         ingest and payload without KeyError; the legacy keys migrate
@@ -145,6 +154,14 @@ class LegacyStateTests(unittest.TestCase):
 
 
 class NeverLoseAMessageTests(unittest.TestCase):
+    def setUp(self):
+        # telegram.ingest ensures adapter state, which now needs the
+        # bot username (no default): the fixture name stands in.
+        self._env = mock.patch.dict(os.environ, {
+            telegram.BOT_USERNAME_ENV: "ExampleBot"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
     def test_failed_processing_holds_message_pending(self):
         """INVARIANT: a message whose normal processing raises is
         HELD in pending (minimal enqueue) so the next poll retries

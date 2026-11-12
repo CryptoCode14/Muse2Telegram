@@ -119,7 +119,7 @@ so Telegram rejects the call with a 404.
   (`--heartbeat CLAIM_TOKEN`, first thing after waking and before
   any step that may take over a minute; the ack and claim-more
   paths refresh it automatically). A claim whose heartbeat goes
-  stale for 120s (`TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS`) is
+  stale for 600s (`TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS`) is
   recycled on the next claim, so a turn that died mid-work blocks
   its lane for minutes, not the full 30-minute stale TTL. A queue
   watchdog hook polls every 60s and recycles dead claims the same

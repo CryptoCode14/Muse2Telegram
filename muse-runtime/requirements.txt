@@ -3,3 +3,7 @@
 # The bridge uses only the Python standard library — no third-party
 # packages are needed. Keep this file so `pip install -r
 # requirements.txt` succeeds as a no-op during setup.
+#
+# The pip install step in CI is deliberately a no-op: the bridge is
+# stdlib-only, so there is nothing to install; the file exists only
+# so the install command has something to point at.

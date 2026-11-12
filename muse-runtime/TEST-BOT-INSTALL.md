@@ -27,7 +27,7 @@ with test values.
   - `~/workspace/telegram-bridge-test/held.jsonl`
   - `~/workspace/telegram-bridge-test/intake-errors.log`
 - Test bridge checkout: this repo's `muse-runtime/` directory, e.g.
-  `~/workspace/muse2telegram-v2/muse-runtime` (run every bridge
+  `~/workspace/muse2telegram/muse-runtime` (run every bridge
   command from inside it).
 - Test hooks folder: `~/hooks-test/scripts/` for the scripts,
   `~/hooks-test/definitions/` for the hook definitions (or the
@@ -53,16 +53,14 @@ log.
 ## 3. Set up the venv and run the offline tests
 
 ```text
-cd ~/workspace/muse2telegram-v2/muse-runtime && python3 -m venv .venv
+cd ~/workspace/muse2telegram/muse-runtime && python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m unittest discover -s tests
 ```
 
-**Done looks like:** the suite runs with no NEW failures versus the
-v2 baseline (331 tests; the known pre-existing failures are
-environmental — missing live `~/hooks/prompts/` files and
-media-download mocks — not test-bot failures). Do not proceed on a
-failing suite you cannot explain.
+**Done looks like:** the suite runs with no failures (436 tests, the
+current baseline — zero failures). Do not proceed on a failing suite
+you cannot explain.
 
 ## 4. Install the files (test paths)
 
@@ -141,7 +139,7 @@ adopt, passing the mode from `SETUP.md` Step 5 (default **guarded**
 if undecided):
 
 ```text
-cd ~/workspace/muse2telegram-v2/muse-runtime && TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge-test/state.json .venv/bin/python -m bridge_core.telegram --adopt <TEST_OWNER_ID> <trusted|guarded>
+cd ~/workspace/muse2telegram/muse-runtime && TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge-test/state.json .venv/bin/python -m bridge_core.telegram --adopt <TEST_OWNER_ID> <trusted|guarded>
 ```
 
 **Done looks like:** the command prints `{"owner_id": <id>,

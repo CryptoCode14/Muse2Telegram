@@ -565,8 +565,12 @@ class HeartbeatCliTests(unittest.TestCase):
 
     def run_cli(self, argv):
         out = io.StringIO()
-        with redirect_stdout(out):
-            code = telegram.main(argv=argv, path=self.path)
+        # The bridge refuses to run without its bot username (no
+        # default): the fixture name stands in for a real bot.
+        with mock.patch.dict(os.environ,
+                             {telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with redirect_stdout(out):
+                code = telegram.main(argv=argv, path=self.path)
         return code, json.loads(out.getvalue())
 
     def test_cli_heartbeat_refreshes_batch(self):

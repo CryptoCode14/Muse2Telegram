@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from bridge_core.store import JsonStateStore, StateStoreError
 from bridge_core import telegram
@@ -51,8 +52,12 @@ class StateSecurityTests(unittest.TestCase):
 
     def adopt(self, supplied):
         output = io.StringIO()
-        with redirect_stdout(output):
-            result = telegram.main(["--adopt", supplied], path=self.path)
+        # The bridge refuses to run without its bot username (no
+        # default): the fixture name stands in for a real bot.
+        with mock.patch.dict(os.environ,
+                             {telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with redirect_stdout(output):
+                result = telegram.main(["--adopt", supplied], path=self.path)
         return result, json.loads(output.getvalue())
 
     def test_owner_idempotence_and_refusal_to_change_established_owner(self):

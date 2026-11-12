@@ -43,7 +43,7 @@ OWNER = 111
 GROUP = -777
 OTHER_BOT = 333
 OTHER_BOT_USERNAME = "SomeOtherBot"
-BOT_USERNAME = "Westinmusebot"
+BOT_USERNAME = "ExampleBot"
 
 
 def _decider_paths():
@@ -310,7 +310,7 @@ class BotSenderTests(unittest.TestCase):
         # no tier word; the agent always follows the unified prompt).
         result = self.run_decider({"items": [
             decider_item(1, GROUP, "group", OTHER_BOT,
-                         "@Westinmusebot what do you think?",
+                         "@ExampleBot what do you think?",
                          is_bot=True,
                          sender_name="@" + OTHER_BOT_USERNAME),
         ]})
@@ -335,26 +335,26 @@ class PreclaimAliasTests(unittest.TestCase):
     def _state(self, text):
         return {"queue": [{
             "status": "pending", "chat_type": "group",
-            "text": text, "is_bot": False, "sender_name": "Westin",
+            "text": text, "is_bot": False, "sender_name": "Example",
             "sender_id": OWNER, "external_id": 1, "replied_at": None,
         }]}
 
     def test_alias_mention_is_not_noise(self):
         with mock.patch.dict(os.environ, {
             "TELEGRAM_BRIDGE_BOT_USERNAME": BOT_USERNAME,
-            "TELEGRAM_BRIDGE_BOT_ALIASES": "Westin",
+            "TELEGRAM_BRIDGE_BOT_ALIASES": "Example",
         }):
             closed = telegram.preclaim_filter(
-                self._state("@Westin check this"))
+                self._state("@Example check this"))
         self.assertEqual(closed, [])
 
     def test_alias_mention_is_case_insensitive(self):
         with mock.patch.dict(os.environ, {
             "TELEGRAM_BRIDGE_BOT_USERNAME": BOT_USERNAME,
-            "TELEGRAM_BRIDGE_BOT_ALIASES": "westin",
+            "TELEGRAM_BRIDGE_BOT_ALIASES": "example",
         }):
             closed = telegram.preclaim_filter(
-                self._state("@WESTIN check this"))
+                self._state("@EXAMPLE check this"))
         self.assertEqual(closed, [])
 
     def test_unaliased_short_name_is_still_noise(self):
@@ -363,13 +363,13 @@ class PreclaimAliasTests(unittest.TestCase):
         }, clear=False):
             os.environ.pop("TELEGRAM_BRIDGE_BOT_ALIASES", None)
             closed = telegram.preclaim_filter(
-                self._state("@Westin check this"))
+                self._state("@Example check this"))
         self.assertEqual(closed, [1])
 
     def test_other_bot_mention_is_still_noise_with_alias_set(self):
         with mock.patch.dict(os.environ, {
             "TELEGRAM_BRIDGE_BOT_USERNAME": BOT_USERNAME,
-            "TELEGRAM_BRIDGE_BOT_ALIASES": "Westin",
+            "TELEGRAM_BRIDGE_BOT_ALIASES": "Example",
         }):
             closed = telegram.preclaim_filter(
                 self._state("@SomeOtherBot check this"))

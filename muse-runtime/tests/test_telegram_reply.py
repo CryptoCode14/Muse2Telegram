@@ -104,6 +104,9 @@ def run_cli(path, argv, fetch=None, stdin_text="", api_call=None,
     env = {
         telegram.RATE_PATH_ENV: str(rate_path),
         telegram.POLL_LOCK_PATH_ENV: str(Path(path).parent / "poll.lock"),
+        # The bridge refuses to run without its bot username (no
+        # default): the fixture name stands in for a real bot.
+        telegram.BOT_USERNAME_ENV: "ExampleBot",
     }
     if extra_env:
         env.update(extra_env)
@@ -267,7 +270,7 @@ class ReplySingleTests(ReplyTestBase):
             result = run_cli(
                 self.path, ["--reply", payload["claim_token"],
                             "--react", "👍"],
-                stdin_text="I'm Westin Jr.",
+                stdin_text="I'm ExampleBot.",
             )
         self.assertEqual(result["ok"], True)
         calls = self.call_log()
@@ -362,7 +365,7 @@ class ReplyBatchTests(ReplyTestBase):
             result = run_cli(
                 self.path, ["--reply", payload["claim_token"],
                             "--keyboard"],
-                stdin_text="I'm Westin Jr.",
+                stdin_text="I'm ExampleBot.",
             )
         self.assertEqual(result["ok"], True)
         calls = self.call_log()
@@ -687,6 +690,7 @@ class WarmHoldTests(ReplyTestBase):
         env = {
             telegram.SEND_CMD_ENV: cmd,
             telegram.POLL_LOCK_PATH_ENV: str(self.dir / "poll.lock"),
+            telegram.BOT_USERNAME_ENV: "ExampleBot",
         }
         with mock.patch.dict(os.environ, env):
             return telegram.send_reply(

@@ -114,6 +114,9 @@ def run_cli(path, argv, fetch=None, stdin_text="", api_call=None,
         # shares the live lock (and never flakes against the live
         # intake holding it).
         telegram.POLL_LOCK_PATH_ENV: str(Path(path).parent / "poll.lock"),
+        # The bridge refuses to run without its bot username (no
+        # default): the fixture name stands in for a real bot.
+        telegram.BOT_USERNAME_ENV: "ExampleBot",
     }
     if extra_env:
         env.update(extra_env)
@@ -178,7 +181,7 @@ class CallbackThreadingTests(unittest.TestCase):
             result = run_cli(
                 self.path,
                 ["--send-and-close", "1", payload["claim_token"], str(OWNER)],
-                stdin_text="I'm Westin Jr.",
+                stdin_text="I'm ExampleBot.",
             )
         self.assertEqual(result, {"ok": True, "message_id": "4242"})
         # No --reply-to: the reply is a plain new message, not
@@ -196,7 +199,7 @@ class CallbackThreadingTests(unittest.TestCase):
                 self.path,
                 ["--send-and-close", "1", payload["claim_token"],
                  str(OWNER), "77"],
-                stdin_text="I'm Westin Jr.",
+                stdin_text="I'm ExampleBot.",
             )
         self.assertEqual(result, {"ok": False, "stage": "fence"})
         self.assertFalse(self.calls.exists())
@@ -218,7 +221,7 @@ class CallbackThreadingTests(unittest.TestCase):
                 self.path,
                 ["--send-and-close", "1", payload["claim_token"],
                  str(OWNER), "14"],
-                stdin_text="I'm Westin Jr.",
+                stdin_text="I'm ExampleBot.",
             )
         self.assertEqual(result, {"ok": False, "stage": "fence"})
         self.assertFalse(self.calls.exists())
@@ -238,7 +241,7 @@ class CallbackThreadingTests(unittest.TestCase):
                 self.path,
                 ["--send-and-close", "1", payload["claim_token"],
                  str(OWNER), "555"],
-                stdin_text="I'm Westin Jr.",
+                stdin_text="I'm ExampleBot.",
             )
         self.assertEqual(result, {"ok": True, "message_id": "4242"})
         calls = self.calls.read_text(encoding="utf-8")
@@ -309,7 +312,7 @@ class KeyboardRuleTests(unittest.TestCase):
                 self.path,
                 ["--send-and-close", "1", payload["claim_token"],
                  str(OWNER), "--keyboard"],
-                stdin_text="I'm Westin Jr.",
+                stdin_text="I'm ExampleBot.",
             )
         self.assertEqual(result, {"ok": True, "message_id": "4242"})
         calls = self.calls.read_text(encoding="utf-8")
@@ -326,7 +329,7 @@ class KeyboardRuleTests(unittest.TestCase):
                 self.path,
                 ["--send-and-close", "1", payload["claim_token"],
                  str(OWNER), "--keyboard"],
-                stdin_text="I'm Westin Jr.",
+                stdin_text="I'm ExampleBot.",
             )
         # A tap IS a command, so the keyboard is allowed — and the
         # reply is still standalone (no --reply-to).

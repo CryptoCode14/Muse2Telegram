@@ -45,7 +45,9 @@ class ReplyAgeTests(unittest.TestCase):
             return batch["claim_token"]
 
     def send(self, token, *, now, sender_result=("sent", "777")):
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=sender_result
             ) as sender:
@@ -84,7 +86,9 @@ class ReplyAgeTests(unittest.TestCase):
         token = self.claim_item(
             received_at=1000.0, claimed_at=1000.0, ever_claimed=False
         )
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=("sent", "777")
             ) as sender:
@@ -111,7 +115,9 @@ class ReplyAgeTests(unittest.TestCase):
             )
             batch = queue_core.claim_batch(state, platform="telegram", now=1000.0)
             token = batch["claim_token"]
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=("sent", "777")
             ):

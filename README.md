@@ -4,6 +4,29 @@ A Telegram auto-reply bridge for Muse, the personal agent. Your Muse answers you
 
 **Telegram only.** This project is built specifically for Telegram.
 
+## Risks and scope — read first
+
+- **Unofficial.** This bridge is not affiliated with Telegram or with
+  Muse. It is a community project, not an official integration.
+- **A bot token is full control of the bot.** Anyone holding it can
+  read the bot's messages and send as the bot. Never paste it in
+  chat, a file, or a command — register it only through the secure
+  flow in `muse-runtime/SETUP.md` Step 2.
+- **Trusted mode shares personal details.** In a trusted group the bot
+  gives the owner their personal, financial, and account details when
+  asked. Use trusted only for a private group of the owner and their
+  own Muse bots — never for a group with other people in it.
+- **A listed group is ALWAYS trusted.** A group on the allowlist stays
+  trusted and the safety trips never apply there, no matter who joins
+  it later. The owner controls who is in it.
+- **Group Privacy OFF means the agent reads every group message.**
+  With Group Privacy off (or the bot an admin), Telegram delivers all
+  human group messages to the bot. With it on, only @mentions and
+  replies to the bot reach it. See `muse-runtime/SETUP.md` Step 8.
+- **Telegram Bot API rate limits apply.** The bridge delays
+  over-limit wakes instead of dropping messages, but Telegram-side
+  limits (including 429s) can still delay sends.
+
 ## What it does
 
 - One bot per Muse. You create a bot in BotFather for each Muse you run.
@@ -26,7 +49,7 @@ What changed:
 - **Offset advances only after durable commit, plus receipt dedupe.** Updates are no longer consumed before they are safely queued, and a 24 hour receipt record stops redelivery from ever double-answering.
 - **Pre-claim noise filter.** Messages that are not for this bot (open group chatter, commands to other bots, non-mentions) are closed before claiming, so they never occupy a lane.
 - **Delivery ledger, message cache, prompt pin, deterministic recall.** New modules under `bridge_core/`: a SQLite delivery ledger replacing the old sending black hole, a disk-backed message cache with reply chains, a byte-stable prompt pin, and keyword recall with bounded summaries.
-- **Simulation harness.** `simulation/` replays scripted Telegram scenarios against the real queue and claim code with a fake Telegram and a fake agent turn, and reports duplicate sends and silent drops. 389 tests in `muse-runtime/tests/`.
+- **Simulation harness.** `simulation/` replays scripted Telegram scenarios against the real queue and claim code with a fake Telegram and a fake agent turn, and reports duplicate sends and silent drops. 436 tests in `muse-runtime/tests/`.
 
 What v2 does not do: no webhooks, no Redis or Postgres, no parallel turns in one lane, no hardcoded conversational answers, and no script that answers `/status` or `/who` for the agent. Speed comes from plumbing, not from taking the agent out of the loop.
 
@@ -48,9 +71,15 @@ Details on how it works live in [`muse-runtime/README.md`](muse-runtime/README.m
 
 ## Requirements
 
-- A Muse agent with the hook harness (intake hook on a 5 second poll, watchdog hook on a 120 second poll).
+- A Muse agent with the hook harness (intake hook on a 5 second poll, watchdog hook on a 60 second poll).
 - A Telegram bot token from BotFather.
 - Python 3.10 or newer, standard library only for the bridge itself. Whisper transcription needs the `faster-whisper` model installed separately; without it, voice notes fail gracefully and the agent asks for text.
+
+This bridge runs inside the Muse runtime only — it needs the hook
+harness, the Secure Vault, and the runtime's dynamic-credential
+helper (`dynamic_credentials` + `authd`). It does not run as a
+standalone project: without those pieces there is no polling, no
+wake, and no credential.
 
 ## Credit
 

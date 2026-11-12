@@ -17,11 +17,11 @@ between a worker subprocess and the restarting parent).
 
 ## How to run
 
-From the v2 copy root, with the copy's own venv (stdlib only, no
+From the repo root, with the repo's own venv (stdlib only, no
 pytest — the suite is `unittest`):
 
 ```bash
-cd ~/workspace/muse2telegram-v2
+cd <repo root>
 muse-runtime/.venv/bin/python simulation/run_scenario.py --list
 muse-runtime/.venv/bin/python simulation/run_scenario.py --scenario single-dm-reply --mode v2
 muse-runtime/.venv/bin/python simulation/run_scenario.py --scenario all --mode baseline
@@ -33,8 +33,7 @@ muse-runtime/.venv/bin/python -m unittest discover -s muse-runtime/tests -p 'tes
 ```
 
 `--mode` only changes the label and the v2 pass bar for now; the
-code under test is whatever is in the v2 copy at run time. The
-parent re-runs this after the v2 core work lands.
+code under test is whatever is in the repo at run time.
 
 ## Scenarios
 
@@ -43,8 +42,8 @@ parent re-runs this after the v2 core work lands.
 | `single-dm-reply` | 1 DM, 1 wake, 1 send; first-signal / reply latency (simulated). |
 | `rapid-back-and-forth-5` | 5-message exchange; warm-lease hit rate (0/4 in the harness: FakeTurn drives `send_and_close`, not `--reply`, so the warm hold in `telegram._warm_hold` is exercised by the unit tests in `tests/test_telegram_reply.py`, not here). |
 | `dm-plus-group-concurrent` | DM + group arriving together; independent lanes, no cross-lane blocking. |
-| `dropped-wake` | Wake fires, turn never starts; recovery time to recycle + re-wake. v2 target <= 180 s. |
-| `hang-no-heartbeat` | Claim with no heartbeat; recycle time. Baseline ~600 s, v2 target ~180 s. Simulated clock, no real sleep. |
+| `dropped-wake` | Wake fires, turn never starts; recovery time to recycle + re-wake. Shipped recycle ~600 s. |
+| `hang-no-heartbeat` | Claim with no heartbeat; recycle time. Shipped recycle ~600 s (the heartbeat horizon). Simulated clock, no real sleep. |
 | `die-mid-send` | Turn dies after `send_fenced`, before the reply record; probe/ledger recovery, no duplicate. |
 | `send-unknown-delivered` | Sender reports unknown but the send landed; edit-probe says delivered, closed with evidence, no re-send. |
 | `send-unknown-not-delivered` | Sender reports unknown, nothing sent; item returns to pending, re-wake sends exactly once. |
@@ -61,7 +60,7 @@ Every result has: `duplicate_sends`, `silent_drops`,
 ## Models and assumptions (read before quoting numbers)
 
 - **Time is simulated.** The fake clock is advanced explicitly;
-  recovery times (30/180/600 s) cost milliseconds of wall time.
+  recovery times (30/600 s) cost milliseconds of wall time.
   Modelled latencies: wake 0.5 s, quick work 2.0 s, deep work
   30.0 s, re-wake 0.5 s. Only `kill-9-mid-send` recovery_time is
   wall seconds (kill to reconcile).

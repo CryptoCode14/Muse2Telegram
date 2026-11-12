@@ -106,6 +106,9 @@ def run_cli(path, argv, fetch=None, stdin_text="", api_call=None,
         # shares the live lock (and never flakes against the live
         # intake holding it).
         telegram.POLL_LOCK_PATH_ENV: str(Path(path).parent / "poll.lock"),
+        # The bridge refuses to run without its bot username (no
+        # default): the fixture name stands in for a real bot.
+        telegram.BOT_USERNAME_ENV: "ExampleBot",
     }
     if extra_env:
         env.update(extra_env)
@@ -443,7 +446,9 @@ class OutboundMediaTests(unittest.TestCase):
     def test_media_send_refuses_wrong_chat_and_reply_target(self):
         payload = self.claim()
         cmd = self.write_send_cmd()
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: cmd}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: cmd,
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command"
             ) as sender:
@@ -464,7 +469,8 @@ class OutboundMediaTests(unittest.TestCase):
     def test_media_send_refuses_keyboard_on_plain_chat(self):
         payload = self.claim()
         with mock.patch.dict(
-            os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}
+            os.environ, {telegram.SEND_CMD_ENV: "/fake/sender",
+                         telegram.BOT_USERNAME_ENV: "ExampleBot"}
         ):
             with mock.patch.object(telegram, "_run_send_command") as sender:
                 result = telegram.send_media_fenced(

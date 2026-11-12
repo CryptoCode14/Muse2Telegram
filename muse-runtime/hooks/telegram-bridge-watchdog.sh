@@ -19,6 +19,13 @@
 # Honors telegram-bridge/WATCHDOG_PAUSE: if that file exists, never
 # sweep (an operator is working the queue by hand).
 set -euo pipefail
+# The hook runtime provides wake/silent/log. Outside the Muse hook
+# runtime HATCH_HOOK_RUNTIME is unset; say so plainly instead of
+# failing with an "unbound variable" error under set -u.
+if [ -z "${HATCH_HOOK_RUNTIME:-}" ]; then
+  echo "telegram-bridge-watchdog.sh requires the Muse hook runtime (HATCH_HOOK_RUNTIME is not set)" >&2
+  exit 1
+fi
 source "$HATCH_HOOK_RUNTIME"
 # muse-runtime/ holds bridge_core/ and .venv. Derive it from this
 # script's own location when run from the repo; after install to

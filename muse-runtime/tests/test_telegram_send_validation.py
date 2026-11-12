@@ -34,7 +34,9 @@ class TelegramSendValidationTests(unittest.TestCase):
         return queue_core.find_item(self.store.load(), "telegram", 101)
 
     def fenced(self, destination, text="approved reply"):
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=("sent", "777")
             ) as sender:
@@ -118,7 +120,9 @@ class TelegramSendValidationTests(unittest.TestCase):
             queue_core.find_item(state, "telegram", 202)[
                 "received_at"
             ] -= 90000
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(telegram, "_run_send_command") as sender:
                 result = telegram.send_fenced(
                     store, 202, token, "-777", "late reply"
@@ -138,7 +142,9 @@ class TelegramSendValidationTests(unittest.TestCase):
         unclosed either way."""
         with self.store.transaction() as state:
             queue_core.find_item(state, "telegram", 101)["received_at"] -= 7200
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(telegram, "_run_send_command") as sender:
                 result = telegram.send_fenced(
                     self.store, 101, "bogus-token", "123456789", "late reply"
@@ -164,7 +170,9 @@ class TelegramSendValidationTests(unittest.TestCase):
         with self.store.transaction() as state:
             queue_core.find_item(state, "telegram", 101)["received_at"] -= 7200
         before = self.store.load()
-        env = mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"})
+        env = mock.patch.dict(os.environ, {
+            telegram.SEND_CMD_ENV: "/fake/sender",
+            telegram.BOT_USERNAME_ENV: "ExampleBot"})
         env.start()
         self.addCleanup(env.stop)
         base = ["--send-fenced", "101", self.token, "123456789"]
@@ -184,7 +192,9 @@ class TelegramSendValidationTests(unittest.TestCase):
 
     def test_cli_send_fenced_rejects_unknown_trailing_flag(self):
         out = io.StringIO()
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(telegram, "_run_send_command") as sender:
                 with mock.patch("sys.stdin", io.StringIO("reply")):
                     with redirect_stdout(out):
@@ -226,7 +236,9 @@ class TelegramSendValidationTests(unittest.TestCase):
         equals the maximum reply age follows the normal fence path
         and still sends."""
         received = self.item()["received_at"]
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=("sent", "777")
             ) as sender:
@@ -240,7 +252,9 @@ class TelegramSendValidationTests(unittest.TestCase):
 
     def test_cli_rejects_wrong_destination_without_invoking_sender(self):
         output = io.StringIO()
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(telegram, "_run_send_command") as sender:
                 with mock.patch("sys.stdin", io.StringIO("private content")):
                     with redirect_stdout(output):

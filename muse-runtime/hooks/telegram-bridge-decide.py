@@ -23,8 +23,8 @@ Routing (free-for-all + mention):
     that does not mention this bot, is not for it.
   - A configured alias also counts as a mention of this bot:
     TELEGRAM_BRIDGE_BOT_ALIASES is a comma-separated list of short
-    names (no "@", e.g. "Dorian" for a bot whose username is
-    DorianCodingBot), and "@<alias>" wakes it just like
+    names (no "@", e.g. "Example" for a bot whose username is
+    ExampleBot), and "@<alias>" wakes it just like
     "@<username>". Unset, only the username counts.
 While paused, only owner/admin commands wake the agent; everything
 else is held for the resume turn to answer or close.
@@ -47,10 +47,20 @@ import re
 import sys
 from pathlib import Path
 
-MY_BOT = os.environ.get("TELEGRAM_BRIDGE_BOT_USERNAME", "Westinmusebot").lower()
+#: This bot's Telegram username (no "@", case-insensitive). There is
+#: no default: TELEGRAM_BRIDGE_BOT_USERNAME must be set, or the
+#: decider refuses to run instead of silently answering as some
+#: other bot.
+_raw_bot_username = os.environ.get("TELEGRAM_BRIDGE_BOT_USERNAME", "")
+if not _raw_bot_username.strip():
+    raise RuntimeError(
+        "TELEGRAM_BRIDGE_BOT_USERNAME is not set: set it to this bot's "
+        "Telegram username (without '@') before running the bridge."
+    )
+MY_BOT = _raw_bot_username.strip().lstrip("@").lower()
 
 #: Optional comma-separated short names that also @mention this bot
-#: (e.g. "Dorian" for a bot whose username is DorianCodingBot).
+#: (e.g. "Example" for a bot whose username is ExampleBot).
 #: Set with TELEGRAM_BRIDGE_BOT_ALIASES, no "@", case-insensitive.
 #: Unset means only the bot's username counts as a mention of it.
 BOT_ALIASES_ENV = "TELEGRAM_BRIDGE_BOT_ALIASES"
@@ -80,9 +90,9 @@ COMMAND_RE = re.compile(
 )
 
 #: This bot's @mention as a standalone token — its username or any
-#: configured alias. The lookarounds keep "@westinmusebot2",
-#: email-like "user@westinmusebot.com", and
-#: "https://example.com/@westinmusebot" from matching.
+#: configured alias. The lookarounds keep "@examplebot2",
+#: email-like "user@examplebot.com", and
+#: "https://example.com/@examplebot" from matching.
 MENTION_ME_RE = re.compile(
     r"(?<![A-Za-z0-9_/.])@(?:" + "|".join(
         re.escape(n) for n in [MY_BOT] + ALIASES) + r")(?![A-Za-z0-9_])",

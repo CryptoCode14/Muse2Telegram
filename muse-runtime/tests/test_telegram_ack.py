@@ -43,7 +43,9 @@ class TelegramAckTests(unittest.TestCase):
             sender_result=("sent", "777")):
         if token is None:
             token = self.token
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=sender_result
             ) as sender:
@@ -70,7 +72,9 @@ class TelegramAckTests(unittest.TestCase):
     def test_full_reply_still_works_after_ack(self):
         result, _sender = self.ack()
         self.assertTrue(result["ok"])
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=("sent", "888")
             ):
@@ -93,7 +97,9 @@ class TelegramAckTests(unittest.TestCase):
         self.assertEqual(self.item()["ack_message_id"], "777")
 
     def test_ack_refused_when_reply_already_recorded(self):
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=("sent", "888")
             ):
@@ -138,7 +144,12 @@ class TelegramAckTests(unittest.TestCase):
         self.assertEqual(self.item()["ack_message_id"], "777")
 
     def test_ack_without_send_command_is_config_error(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
+        # No send command, but the bot username is present: the
+        # config error under test is the missing sender, not the
+        # (separately fail-loud) username.
+        with mock.patch.dict(
+            os.environ, {telegram.BOT_USERNAME_ENV: "ExampleBot"},
+            clear=True):
             with mock.patch.object(
                 telegram, "_run_send_command"
             ) as sender:
@@ -157,7 +168,9 @@ class TelegramAckTests(unittest.TestCase):
                 text="/menu", message_id=None, source="callback_query",
             )
             token2 = queue_core.claim_batch(state, platform="telegram")["claim_token"]
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=("sent", "999")
             ) as sender:
@@ -172,7 +185,9 @@ class TelegramAckTests(unittest.TestCase):
         self.assertEqual(item["ack_message_id"], "999")
 
     def test_cli_send_ack_parses_args(self):
-        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: "/fake/sender"}):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
             with mock.patch.object(
                 telegram, "_run_send_command", return_value=("sent", "777")
             ):
