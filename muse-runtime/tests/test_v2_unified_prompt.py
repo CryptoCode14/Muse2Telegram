@@ -108,6 +108,24 @@ class UnifiedPromptTests(unittest.TestCase):
         # word must not appear anywhere in the prompt itself.
         self.assertNotIn("tier", PROMPT.read_text().lower())
 
+    def test_unified_prompt_carries_collab_gate(self):
+        # Collab protocol, gated, never the default: in a trusted
+        # multi-bot group where the telegram-collab-protocol skill
+        # is installed, the prompt points at COLLAB_PROTOCOL.md
+        # instead of the silence rules; everywhere else the
+        # silence rules below apply.
+        text = PROMPT.read_text()
+        for phrase in (
+            "Collab protocol (trusted multi-bot groups only)",
+            "group_mode_effective is trusted",
+            "telegram-collab-protocol skill",
+            "COLLAB_PROTOCOL.md",
+            "instead of the silence rules below",
+            "one owner per task",
+            "An ack is still terminal",
+        ):
+            self.assertIn(phrase, text)
+
     def test_unified_prompt_carries_chat_rules_short_version(self):
         text = PROMPT.read_text()
         for phrase in (
