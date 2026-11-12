@@ -4,7 +4,7 @@
 
 ## Checklist
 
-- [ ] The offline suite passes: `cd muse-runtime && python3 -m unittest discover -s tests` (562 tests, zero failures)
+- [ ] The offline suite passes: `cd muse-runtime && python3 -m unittest discover -s tests` (563 tests, zero failures)
 - [ ] No failing test was weakened, deleted, or edited to pass
 - [ ] No personal identities in shipped files (generic `ExampleBot` / `MyBot` / `[USER]` only)
 - [ ] No `state.json`, token, credential, or personal data committed

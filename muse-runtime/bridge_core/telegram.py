@@ -3877,6 +3877,13 @@ def _reserve_send(
     transaction, BEFORE the network send. Every check runs
     before any item is marked, so a refused extra leaves the
     primary claimed too: the reservation is all-or-nothing.
+    The all-or-nothing does not rest on the pre-checks alone:
+    if a mark fails after earlier marks (unreachable while the
+    pre-checks and ``mark_sending`` agree, under the exclusive
+    lock this transaction holds), the reservation raises so the
+    transaction rolls back instead of committing a partial
+    reservation that the fence would then report as a plain
+    refusal.
     """
     send_cmd = os.environ.get(SEND_CMD_ENV)
     if not send_cmd:
@@ -3957,8 +3964,21 @@ def _reserve_send(
                 if not queue_core.mark_sending(
                     state, PLATFORM, external_id, token
                 ):
-                    fenced = False
-                    break
+                    # Invariant failure, not a refusal: this extra
+                    # passed the ownership / reply / staleness
+                    # pre-checks above, and this transaction holds
+                    # the exclusive lock, so the mark cannot fail
+                    # unless the pre-checks and the mark disagree.
+                    # Raise so the transaction rolls back — the
+                    # primary (and any earlier extras) must not
+                    # commit as SENDING while the reservation is
+                    # reported as refused, which would strand them
+                    # in SENDING with no reply recorded.
+                    raise RuntimeError(
+                        "partial send reservation: extra item "
+                        f"{external_id} failed to mark sending "
+                        "after the primary was reserved"
+                    )
         if not fenced:
             # Ownership lost (2026-11-12 turns-dying bug): the item
             # exists but this token no longer owns it. Report the

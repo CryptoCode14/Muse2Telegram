@@ -271,5 +271,68 @@ class TelegramSendValidationTests(unittest.TestCase):
         self.assertEqual(self.item()["status"], "claimed")
 
 
+class TelegramReserveSendAtomicityTests(unittest.TestCase):
+    """A mark failure mid-reservation must roll back, not strand.
+
+    Review finding (Westin Jr., round-2 review): the all-or-nothing
+    in _reserve_send rested on mark_sending re-checking exactly the
+    pre-verified conditions, not on transaction rollback — a later
+    extra failing to mark after earlier marks would commit partial
+    SENDING marks while the fence reported a plain refusal. The
+    reservation now raises on that invariant failure so the
+    transaction rolls back.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "state.json"
+        self.store = JsonStateStore(self.path)
+        with self.store.transaction() as state:
+            for external_id in (101, 102):
+                queue_core.enqueue(
+                    state, platform="telegram", external_id=external_id,
+                    chat_id=123456789, chat_type="private",
+                    sender_id=123456789, text="batch message",
+                )
+            self.token = queue_core.claim_batch(
+                state, platform="telegram"
+            )["claim_token"]
+
+    def item(self, external_id):
+        return queue_core.find_item(self.store.load(), "telegram", external_id)
+
+    def test_extra_mark_failure_raises_and_rolls_back(self):
+        real_mark_sending = queue_core.mark_sending
+        calls = []
+
+        def flaky_mark_sending(state, platform, external_id, token, **kw):
+            calls.append(external_id)
+            if len(calls) == 2:
+                return False
+            return real_mark_sending(
+                state, platform, external_id, token, **kw
+            )
+
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with mock.patch.object(
+                queue_core, "mark_sending", side_effect=flaky_mark_sending
+            ):
+                with self.assertRaises(RuntimeError):
+                    telegram._reserve_send(
+                        self.store, 101, self.token, 123456789,
+                        extra_targets=[102],
+                    )
+        self.assertEqual(calls, [101, 102])
+        # Nothing persisted: both items still claimed, nothing sending.
+        for external_id in (101, 102):
+            item = self.item(external_id)
+            self.assertEqual(item["status"], "claimed")
+            self.assertEqual(item["claim_token"], self.token)
+            self.assertIsNone(item["sending_at"])
+
+
 if __name__ == "__main__":
     unittest.main()
