@@ -5,7 +5,7 @@ hooks/telegram-bridge-intake.sh):
 - The unified prompt is one static text, smaller (modelled tokens,
   chars/4) than the old standard prompt, and carries every rule that
   must not be lost: group reply rules (short form), the @mention rule,
-  group modes, the allowlist rule, --reply as the single send path,
+  group modes, the allowlist rule, --outbox as the single send path,
   silence via --done, ack-first for 10+ minute work, unknown-send
   handling, commands, gated voice transcription, and media.
 - The hook-definition install file embeds the unified prompt verbatim.
@@ -175,12 +175,15 @@ class UnifiedPromptTests(unittest.TestCase):
     def test_unified_prompt_carries_send_rules(self):
         text = PROMPT.read_text()
         for phrase in (
+            "--outbox CLAIM_TOKEN",
+            "Send via the outbox FIRST",
+            "already-queued",
             "--reply CLAIM_TOKEN",
             "NEVER paste reply text into a shell command",
             "--heartbeat CLAIM_TOKEN",
             "A claim alone does not start the turn",
             "Do NOT call --claim-more or --send-and-close",
-            "do NOT call --reply at all; close with --done and a reason instead",
+            "do NOT call --outbox or --reply at all; close with --done and a reason instead",
             "--done UPDATE_ID CLAIM_TOKEN REASON",
             "stage stale-token",
             "10 minutes or more",

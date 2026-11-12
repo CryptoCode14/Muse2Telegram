@@ -155,7 +155,7 @@ muse-runtime/
                                 the superseded files below)
   prompts/
     unified.md        the hook-definition prompt (one static prompt
-                      for every wake; 14607 chars, ~3652 modelled
+                      for every wake; 15780 chars, ~3945 modelled
                       tokens)
     router.md, tier-quick.md, tier-standard.md, tier-deep.md
                       superseded in v2; kept for history only,
@@ -575,7 +575,7 @@ The hook definition prompt is the unified prompt in
 definition prompt (replacing the placeholders), following the exact
 install steps in `muse-runtime/hooks/hook-definition-unified-prompt.md`.
 It is the woken agent's full instruction for the turn: one static text
-for every wake (14607 chars, ~3652 modelled tokens). There is no
+for every wake (15780 chars, ~3945 modelled tokens). There is no
 per-batch prompt selection any more: the decider prints only `wake` /
 `hold` / `done` / `empty`, and the intake hook pre-loads the agent's
 context into the wake payload as `context_md` (the bounded contents of

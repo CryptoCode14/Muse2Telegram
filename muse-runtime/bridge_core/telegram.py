@@ -7,7 +7,9 @@ Keeps the operational interface the wake hook drives:
                long-poll (Telegram answers that with HTTP 409).
   (no args)   fetch updates once, queue servable messages, claim one
               batch and print ONE wake payload JSON. Prints nothing
-              when there is no work.
+              when there is no work. Before the long poll, deliver
+              due outbox entries (see --dispatch-outbox), so a reply
+              the agent queued goes out within one poll cycle.
   --sending ID TOKEN       move a claimed item to "sending" — run this
                            BEFORE the Bot API send for the item, so a
                            crash mid-send leaves the item in "sending"
@@ -202,7 +204,7 @@ Keeps the operational interface the wake hook drives:
                            send went out but a reply record could not
                            be written for every item.
   --reply CLAIM_TOKEN [--react EMOJI] [--keyboard]
-                           the single send path for a turn (v2): look
+                           the direct send path for a turn (v2): look
                            up every claimed item under CLAIM_TOKEN
                            (the caller passes no update/chat/reply
                            ids — they are derived from the batch),
@@ -236,7 +238,52 @@ Keeps the operational interface the wake hook drives:
                            send the full reply with --reply. The
                            older --send-and-close and
                            --send-batch-and-close paths stay available
-                           for backwards compatibility.
+                           for backwards compatibility. The prompt
+                           directs the agent to --outbox instead
+                           (below): --reply stays for the warm
+                           follow-up and the manual path.
+  --outbox CLAIM_TOKEN [--keyboard]
+                           OUTBOX-FIRST send path (v2, P1.5): the
+                           agent's reply path. Queue the reply for a
+                           claimed batch in the SQLite outbox (text
+                           on stdin; the batch, chat, reply target
+                           and cover list are derived from the claim
+                           token, exactly like --reply) and return at
+                           once — the poll script delivers it within
+                           one poll cycle, retries it, and closes the
+                           batch, so a turn killed after the write
+                           still delivers. The write is fenced by the
+                           same claim token rules as --reply, and a
+                           live entry already covering the batch
+                           refuses the write as "already-queued".
+                           Prints {"ok": true, "outbox_id": n,
+                           "target_update_id": ...,
+                           "covered_update_ids": [...], "chat_id":
+                           ...} on success, or {"ok": false,
+                           "stage": ...} ("input", "fence",
+                           "stale-token", "stale", "keyboard",
+                           "already-queued"). Once queued, do NOT
+                           call --reply for the same batch — the
+                           dispatcher sends it. The outbox lives next
+                           to state.json
+                           (``<state stem>.outbox.sqlite3``).
+  --dispatch-outbox        run one dispatcher pass now (the same pass
+                           run_once runs before each long poll):
+                           deliver due outbox entries through the B1
+                           three-way sender contract (definitive
+                           fails, retryable re-queues with backoff
+                           honoring Retry-After, unknown is never
+                           resent), recording reply_message_id before
+                           marking the queue item done. Prints the
+                           dispatch report JSON.
+  --outbox-status          read-only: list the outbox entries, newest
+                           first, with status, attempts,
+                           reply_message_id and last_error.
+  --outbox-drop OUTBOX_ID  operator: drop one pending/sending outbox
+                           entry (marks it failed, never delivered).
+                           The queue item is untouched — after
+                           verifying non-delivery, return it to
+                           pending with --send-failed.
   --send-photo-and-close ID TOKEN CHAT_ID FILE_PATH
                            [REPLY_TO_MESSAGE_ID] [--keyboard]
                            [--cover UPDATE_ID ...]
@@ -491,6 +538,7 @@ import urllib.request
 from pathlib import Path
 
 from . import queue as queue_core
+from .outbox import OutboxStore
 from .store import JsonStateStore
 
 PLATFORM = "telegram"
@@ -682,6 +730,42 @@ HERE = Path(__file__).resolve().parent
 def state_path() -> Path:
     override = os.environ.get("TELEGRAM_BRIDGE_STATE_PATH")
     return Path(override) if override else HERE / "state.json"
+
+
+#: Environment variable overriding the outbox SQLite path (tests
+#: point it at a temp file so the suite never shares the live
+#: outbox). Default is next to state.json: ``<state stem>.outbox.sqlite3``
+#: (see outbox_path).
+OUTBOX_PATH_ENV = "TELEGRAM_BRIDGE_OUTBOX_PATH"
+
+#: Maximum outbox entries the dispatcher attempts in one poll
+#: pass. One entry per batch, so a pass normally handles 0-1; the
+#: cap bounds a pathological backlog so the poll tick stays quick.
+OUTBOX_DISPATCH_PER_PASS = 20
+
+#: Delay (seconds) before the dispatcher re-checks an entry it had
+#: to defer (another send in flight for the same item): short, so
+#: a deferred entry is retried on a near-future poll tick instead
+#: of waiting out a throttle delay.
+OUTBOX_DEFER_SECONDS = 30.0
+
+
+def outbox_path(store: JsonStateStore | None = None) -> Path:
+    """Path of the SQLite outbox for this bot.
+
+    Next to the state file (``state.outbox.sqlite3`` for the
+    default state path), so the outbox lives and dies with the
+    deployment's state directory. Pass the store in use so the
+    path follows an explicit state path (tests, operator probes)
+    instead of the environment default; without a store it
+    derives from state_path(). ``TELEGRAM_BRIDGE_OUTBOX_PATH``
+    overrides it outright.
+    """
+    override = os.environ.get(OUTBOX_PATH_ENV)
+    if override:
+        return Path(override)
+    base = store.path if store is not None else state_path()
+    return base.with_suffix(".outbox.sqlite3")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -3332,6 +3416,15 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
             fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return None
+        # P1.5 outbox first, before the long poll blocks: a reply
+        # the agent queued must go out within one poll cycle, not
+        # after a 30 s long-poll wait. Best-effort — a dispatcher
+        # failure never kills the poll (the entries stay queued
+        # for the next tick, and --dispatch-outbox reports it).
+        try:
+            dispatch_outbox(store)
+        except Exception as exc:  # noqa: BLE001 - the poll must survive a dispatcher failure
+            print(f"outbox dispatch failed: {exc}", file=sys.stderr)
         snapshot = _ensure_adapter_state(store.load())
         # Fast-claim: work is already claimable (or a dead claim is
         # recyclable), so there is nothing to wait for — fetch with
@@ -5499,6 +5592,471 @@ def send_reply(
     )
 
 
+def write_outbox(
+    store: JsonStateStore,
+    token,
+    text: str,
+    *,
+    keyboard: bool = False,
+    max_reply_age: float | None = DEFAULT_MAX_REPLY_AGE,
+    now: float | None = None,
+) -> dict:
+    """OUTBOX-FIRST write path for a turn (v2, P1.5 --outbox).
+
+    Queues the reply for a claimed batch in the SQLite outbox and
+    returns at once — the poll script delivers it, retries it,
+    and closes the batch, so a turn killed after the write still
+    delivers. The agent writes the reply FIRST, before any
+    follow-up work, and then closes the turn WITHOUT calling
+    --reply for the same batch: the dispatcher sends it, and a
+    second send would duplicate the reply.
+
+    The write is fenced by the same claim token rules as --reply
+    (see send_reply (a)-(b)): the batch is derived from the token
+    alone (no items, or items spanning more than one chat, fails
+    closed; a SENDING sibling with no recorded reply fails closed
+    too), the batch heartbeat is refreshed (the turn is alive),
+    the stale-age guard and the keyboard rule are applied, and a
+    live outbox entry already covering any item of the batch
+    refuses the write as "already-queued" — one batch is queued
+    once, never twice. The queue items stay CLAIMED under the
+    token: the dispatcher reserves them at delivery time, and
+    records the reply and closes them then.
+
+    Returns {"ok": true, "outbox_id": n, "target_update_id": ...,
+    "covered_update_ids": [...], "chat_id": ...} on success, or
+    {"ok": false, "stage": ...} with stage "input" (empty /
+    oversized text), "fence" (split batch or a send in flight),
+    "stale-token" (the token owns no live batch — with
+    "item_status" / "replied" when the item is known, exactly
+    like --reply), "stale" (the reply aged past the fence),
+    "keyboard" (--keyboard on a reply that does not answer a
+    command), or "already-queued" (a live entry already covers
+    the batch: stop, do not send another). The write never sends
+    anything itself, so there is no rejected / retryable /
+    unknown stage here — those belong to the dispatcher.
+    """
+    if not isinstance(text, str) or not text.strip() or len(text) > 4096:
+        return {"ok": False, "stage": "input"}
+    if max_reply_age is not None and not math.isfinite(max_reply_age):
+        return {"ok": False, "stage": "input"}
+    check_now = time.time() if now is None else now
+    # (a) The whole batch, derived from the token alone — the same
+    # derivation as send_reply (a).
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        items = [
+            item
+            for item in state.get("queue", [])
+            if item.get("platform") == PLATFORM
+            and item.get("status") == queue_core.CLAIMED
+            and item.get("claim_token") == token
+            and item.get("replied_at") is None
+        ]
+        sending_siblings = [
+            item
+            for item in state.get("queue", [])
+            if item.get("platform") == PLATFORM
+            and item.get("status") == queue_core.SENDING
+            and item.get("claim_token") == token
+            and item.get("replied_at") is None
+        ]
+    if sending_siblings:
+        return {"ok": False, "stage": "fence"}
+    if not items:
+        return {"ok": False, "stage": "stale-token"}
+    chat_ids = {item.get("chat_id") for item in items}
+    if len(chat_ids) != 1:
+        return {"ok": False, "stage": "fence"}
+    chat_id = next(iter(chat_ids))
+    if type(chat_id) is not int:
+        return {"ok": False, "stage": "fence"}
+    # The stale-age guard, per item — the same rule _reserve_send
+    # applies at delivery time, checked here so the agent learns
+    # immediately instead of queuing a reply the dispatcher must
+    # drop. Claimed work gets the longer claimed limit (see
+    # _reply_age_limit), so a recovery after an outage is never
+    # refused as stale.
+    for item in items:
+        limit = _reply_age_limit(item, max_reply_age)
+        if (
+            limit is not None
+            and check_now - item["received_at"] > limit
+        ):
+            return {"ok": False, "stage": "stale"}
+    ordered = sorted(items, key=lambda it: it.get("received_at") or 0)
+
+    def _message_id(item):
+        try:
+            return int(item.get("message_id"))
+        except (TypeError, ValueError):
+            return None
+
+    with_message = [
+        item for item in ordered if _message_id(item) is not None
+    ]
+    if with_message:
+        primary = with_message[-1]
+        reply_to = _message_id(primary)
+    else:
+        primary = ordered[0]
+        reply_to = None
+    primary_id = int(primary["external_id"])
+    extras = [
+        int(item["external_id"]) for item in ordered if item is not primary
+    ]
+    # The keyboard goes only on command replies, exactly like the
+    # send fence: refuse it here so the agent learns immediately.
+    if keyboard and not _is_command_text(primary.get("text")):
+        return {"ok": False, "stage": "keyboard"}
+    # (b) Heartbeat first: the turn is alive and working, and the
+    # dispatcher gets the full heartbeat window to deliver in.
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        refreshed = queue_core.heartbeat_batch(state, token, now=check_now)
+    if refreshed == 0:
+        # The batch vanished between the lookup and the heartbeat
+        # (recycled mid-write): same stale-token story as
+        # send_reply (b), with one item's disposition.
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            current = queue_core.find_item(
+                state, PLATFORM, int(items[0]["external_id"])
+            )
+        if current is not None:
+            return {
+                "ok": False,
+                "stage": "stale-token",
+                "item_status": current.get("status"),
+                "replied": current.get("replied_at") is not None,
+            }
+        return {"ok": False, "stage": "stale-token"}
+    entry_id = OutboxStore(outbox_path(store)).enqueue(
+        {
+            "claim_token": token,
+            "target_update_id": primary_id,
+            "chat_id": chat_id,
+            "reply_to_message_id": reply_to,
+            "keyboard": keyboard,
+            "text": text,
+            "extra_update_ids": extras,
+            "created_at": check_now,
+        }
+    )
+    if entry_id is None:
+        return {
+            "ok": False,
+            "stage": "already-queued",
+            "target_update_id": primary_id,
+        }
+    return {
+        "ok": True,
+        "outbox_id": entry_id,
+        "target_update_id": primary_id,
+        "covered_update_ids": [primary_id] + extras,
+        "chat_id": chat_id,
+    }
+
+
+def _outbox_item_disposition(item, entry) -> tuple:
+    """(action, reason) for an outbox entry whose queue item cannot
+    simply be reserved right now. ``item`` may be None.
+
+    - (None, None): the item is CLAIMED under the entry's token —
+      reservable; the caller runs the atomic fence.
+    - ("resend", ...): the item is SENDING under the entry's token
+      — the entry's own earlier reservation (a retryable attempt).
+      The caller re-validates the send guards and sends without
+      re-marking it.
+    - ("supersede", ...): the queued reply is no longer needed —
+      already answered, closed, recycled, or owned by another turn.
+    - ("defer", ...): another turn's send is in flight for the
+      item; leave the entry pending and re-check on a later pass.
+    """
+    if item is None:
+        return "supersede", "queue item missing"
+    if item.get("replied_at") is not None:
+        return "supersede", "already replied"
+    status = item.get("status")
+    if status == queue_core.DONE:
+        return "supersede", "item closed"
+    if status == queue_core.PENDING:
+        return "supersede", "claim recycled; re-wake owns the retry"
+    if item.get("claim_token") != entry["claim_token"]:
+        if status == queue_core.SENDING:
+            return "defer", "send in flight under another token"
+        return "supersede", "claim owned by another turn"
+    if status == queue_core.SENDING:
+        return "resend", "own earlier reservation"
+    if status == queue_core.CLAIMED:
+        return None, None
+    return "supersede", f"unexpected item status {status}"
+
+
+def _outbox_resend_refused(item, entry, now, max_reply_age) -> tuple:
+    """(action, reason) re-validating the send guards for a
+    retry of the entry's own earlier reservation (the item is
+    already SENDING under the entry's token, so _reserve_send's
+    mark_sending would refuse it — there is nothing to reserve).
+    (None, None) when the re-send may proceed."""
+    if (
+        type(item.get("chat_id")) is not int
+        or str(item["chat_id"]) != str(entry["chat_id"])
+    ):
+        return "supersede", "destination no longer matches the queued item"
+    reply_to = entry["reply_to_message_id"]
+    if reply_to is not None:
+        queued_message_id = item.get("message_id")
+        if (
+            queued_message_id is None
+            or str(reply_to) != str(queued_message_id)
+        ):
+            return "supersede", "reply target no longer matches the queued item"
+    if entry["keyboard"] and not _is_command_text(item.get("text")):
+        return "fail", "keyboard refused: reply does not answer a command"
+    limit = _reply_age_limit(item, max_reply_age)
+    if limit is not None and now - item["received_at"] > limit:
+        return "supersede", "reply too old for the age guard"
+    return None, None
+
+
+def _reserve_outbox_entry(store, entry, *, now, max_reply_age) -> tuple:
+    """Reserve one outbox entry's queue item for delivery.
+
+    Returns ``(queued_chat_id, action, reason)``: ``queued_chat_id``
+    is the bound destination when the entry may be sent (action
+    None), else ``action`` is "supersede" (drop the entry — the
+    reply is no longer needed or no longer owned), "defer" (leave
+    the entry pending — another send is in flight), or "fail"
+    (drop the entry — the send can never go out, keyboard rule).
+    A CLAIMED item goes through the atomic _reserve_send fence
+    (destination, reply target, keyboard, stale age, mark
+    "sending"); a SENDING item under the entry's own token is the
+    entry's earlier reservation, re-validated in place.
+    """
+    state = _ensure_adapter_state(store.load())
+    item = queue_core.find_item(state, PLATFORM, entry["target_update_id"])
+    action, reason = _outbox_item_disposition(item, entry)
+    if action == "resend":
+        refused = _outbox_resend_refused(item, entry, now, max_reply_age)
+        if refused[0] is not None:
+            return None, refused[0], refused[1]
+        return item.get("chat_id"), None, None
+    if action is not None:
+        return None, action, reason
+    error, queued_chat_id = _reserve_send(
+        store,
+        int(entry["target_update_id"]),
+        entry["claim_token"],
+        entry["chat_id"],
+        reply_to=entry["reply_to_message_id"],
+        keyboard=entry["keyboard"],
+        extra_targets=entry["extra_update_ids"],
+        max_reply_age=max_reply_age,
+        now=now,
+    )
+    if error is None:
+        return queued_chat_id, None, None
+    # The claim moved between the read and the reservation: re-read
+    # the disposition once and act on the fresh state.
+    state = _ensure_adapter_state(store.load())
+    item = queue_core.find_item(state, PLATFORM, entry["target_update_id"])
+    action, reason = _outbox_item_disposition(item, entry)
+    if action == "resend":
+        refused = _outbox_resend_refused(item, entry, now, max_reply_age)
+        if refused[0] is not None:
+            return None, refused[0], refused[1]
+        return item.get("chat_id"), None, None
+    if action is not None:
+        return None, action, reason
+    # Still claimed under this token, but the fence refused (stale
+    # age, keyboard, or a moved extra): map the stage.
+    stage = error.get("stage")
+    if stage == "stale":
+        return None, "supersede", "reply too old for the age guard"
+    if stage == "keyboard":
+        return None, "fail", "keyboard refused: reply does not answer a command"
+    return None, "defer", f"fence refused ({stage}); retry next pass"
+
+
+def _dispatch_one_outbox_entry(
+    store, outbox, entry, send_cmd, report, *, now, max_reply_age
+) -> None:
+    """Deliver one due outbox entry, through the existing B1
+    three-way sender contract (see _run_send_command).
+
+    The attempt is claimed in SQLite first (CAS on
+    status='pending'), then the queue item is reserved, then the
+    send runs exactly once. Outcomes:
+
+    - sent → reply_message_id is recorded in the outbox BEFORE
+      the queue item is marked done (via _finish_send, which
+      records replied_at + reply_message_id and then closes the
+      primary and every covered item, exactly like --reply), so
+      the ack card, lease, and --latency-report stay consistent.
+      A failed record leaves the item in "sending" for
+      reconciliation, never resent.
+    - rejected (sender exit 2: definitive) → the entry is failed
+      (never retried) and every covered item returns to pending
+      (mark_send_failed), so a later turn can answer it.
+    - retryable (sender exit 3: 429/5xx) → the entry is re-queued
+      with next_attempt_at = now + min(Retry-After, 300) (60 s
+      when the sender had none), and the queue item STAYS in
+      "sending": the entry owns the retry, so no fresh turn can
+      claim the item and answer in parallel. The next attempt
+      re-sends from that reservation (see "resend" above).
+    - unknown → the entry is marked unknown and the item stays in
+      "sending": the send may have gone out, so it is NEVER
+      resent blindly — the operator reconciles it.
+    """
+    entry_id = entry["id"]
+    target = int(entry["target_update_id"])
+    token = entry["claim_token"]
+    extras = [int(t) for t in entry["extra_update_ids"]]
+    if not outbox.mark_sending(entry_id):
+        # Another dispatcher claimed this attempt first.
+        report["deferred"].append(entry_id)
+        return
+    queued_chat_id, action, reason = _reserve_outbox_entry(
+        store, entry, now=now, max_reply_age=max_reply_age
+    )
+    if action == "supersede":
+        outbox.mark_superseded(entry_id, reason)
+        report["superseded"].append(entry_id)
+        return
+    if action == "defer":
+        outbox.requeue(entry_id, now + OUTBOX_DEFER_SECONDS, None, reason)
+        report["deferred"].append(entry_id)
+        return
+    if action == "fail":
+        outbox.mark_failed(entry_id, reason)
+        # The send can never go out (keyboard rule): return every
+        # covered item to pending where it is actually in
+        # "sending" (mark_send_failed is a no-op for a merely
+        # claimed item), so a later turn can answer it.
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            for external_id in [target] + extras:
+                queue_core.mark_send_failed(state, PLATFORM, external_id, token)
+        report["failed"].append(entry_id)
+        return
+    # Reserved (or the entry's own earlier reservation): delete
+    # any recorded ack card(s) best-effort first, exactly like
+    # send_reply, then send once through the sender contract.
+    state = _ensure_adapter_state(store.load())
+    ack_ids = []
+    for external_id in [target] + extras:
+        item = queue_core.find_item(state, PLATFORM, external_id)
+        ack_id = item.get("ack_message_id") if item is not None else None
+        if ack_id is not None and ack_id not in ack_ids:
+            ack_ids.append(ack_id)
+    if ack_ids:
+        # Best-effort only: a failed delete never blocks the send,
+        # and the result does not depend on it.
+        for ack_id in ack_ids:
+            delete_message(send_cmd, queued_chat_id, ack_id)
+    send_result = _run_send_command(
+        send_cmd,
+        queued_chat_id,
+        entry["text"],
+        reply_to=entry["reply_to_message_id"],
+        keyboard=entry["keyboard"],
+    )
+    outcome, message_id = send_result
+    if outcome == "sent":
+        # reply_message_id first, then the queue record: a crash
+        # between the two leaves the reply recoverable from the
+        # outbox instead of lost.
+        outbox.mark_delivered(entry_id, message_id, now)
+        all_ok, _covered = _finish_send(
+            store, target, token, message_id, extras=extras
+        )
+        if all_ok:
+            report["delivered"].append(entry_id)
+        else:
+            report["record_failed"].append(entry_id)
+        return
+    if outcome == "rejected":
+        outbox.mark_failed(entry_id, "rejected: sender exit 2 (definitive)")
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            for external_id in [target] + extras:
+                queue_core.mark_send_failed(state, PLATFORM, external_id, token)
+        report["failed"].append(entry_id)
+        return
+    if outcome == "retryable":
+        retry_after = getattr(send_result, "retry_after", None)
+        delay = _retryable_delay_seconds(retry_after)
+        outbox.requeue(
+            entry_id,
+            now + delay,
+            retry_after,
+            (
+                f"retryable: sender exit 3 (retry-after={retry_after})"
+                if retry_after is not None
+                else "retryable: sender exit 3"
+            ),
+        )
+        report["retried"].append(entry_id)
+        return
+    outbox.mark_unknown(
+        entry_id, "unknown: sender outcome ambiguous; never resent blindly"
+    )
+    report["unknown"].append(entry_id)
+
+
+def dispatch_outbox(
+    store: JsonStateStore,
+    *,
+    now: float | None = None,
+    limit: int = OUTBOX_DISPATCH_PER_PASS,
+    max_reply_age: float | None = DEFAULT_MAX_REPLY_AGE,
+) -> dict:
+    """One dispatcher pass over the due outbox entries (P1.5).
+
+    Called from run_once before the long poll, so a reply the
+    agent queued goes out within one poll cycle, and directly by
+    --dispatch-outbox for the operator. Each due entry is
+    delivered through _dispatch_one_outbox_entry (B1 three-way
+    sender contract; definitive fails, retryable re-queues with
+    backoff honoring Retry-After, unknown is never resent).
+
+    Returns {"ok": true, "checked": n, "delivered": [ids],
+    "failed": [ids], "retried": [ids], "unknown": [ids],
+    "superseded": [ids], "deferred": [ids], "record_failed":
+    [ids]} — ids are outbox entry ids. {"ok": false, "stage":
+    "config", "checked": n, "deferred": [ids]} when no send
+    command is configured: nothing is attempted, and the entries
+    stay queued for a later pass.
+    """
+    check_now = time.time() if now is None else now
+    send_cmd = os.environ.get(SEND_CMD_ENV)
+    outbox = OutboxStore(outbox_path(store))
+    due = outbox.due_entries(check_now, limit=limit)
+    report = {
+        "ok": True,
+        "checked": len(due),
+        "delivered": [],
+        "failed": [],
+        "retried": [],
+        "unknown": [],
+        "superseded": [],
+        "deferred": [],
+        "record_failed": [],
+    }
+    if not send_cmd:
+        report["ok"] = False
+        report["stage"] = "config"
+        report["deferred"] = [entry["id"] for entry in due]
+        return report
+    for entry in due:
+        _dispatch_one_outbox_entry(
+            store, outbox, entry, send_cmd, report,
+            now=check_now, max_reply_age=max_reply_age,
+        )
+    return report
+
+
 def _parse_send_args(extra: list) -> tuple:
     """Optional args after UPDATE_ID CLAIM_TOKEN CHAT_ID for the send
     commands: a bare integer is the REPLY_TO_MESSAGE_ID, and
@@ -5909,6 +6467,75 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         print(json.dumps(latency_report(store.load())))
         return 0
 
+    if args[:1] == ["--dispatch-outbox"]:
+        # --dispatch-outbox: run one dispatcher pass now (the
+        # same pass run_once runs before each long poll): deliver
+        # due outbox entries through the B1 three-way sender
+        # contract, and print the dispatch report JSON. The
+        # operator runs this to flush the outbox by hand, or to
+        # see what a pass would do. Prints {"ok": true,
+        # "checked": n, "delivered": [...], "failed": [...],
+        # "retried": [...], "unknown": [...], "superseded": [...],
+        # "deferred": [...], "record_failed": [...]} (outbox entry
+        # ids), or {"ok": false, "stage": "config"} when no send
+        # command is configured.
+        if len(args) != 1:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --dispatch-outbox",
+            }))
+            return 2
+        print(json.dumps(dispatch_outbox(store)))
+        return 0
+
+    if args[:1] == ["--outbox-status"]:
+        # --outbox-status: read-only list of the outbox entries,
+        # newest first (at most 100), with status, attempts,
+        # reply_message_id and last_error — the operator's window
+        # into entries that need reconciliation (notably
+        # "unknown", which is never resent blindly). Never mutates
+        # anything; prints one JSON object.
+        if len(args) != 1:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --outbox-status",
+            }))
+            return 2
+        print(json.dumps({
+            "ok": True,
+            "outbox_path": str(outbox_path(store)),
+            "entries": OutboxStore(outbox_path(store)).list_entries(),
+        }))
+        return 0
+
+    if args[:1] == ["--outbox-drop"]:
+        # --outbox-drop OUTBOX_ID: operator drop for a wedged
+        # entry — mark one pending/sending entry failed ("dropped
+        # by operator"), so it is never delivered. Terminal
+        # entries cannot be dropped (they are already terminal).
+        # This touches only the outbox row: the queue item stays
+        # wherever it was (usually "sending" for a retryable
+        # entry) — after verifying non-delivery, return it to
+        # pending with --send-failed so a later turn can answer
+        # it. Prints {"ok": true} when one was dropped, {"ok":
+        # false} otherwise.
+        if len(args) != 2:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --outbox-drop OUTBOX_ID",
+            }))
+            return 2
+        try:
+            entry_id = int(args[1])
+        except ValueError:
+            print(json.dumps({"ok": False, "error": "invalid-outbox-id"}))
+            return 2
+        ok = OutboxStore(outbox_path(store)).mark_failed(
+            entry_id, "dropped by operator"
+        )
+        print(json.dumps({"ok": ok}))
+        return 0
+
     if args[:1] == ["--claim-more"]:
         # --claim-more CHAT_ID CLAIM_TOKEN [BATCH_SIZE]: pull messages
         # that arrived during the turn into this turn's batch, so
@@ -6022,6 +6649,56 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
             keyboard=keyboard,
             max_reply_age=_max_reply_age(),
             warm_hold_seconds=0.0 if no_warm_hold else None,
+        )
+        print(json.dumps(result))
+        return 0
+
+    if args[:1] == ["--outbox"]:
+        # --outbox CLAIM_TOKEN [--keyboard]: OUTBOX-FIRST send
+        # path (v2, P1.5). Queue the reply for a claimed batch in
+        # the SQLite outbox (text on stdin, heredoc, never pasted
+        # into a shell command) and return at once — the poll
+        # script delivers it, retries it, and closes the batch, so
+        # a turn killed after the write still delivers. The batch,
+        # chat, reply target and cover list are all derived from
+        # the claim token, exactly like --reply; the caller passes
+        # no update/chat/reply ids. Prints {"ok": true,
+        # "outbox_id": n, "target_update_id": ...,
+        # "covered_update_ids": [...], "chat_id": ...} on success,
+        # or {"ok": false, "stage": ...} ("input", "fence",
+        # "stale-token", "stale", "keyboard", "already-queued").
+        # Once queued, do NOT call --reply for the same batch —
+        # the dispatcher sends it. --reply stays only as the
+        # backwards-compatibility direct send path.
+        _outbox_usage = (
+            "usage: --outbox CLAIM_TOKEN [--keyboard] — reply text "
+            "on stdin; --outbox queues the reply for the dispatcher, "
+            "it does not send it. Do NOT call --reply for the same "
+            "batch afterwards."
+        )
+        if len(args) < 2:
+            print(json.dumps({"ok": False, "error": _outbox_usage}))
+            return 2
+        keyboard = False
+        valid = True
+        index = 2
+        while index < len(args):
+            arg = args[index]
+            if arg == "--keyboard":
+                keyboard = True
+                index += 1
+            else:
+                valid = False
+                break
+        if not valid:
+            print(json.dumps({"ok": False, "error": _outbox_usage}))
+            return 2
+        result = write_outbox(
+            store,
+            args[1],
+            sys.stdin.read(),
+            keyboard=keyboard,
+            max_reply_age=_max_reply_age(),
         )
         print(json.dumps(result))
         return 0
