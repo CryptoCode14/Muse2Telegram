@@ -467,6 +467,30 @@ class WatchdogHealthTests(unittest.TestCase):
         self.assertFalse(report["checks"]["intake_definition"]["ok"])
         self.assertTrue(report["checks"]["checkout"]["ok"])
 
+    def test_intake_named_definition_file_is_accepted(self):
+        # Regression (2026-11-12): the 878afe0 health check only
+        # looked for telegram-bridge.json, but the hook tool names
+        # the file after the hook id, and this install's id is
+        # telegram-bridge-intake — so the check failed forever on
+        # a healthy install. Either filename must pass.
+        defs = self.install["definitions_dir"]
+        old = defs / "telegram-bridge.json"
+        data = json.loads(old.read_text())
+        data["id"] = "telegram-bridge-intake"
+        old.unlink()
+        (defs / "telegram-bridge-intake.json").write_text(json.dumps(data))
+        report = self.health()
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["checks"]["intake_definition"]["ok"])
+
+    def test_missing_definition_names_both_filenames(self):
+        defs = self.install["definitions_dir"]
+        (defs / "telegram-bridge.json").unlink()
+        report = self.health()
+        detail = report["checks"]["intake_definition"]["detail"]
+        self.assertIn("telegram-bridge-intake.json", detail)
+        self.assertIn("telegram-bridge.json", detail)
+
     def test_definition_not_json(self):
         (self.install["definitions_dir"] / "telegram-bridge.json").write_text(
             "not json {"
@@ -553,10 +577,10 @@ class HeartbeatCliTests(unittest.TestCase):
             self.store.load()["queue"][0]["heartbeat_at"], 1000.0
         )
 
-    def test_cli_heartbeat_wrong_token_is_fence(self):
-        code, result = self.run_cli(["--heartbeat", "stale-token"])
+    def test_cli_heartbeat_wrong_token_is_stale_token(self):
+        code, result = self.run_cli(["--heartbeat", "bogus-token"])
         self.assertEqual(code, 0)
-        self.assertEqual(result, {"ok": False, "stage": "fence"})
+        self.assertEqual(result, {"ok": False, "stage": "stale-token"})
 
     def test_cli_heartbeat_usage_error(self):
         code, result = self.run_cli(["--heartbeat"])

@@ -174,8 +174,18 @@ HEALTH_WAKE_COOLDOWN_SECONDS = 600.0
 #: State key recording the last bridge-health wake (epoch seconds).
 LAST_HEALTH_WAKE_KEY = "last_health_wake"
 
-#: The intake hook definition the health check verifies.
-INTAKE_DEFINITION_FILENAME = "telegram-bridge.json"
+#: The intake hook definition filenames the health check verifies,
+#: in order. The hook tool names a definition file after the hook
+#: id, and installs use two ids: "telegram-bridge-intake" (this
+#: install, and SETUP.md Step 10) and "telegram-bridge" (the older
+#: id the 878afe0 health check assumed). Checking only one name
+#: fails the health check forever on the other install — that is
+#: what the first live watchdog dry run hit on 2026-11-12, so the
+#: check accepts either file, first match wins.
+INTAKE_DEFINITION_FILENAMES = (
+    "telegram-bridge-intake.json",
+    "telegram-bridge.json",
+)
 
 #: Intake classifications stored on the queue record as
 #: ``item_class``. Only CLASS_CONVERSATION ("ordinary conversation")
@@ -972,7 +982,8 @@ def check_bridge_health(*, definitions_dir, bridge_home, send_cmd=None):
     the intake needs to poll and the turn needs to reply:
 
     - ``intake_definition``: the intake hook definition at
-      ``definitions_dir/telegram-bridge.json`` parses, is enabled,
+      ``definitions_dir/telegram-bridge-intake.json`` (or the older
+      ``telegram-bridge.json``) parses, is enabled,
       carries ``created_at_ms`` (the runtime stamps it when the
       hook is created through the hook tool — a definition copied
       from the shipped template has none and never runs), and
@@ -991,13 +1002,24 @@ def check_bridge_health(*, definitions_dir, bridge_home, send_cmd=None):
     """
     checks = {}
 
-    definition_path = os.path.join(
-        os.path.expanduser(str(definitions_dir)), INTAKE_DEFINITION_FILENAME
-    )
-    if not os.path.isfile(definition_path):
+    definition_path = None
+    for candidate in INTAKE_DEFINITION_FILENAMES:
+        path = os.path.join(
+            os.path.expanduser(str(definitions_dir)), candidate
+        )
+        if os.path.isfile(path):
+            definition_path = path
+            break
+    if definition_path is None:
         checks["intake_definition"] = {
             "ok": False,
-            "detail": f"definition file missing: {definition_path}",
+            "detail": "definition file missing: looked for "
+            + ", ".join(
+                os.path.join(
+                    os.path.expanduser(str(definitions_dir)), name
+                )
+                for name in INTAKE_DEFINITION_FILENAMES
+            ),
         }
     else:
         try:

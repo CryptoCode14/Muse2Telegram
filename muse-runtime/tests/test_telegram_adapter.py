@@ -350,9 +350,11 @@ class SendFenceTests(unittest.TestCase):
             )
 
     def test_fence_refuses_without_any_send_invocation(self):
-        """Fence refusals (wrong token, unknown item, already
-        replied, never claimed) print stage "fence" and the send
-        command is never invoked."""
+        """Fence refusals (wrong token, unknown item, never
+        claimed) print stage "fence" and the send command is
+        never invoked. An already-replied item instead prints
+        stage "stale-token" with its disposition (the reply
+        already went out, so there is nothing to re-send)."""
         token = self.claim_dm()
         cmd = self.write_send_cmd('print("4242")\n')
         self.assertEqual(
@@ -365,14 +367,20 @@ class SendFenceTests(unittest.TestCase):
         )
         self.assertEqual(self.call_count(), 0)
         self.assertEqual(self.item(1)["status"], "claimed")
-        # Already replied: the fence refuses (mark_sending guard).
+        # Already replied: stale-token with disposition (the reply
+        # already went out, so there is nothing to re-send).
         self.assertEqual(
             run_cli(self.path, ["--replied", "1", "555", token]),
             {"ok": True},
         )
         self.assertEqual(
             self.fenced(cmd, 1, token),
-            {"ok": False, "stage": "fence"},
+            {
+                "ok": False,
+                "stage": "stale-token",
+                "item_status": "claimed",
+                "replied": True,
+            },
         )
         self.assertEqual(self.call_count(), 0)
         # Pending but never claimed: refused as well.
@@ -1976,6 +1984,62 @@ class ActiveSpeakersTests(unittest.TestCase):
         self.assertIn("@boss", names)
         self.assertIn("@kai", names)
         self.assertEqual(names["@kai"]["messages"], 1)
+
+
+class DoneDefaultReasonTests(unittest.TestCase):
+    """--done with no reply and no reason defaults the reason.
+
+    Regression (2026-11-12 turns-dying bug): items 344786942-945
+    were closed done with replied_at None and done_reason None —
+    the owning turn closed the @mention work items with no reason
+    recorded (a stale turn cannot --done: a wrong token is a
+    no-op in mark_done). The CLI now defaults the reason on the
+    operator path (queue_core.mark_done itself stays reason-optional;
+    its tests pin that), so every silent close is auditable.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "state.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _claimed(self, external_id, item_class):
+        store = JsonStateStore(self.path)
+        with store.transaction() as state:
+            queue_core.enqueue(
+                state, platform="telegram", external_id=external_id,
+                chat_id=GROUP, chat_type="group", sender_id=OWNER,
+                text="hello", message_id=9000 + external_id,
+                item_class=item_class, now=1000.0,
+            )
+            batch = queue_core.claim_batch(state, platform="telegram", now=1000.0)
+        return batch["claim_token"]
+
+    def _item(self, external_id):
+        return JsonStateStore(self.path).load()["queue"][0]
+
+    def test_done_request_without_reason_defaults_to_no_reply_request(self):
+        token = self._claimed(1, queue_core.CLASS_REQUEST)
+        self.assertEqual(run_cli(self.path, ["--done", "1", token]), {"ok": True})
+        item = self._item(1)
+        self.assertEqual(item["status"], "done")
+        self.assertIsNone(item["replied_at"])
+        self.assertEqual(item["done_reason"], "closed-no-reply-request")
+
+    def test_done_conversation_without_reason_defaults_to_no_reply(self):
+        token = self._claimed(2, queue_core.CLASS_CONVERSATION)
+        self.assertEqual(run_cli(self.path, ["--done", "2", token]), {"ok": True})
+        self.assertEqual(self._item(2)["done_reason"], "closed-no-reply")
+
+    def test_done_explicit_reason_is_preserved(self):
+        token = self._claimed(3, queue_core.CLASS_REQUEST)
+        self.assertEqual(
+            run_cli(self.path, ["--done", "3", token, "silence-guarded"]),
+            {"ok": True},
+        )
+        self.assertEqual(self._item(3)["done_reason"], "silence-guarded")
 
 
 if __name__ == "__main__":

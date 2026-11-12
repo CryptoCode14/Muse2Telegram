@@ -160,15 +160,19 @@ class RoutingNoteOutsideRepoTests(unittest.TestCase):
         # unified-live.md reference copy), not the superseded tier
         # files, so that is where the note must be.
         candidates = []
-        hook_def = (
-            Path.home() / "hooks" / "definitions" / "telegram-bridge.json"
-        )
-        if hook_def.is_file():
-            try:
-                candidates.append(
-                    json.loads(hook_def.read_text())["prompt"])
-            except (KeyError, ValueError):
-                pass
+        for definition_name in (
+            "telegram-bridge-intake.json",
+            "telegram-bridge.json",
+        ):
+            hook_def = (
+                Path.home() / "hooks" / "definitions" / definition_name
+            )
+            if hook_def.is_file():
+                try:
+                    candidates.append(
+                        json.loads(hook_def.read_text())["prompt"])
+                except (KeyError, ValueError):
+                    pass
         live_unified = Path.home() / "hooks" / "prompts" / "unified-live.md"
         if live_unified.is_file():
             candidates.append(live_unified.read_text())

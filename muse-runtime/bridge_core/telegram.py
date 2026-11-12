@@ -94,8 +94,8 @@ Keeps the operational interface the wake hook drives:
                            item under the token: the owning turn's
                            proof it is still alive and working.
                            Prints {"ok": true, "heartbeated": n}, or
-                           {"ok": false, "stage": "fence"} when the
-                           token owns no live batch. The turn calls
+                           {"ok": false, "stage": "stale-token"} when
+                           the token owns no live batch. The turn calls
                            this first thing after waking and before
                            any step that may take over a minute; a
                            claim whose heartbeat goes stale for
@@ -148,7 +148,16 @@ Keeps the operational interface the wake hook drives:
                            with the same fields on failure. On stage
                            "unknown" the send outcome is ambiguous:
                            do NOT resend; check delivery first, and
-                           nothing is closed as replied. --reply is
+                           nothing is closed as replied. On stage
+                           "stale-token" the token owns no live batch
+                           any more (recycled while the turn worked):
+                           do NOT --done the items and do NOT resend;
+                           the result also carries "item_status" and
+                           "replied" for the item when it is known,
+                           so the caller can tell whether the answer
+                           went out. If "replied" is true, stop; else
+                           the intake's re-wake owns the retry.
+                           --reply is
                            NOT a substitute for --send-ack: ack first
                            for work that will take 10+ minutes, then
                            send the full reply with --reply. The
@@ -3426,7 +3435,48 @@ def _reserve_send(
             # under the caller's own token for reassessment.
             return {"ok": False, "stage": "stale"}, None
         fenced = queue_core.mark_sending(state, PLATFORM, target, token)
+        if not fenced:
+            # Ownership lost (2026-11-12 turns-dying bug): the item
+            # exists but this token no longer owns it. Report the
+            # distinct "stale-token" stage with the item's
+            # disposition, so the caller knows whether the answer
+            # went out and whether a re-wake owns the retry:
+            # - the reply already went out (replied_at set): the
+            #   answer is sent, stop, never resend;
+            # - the claim was recycled and the item is pending again
+            #   (claim_token None, ever_claimed): the re-wake owns
+            #   the retry, exit quietly without closing anything.
+            # A live claim under a different token, an item never
+            # claimed at all, an item already in "sending" (a send
+            # in flight, outcome unknown), and item-missing /
+            # chat-mismatch above still report plain "fence" — the
+            # caller never owned that claim, so this is not its
+            # stale token.
+            if item is not None and item.get("status") != queue_core.SENDING:
+                if item.get("replied_at") is not None:
+                    stale_disposition = {
+                        "item_status": item.get("status"),
+                        "replied": True,
+                    }
+                elif (
+                    item.get("claim_token") is None
+                    and item.get("ever_claimed")
+                ):
+                    stale_disposition = {
+                        "item_status": item.get("status"),
+                        "replied": False,
+                    }
+                else:
+                    stale_disposition = None
+            else:
+                stale_disposition = None
+        else:
+            stale_disposition = None
     if not fenced:
+        if stale_disposition is not None:
+            return {
+                "ok": False, "stage": "stale-token", **stale_disposition
+            }, None
         return {"ok": False, "stage": "fence"}, None
     return None, queued_chat_id
 
@@ -3739,18 +3789,19 @@ def heartbeat_batch(store: JsonStateStore, token, *, now: float | None = None) -
     token: the owning turn's proof it is still alive and working.
 
     Returns ``{"ok": true, "heartbeated": n}`` when n > 0, and
-    ``{"ok": false, "stage": "fence"}`` when the token owns no live
-    batch (stale token, or every item already replied / closed).
-    The turn calls this first thing after waking, and again before
-    any step that may take over a minute. The ack and claim-more
-    paths refresh it automatically, so a turn that acks or claims
-    more never needs an explicit heartbeat for those steps.
+    ``{"ok": false, "stage": "stale-token"}`` when the token owns
+    no live batch (stale token, or every item already replied /
+    closed). The turn calls this first thing after waking, and
+    again before any step that may take over a minute. The ack and
+    claim-more paths refresh it automatically, so a turn that acks
+    or claims more never needs an explicit heartbeat for those
+    steps.
     """
     with store.transaction() as state:
         _ensure_adapter_state(state)
         refreshed = queue_core.heartbeat_batch(state, token, now=now)
     if refreshed == 0:
-        return {"ok": False, "stage": "fence"}
+        return {"ok": False, "stage": "stale-token"}
     return {"ok": True, "heartbeated": refreshed}
 
 
@@ -4147,9 +4198,13 @@ def send_reply(
 
     (a) Look up ALL claimed, unreplied items under the token. No
         items, or items spanning more than one chat_id, fails
-        closed (stage "fence") with nothing sent: one batch is one
+        closed with nothing sent: one batch is one
         lane, so a split batch is corrupt state, never a reply to
-        half of it.
+        half of it. No items at all means the token owns no live
+        batch any more — the claim was recycled while the turn was
+        working — so that case reports the distinct stage
+        "stale-token" instead of the generic "fence", and the
+        split-batch case keeps "fence".
     (b) Heartbeat the whole batch first (proof the turn is alive).
     (c) Fire typing in the chat (best-effort, never blocks the
         send).
@@ -4208,8 +4263,8 @@ def send_reply(
     """
     def _result(ok, stage, message_id=None, chat_id=None,
                 replied=(), closed=(), ack_deleted=False,
-                next_batch=None):
-        return {
+                next_batch=None, item_status=None, replied_flag=None):
+        result = {
             "ok": ok,
             "stage": stage,
             "message_id": message_id,
@@ -4219,6 +4274,16 @@ def send_reply(
             "ack_deleted": ack_deleted,
             "next_batch": next_batch,
         }
+        # Disposition on stage "stale-token" only (see (a)/(b)):
+        # what the batch's items look like now, so the caller knows
+        # whether the answer went out and whether a re-wake owns
+        # the retry — there is no turn-side state-read CLI, so the
+        # result itself must carry it.
+        if item_status is not None:
+            result["item_status"] = item_status
+        if replied_flag is not None:
+            result["replied"] = replied_flag
+        return result
 
     if not isinstance(text, str) or not text.strip() or len(text) > 4096:
         return _result(False, "input")
@@ -4234,7 +4299,7 @@ def send_reply(
             and item.get("replied_at") is None
         ]
     if not items:
-        return _result(False, "fence")
+        return _result(False, "stale-token")
     chat_ids = {item.get("chat_id") for item in items}
     if len(chat_ids) != 1:
         return _result(False, "fence")
@@ -4246,7 +4311,23 @@ def send_reply(
         _ensure_adapter_state(state)
         refreshed = queue_core.heartbeat_batch(state, token, now=now)
     if refreshed == 0:
-        return _result(False, "fence", chat_id=chat_id)
+        # The batch vanished between the lookup and the heartbeat
+        # (recycled mid-send): same stale-token story as (a), not
+        # a generic fence failure. The items were found in (a), so
+        # report one item's disposition now (the first found item;
+        # the whole batch shares one token and one fate).
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            current = queue_core.find_item(
+                state, PLATFORM, int(items[0]["external_id"])
+            )
+        if current is not None:
+            return _result(
+                False, "stale-token", chat_id=chat_id,
+                item_status=current.get("status"),
+                replied_flag=current.get("replied_at") is not None,
+            )
+        return _result(False, "stale-token", chat_id=chat_id)
     ordered = sorted(items, key=lambda it: it.get("received_at") or 0)
 
     def _message_id(item):
@@ -4496,6 +4577,22 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         with store.transaction() as state:
             _ensure_adapter_state(state)
             if args[0] == "--done":
+                if reason is None:
+                    # Close-path audit (2026-11-12 turns-dying bug):
+                    # the owning turn closed unanswered @mentions
+                    # with no reason recorded (items 344786942-945:
+                    # done, replied_at None, done_reason None).
+                    # Default the reason so every silent close is
+                    # auditable; request items get their own marker.
+                    # queue_core.mark_done itself stays reason-optional
+                    # (its tests pin that); the default lives here, on
+                    # the operator path the agent actually uses.
+                    item = queue_core.find_item(state, PLATFORM, target)
+                    if item is not None and item.get("replied_at") is None:
+                        if item.get("item_class") == queue_core.CLASS_REQUEST:
+                            reason = "closed-no-reply-request"
+                        else:
+                            reason = "closed-no-reply"
                 ok = queue_core.mark_done(
                     state, PLATFORM, target, token,
                     reason=reason, evidence=evidence,

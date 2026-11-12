@@ -464,6 +464,10 @@ class ReplyFailClosedTests(ReplyTestBase):
     """--reply with no batch, or a split batch, sends nothing."""
 
     def test_reply_no_claimed_items_fails_closed(self):
+        # No live batch under the token (recycled while the turn
+        # worked, or a bogus token): nothing is sent, and the stage
+        # is the distinct "stale-token", not the generic "fence"
+        # (which is kept for a split batch, below).
         cmd = self.write_send_cmd()
         with self.send_env(cmd):
             result = run_cli(
@@ -471,7 +475,7 @@ class ReplyFailClosedTests(ReplyTestBase):
                 stdin_text="hello?",
             )
         self.assertEqual(result["ok"], False)
-        self.assertEqual(result["stage"], "fence")
+        self.assertEqual(result["stage"], "stale-token")
         self.assertIsNone(result["chat_id"])
         self.assertEqual(result["replied_update_ids"], [])
         self.assertEqual(result["closed_update_ids"], [])
