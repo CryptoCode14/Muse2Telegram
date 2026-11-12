@@ -118,6 +118,20 @@ class CollabProtocolTests(unittest.TestCase):
         self.assertIn("COLLAB_PROTOCOL.md", text, str(setup))
         self.assertIn("telegram-collab-protocol", text, str(setup))
 
+    def test_collab_protocol_has_no_install_commands(self):
+        # The template ships as data to be filled in per SETUP Step
+        # 4. It must not carry its own install-time commands: a
+        # fresh installer reading the file would be told by the file
+        # itself to rewrite it, and that trips the safety check.
+        # The fill recipe lives in SETUP.md only.
+        path = _repo_path("COLLAB_PROTOCOL.md")
+        if path is None:
+            self.skipTest("COLLAB_PROTOCOL.md not present on this machine")
+        text = path.read_text()
+        self.assertNotIn("Replace these everywhere", text, str(path))
+        self.assertNotIn("Do not leave a placeholder", text, str(path))
+        self.assertIn("Filled in for this group", text, str(path))
+
 
 if __name__ == "__main__":
     unittest.main()

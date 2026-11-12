@@ -11,7 +11,16 @@
 #          no reply so it never wakes anyone.
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
-cd ~/workspace/muse-agent-bridge-eval
+# muse-runtime/ holds bridge_core/ and .venv. Derive it from this
+# script's own location when run from the repo; after install to
+# ~/hooks/scripts/, set BRIDGE_HOME to your checkout's muse-runtime/.
+if [ -z "${BRIDGE_HOME:-}" ]; then
+  _candidate="$(cd "$(dirname "$0")/.." && pwd || true)"
+  if [ -d "$_candidate/bridge_core" ]; then BRIDGE_HOME="$_candidate"; fi
+  unset _candidate
+fi
+: "${BRIDGE_HOME:?set BRIDGE_HOME to the muse-runtime directory of the bridge checkout}"
+cd "$BRIDGE_HOME"
 export TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json
 export TELEGRAM_BRIDGE_SEND_CMD=~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender
 export TELEGRAM_BRIDGE_BOT_USERNAME="YOUR_BOT_USERNAME"  # <-- set to your bot username

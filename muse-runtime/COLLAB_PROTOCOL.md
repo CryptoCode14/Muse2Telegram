@@ -35,18 +35,12 @@ replaces that default, in that kind of group only, with the
 teammate rules below. In a guarded group, or a group with only
 one bot, CHAT_RULES.md still governs and this file does not apply.
 
-## Fill in at install
+## Filled in for this group
 
-Replace these everywhere in this file, with the real values for
-this install. Do not leave a placeholder in place.
-
-- `[USER]` — the owner's name.
-- `[YOUR MUSE NAME]` — this Muse's name.
-- `[BOT LIST]` — every bot in the group: name, Telegram username,
-  and job. One line per bot, for example:
-  `[YOUR MUSE NAME] / @[YOUR BOT USERNAME] — coding`;
-  a second bot — research and the owner's personal side;
-  a third bot — business only (estimates, scheduling, and so on).
+- Owner: [USER]
+- This Muse: [YOUR MUSE NAME]
+- Bots in this group:
+  - [BOT LIST]
 - `[GROUP]` — the group's name or chat id, for reference only.
 
 ## The direction

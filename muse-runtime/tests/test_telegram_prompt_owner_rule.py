@@ -178,6 +178,27 @@ class RoutingNoteOutsideRepoTests(unittest.TestCase):
             self.assertIn("room context only", text)
             self.assertIn("work item from", text)
 
+    def test_no_stale_eval_checkout_path(self):
+        # The shipped scripts and prompt once cd'd / worked from a
+        # stale eval checkout path that exists on no machine, and
+        # SETUP never told the installer to change it, so a clean
+        # install following SETUP broke on it. The scripts now derive
+        # the checkout (BRIDGE_HOME) and the prompts use the
+        # <bridge checkout> placeholder from SETUP.
+        root = _repo_root()
+        if root is None:
+            self.skipTest("repo root not present on this machine")
+        checked = 0
+        for path in _repo_content_paths(root):
+            text = path.read_text()
+            self.assertNotIn("muse-agent-bridge-eval", text, str(path))
+            checked += 1
+        self.assertGreater(checked, 0, "no repo files found to check")
+        for name in ("telegram-bridge-intake.sh",
+                     "telegram-bridge-watchdog.sh"):
+            text = (root / "hooks" / name).read_text()
+            self.assertIn("BRIDGE_HOME", text, name)
+
     def test_flagged_phrasing_absent_from_live_connector_doc(self):
         # The live connector doc is installed from the repo; it must
         # carry no flagged wording either.

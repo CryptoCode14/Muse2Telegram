@@ -160,7 +160,11 @@ Copy the pieces to where they live on this host. Use these exact paths
   every bridge command runs from there (`cd` into it first).
 - Hook script and decider: copy `muse-runtime/hooks/telegram-bridge-intake.sh`
   and `muse-runtime/hooks/telegram-bridge-decide.py` to the hooks scripts
-  folder (e.g. `~/hooks/scripts/`). Make them executable.
+  folder (e.g. `~/hooks/scripts/`). Make them executable. The scripts
+  find the bridge checkout from their own location when run from the
+  repo; after copying them, set BRIDGE_HOME in each to the bridge
+  checkout path you noted above (e.g. `BRIDGE_HOME="$HOME/workspace/muse2telegram/muse-runtime"`),
+  or they fail with a clear message telling you to set it.
 - Watchdog: copy `muse-runtime/hooks/telegram-bridge-watchdog.sh` to the
   hooks scripts folder and make it executable, and copy
   `muse-runtime/hooks/telegram-bridge-watchdog.json` to the hooks
@@ -204,7 +208,11 @@ Copy the pieces to where they live on this host. Use these exact paths
   say what you are doing, ask each other questions, hand work
   off; ack-only text stays a reaction; an ack is terminal; one
   owner per task). Fill in the placeholders in COLLAB_PROTOCOL.md
-  at install ([USER], [YOUR MUSE NAME], [BOT LIST], [GROUP]).
+  at install: `[USER]` with the owner's name, `[YOUR MUSE NAME]`
+  with this Muse's name, `[BOT LIST]` with one line per bot in the
+  form `Name / @username — job`, and `[GROUP]` with the group's
+  chat id. The "Filled in for this group" section is where those
+  values land.
   In a trusted multi-bot group where this skill is adopted, it
   wins over CHAT_RULES.md; in a guarded group, or a group with
   only one bot, CHAT_RULES.md still governs and this skill does
@@ -402,7 +410,7 @@ The hook definition prompt is the unified prompt in
 definition prompt (replacing the placeholders), following the exact
 install steps in `muse-runtime/hooks/hook-definition-unified-prompt.md`.
 It is the woken agent's full instruction for the turn: one static text
-for every wake (13071 chars, ~3268 modelled tokens). There is no
+for every wake (13054 chars, ~3264 modelled tokens). There is no
 per-batch prompt selection any more: the decider prints only `wake` /
 `hold` / `done` / `empty`, and the intake hook pre-loads the agent's
 context into the wake payload as `context_md` (the bounded contents of
