@@ -249,10 +249,13 @@ Keeps the operational interface the wake hook drives:
                            on stdin; the batch, chat, reply target
                            and cover list are derived from the claim
                            token, exactly like --reply) and return at
-                           once — the poll script delivers it within
-                           one poll cycle, retries it, and closes the
-                           batch, so a turn killed after the write
-                           still delivers. The write is fenced by the
+                           once — then dispatch it yourself with
+                           --dispatch-outbox CLAIM_TOKEN, so it goes
+                           out in the turn instead of waiting for the
+                           poll (the poll stays the backstop for
+                           entries the turn never dispatched, so a
+                           turn killed after the write still
+                           delivers). The write is fenced by the
                            same claim token rules as --reply, and a
                            live entry already covering the batch
                            refuses the write as "already-queued".
@@ -267,15 +270,20 @@ Keeps the operational interface the wake hook drives:
                            dispatcher sends it. The outbox lives next
                            to state.json
                            (``<state stem>.outbox.sqlite3``).
-  --dispatch-outbox        run one dispatcher pass now (the same pass
+  --dispatch-outbox [CLAIM_TOKEN]
+                           run one dispatcher pass now (the same pass
                            run_once runs before each long poll):
                            deliver due outbox entries through the B1
                            three-way sender contract (definitive
                            fails, retryable re-queues with backoff
                            honoring Retry-After, unknown is never
                            resent), recording reply_message_id before
-                           marking the queue item done. Prints the
-                           dispatch report JSON.
+                           marking the queue item done. With a claim
+                           token, only that token's entries are
+                           dispatched (the agent's self-dispatch
+                           after an --outbox write); without one,
+                           every due entry is (operator / poll use).
+                           Prints the dispatch report JSON.
   --outbox-status          read-only: list the outbox entries, newest
                            first, with status, attempts,
                            reply_message_id and last_error.
@@ -6031,14 +6039,22 @@ def dispatch_outbox(
     now: float | None = None,
     limit: int = OUTBOX_DISPATCH_PER_PASS,
     max_reply_age: float | None = DEFAULT_MAX_REPLY_AGE,
+    claim_token: str | None = None,
 ) -> dict:
     """One dispatcher pass over the due outbox entries (P1.5).
 
     Called from run_once before the long poll, so a reply the
     agent queued goes out within one poll cycle, and directly by
-    --dispatch-outbox for the operator. Each due entry is
-    delivered through _dispatch_one_outbox_entry (B1 three-way
-    sender contract; definitive fails, retryable re-queues with
+    --dispatch-outbox for the operator. The agent also calls it
+    itself, right after an --outbox write, with its own claim
+    token (see --dispatch-outbox): the reply then goes out in
+    the turn instead of waiting for the next poll tick, and the
+    poll stays the backstop for entries the agent never
+    dispatched (a turn killed before dispatch). With a claim
+    token, only that token's entries are dispatched; without
+    one, every due entry is. Each due entry is delivered
+    through _dispatch_one_outbox_entry (B1 three-way sender
+    contract; definitive fails, retryable re-queues with
     backoff honoring Retry-After, unknown is never resent).
 
     Returns {"ok": true, "checked": n, "delivered": [ids],
@@ -6052,7 +6068,7 @@ def dispatch_outbox(
     check_now = time.time() if now is None else now
     send_cmd = os.environ.get(SEND_CMD_ENV)
     outbox = OutboxStore(outbox_path(store))
-    due = outbox.due_entries(check_now, limit=limit)
+    due = outbox.due_entries(check_now, limit=limit, claim_token=claim_token)
     report = {
         "ok": True,
         "checked": len(due),
@@ -6488,24 +6504,30 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         return 0
 
     if args[:1] == ["--dispatch-outbox"]:
-        # --dispatch-outbox: run one dispatcher pass now (the
-        # same pass run_once runs before each long poll): deliver
-        # due outbox entries through the B1 three-way sender
-        # contract, and print the dispatch report JSON. The
-        # operator runs this to flush the outbox by hand, or to
-        # see what a pass would do. Prints {"ok": true,
-        # "checked": n, "delivered": [...], "failed": [...],
-        # "retried": [...], "unknown": [...], "superseded": [...],
-        # "deferred": [...], "record_failed": [...]} (outbox entry
-        # ids), or {"ok": false, "stage": "config"} when no send
-        # command is configured.
-        if len(args) != 1:
+        # --dispatch-outbox [CLAIM_TOKEN]: run one dispatcher
+        # pass now (the same pass run_once runs before each long
+        # poll): deliver due outbox entries through the B1
+        # three-way sender contract, and print the dispatch
+        # report JSON. With a claim token, only that token's
+        # entries are dispatched: the agent calls this with its
+        # own token right after an --outbox write, so its reply
+        # goes out in the turn instead of waiting for the next
+        # poll tick (the poll stays the backstop). Without a
+        # token, every due entry is dispatched (operator / poll
+        # use). Prints {"ok": true, "checked": n, "delivered":
+        # [...], "failed": [...], "retried": [...], "unknown":
+        # [...], "superseded": [...], "deferred": [...],
+        # "record_failed": [...]} (outbox entry ids), or {"ok":
+        # false, "stage": "config"} when no send command is
+        # configured.
+        if len(args) not in (1, 2):
             print(json.dumps({
                 "ok": False,
-                "error": "usage: --dispatch-outbox",
+                "error": "usage: --dispatch-outbox [CLAIM_TOKEN]",
             }))
             return 2
-        print(json.dumps(dispatch_outbox(store)))
+        token = args[1] if len(args) == 2 else None
+        print(json.dumps(dispatch_outbox(store, claim_token=token)))
         return 0
 
     if args[:1] == ["--outbox-status"]:

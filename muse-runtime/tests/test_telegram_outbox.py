@@ -270,9 +270,10 @@ class OutboxTestBase(unittest.TestCase):
                 stdin_text=text,
             )
 
-    def dispatch(self, cmd, **kwargs):
+    def dispatch(self, cmd, token=None, **kwargs):
+        argv = ["--dispatch-outbox"] + ([token] if token else [])
         with self.send_env(cmd):
-            return run_cli(self.path, ["--dispatch-outbox"], **kwargs)
+            return run_cli(self.path, argv, **kwargs)
 
 
 class OutboxWriteTests(OutboxTestBase):
@@ -519,6 +520,70 @@ class OutboxDispatchTests(OutboxTestBase):
         self.assertEqual(second["checked"], 0)
         self.assertEqual(second["delivered"], [])
         self.assertEqual(len(self.text_sends()), 1)
+
+    def test_dispatch_token_scoped_delivers_only_that_token(self):
+        # Two batches in two lanes; a token-scoped dispatch (the
+        # agent's self-dispatch after an --outbox write) delivers
+        # only its own token's entry, leaving the other's pending
+        # for the poll (bare dispatch).
+        cmd = self.write_send_cmd()
+        store = JsonStateStore(self.path)
+        now = time.time()
+        with store.transaction() as state:
+            queue_core.enqueue(
+                state, platform="telegram", external_id=1,
+                chat_id=OWNER, chat_type="private", sender_id=OWNER,
+                text="hello A", message_id=9001, now=now,
+            )
+            queue_core.enqueue(
+                state, platform="telegram", external_id=2,
+                chat_id=222, chat_type="private", sender_id=OWNER,
+                text="hello B", message_id=9002, now=now,
+            )
+            batch_a = queue_core.claim_batch(
+                state, platform="telegram", now=now)
+            batch_b = queue_core.claim_batch(
+                state, platform="telegram", now=now)
+        token_a = batch_a["claim_token"]
+        token_b = batch_b["claim_token"]
+        self.assertNotEqual(token_a, token_b)
+        result_a = self.write_outbox(token_a, "reply A", cmd)
+        result_b = self.write_outbox(token_b, "reply B", cmd)
+        self.assertTrue(result_a["ok"], result_a)
+        self.assertTrue(result_b["ok"], result_b)
+        report = self.dispatch(cmd, token=token_a)
+        self.assertEqual(report["delivered"], [result_a["outbox_id"]])
+        self.assertEqual(report["checked"], 1)
+        self.assertEqual(
+            self.outbox_entry(result_b["outbox_id"])["status"], "pending")
+        self.assertEqual(len(self.text_sends()), 1)
+        report = self.dispatch(cmd)
+        self.assertEqual(report["delivered"], [result_b["outbox_id"]])
+        self.assertEqual(len(self.text_sends()), 2)
+
+    def test_agent_dispatch_then_poll_no_double_delivery(self):
+        # The agent's self-dispatch after an --outbox write
+        # delivers in the turn; a later poll pass (bare dispatch)
+        # finds nothing due and never sends twice.
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        result = self.write_outbox(
+            payload["claim_token"], "hi there", cmd)
+        entry_id = result["outbox_id"]
+        agent_pass = self.dispatch(cmd, token=payload["claim_token"])
+        self.assertEqual(agent_pass["delivered"], [entry_id])
+        poll_pass = self.dispatch(cmd)
+        self.assertEqual(poll_pass["checked"], 0)
+        self.assertEqual(poll_pass["delivered"], [])
+        again = self.dispatch(cmd, token=payload["claim_token"])
+        self.assertEqual(again["checked"], 0)
+        self.assertEqual(again["delivered"], [])
+        self.assertEqual(len(self.text_sends()), 1)
+        self.assertEqual(
+            self.outbox_entry(entry_id)["status"], "delivered")
 
     def test_dispatch_retryable_retries_with_retry_after(self):
         cmd, entry_id = self._queued()
@@ -928,9 +993,18 @@ class OutboxOperatorTests(OutboxTestBase):
         result = run_cli(self.path, ["--outbox-status", "extra"])
         self.assertEqual(result["ok"], False)
         self.assertIn("usage", result["error"])
-        result = run_cli(self.path, ["--dispatch-outbox", "extra"])
+        # --dispatch-outbox now takes an optional claim token, so
+        # one extra arg is a token, not a usage error — two are.
+        result = run_cli(self.path, ["--dispatch-outbox", "extra", "more"])
         self.assertEqual(result["ok"], False)
         self.assertIn("usage", result["error"])
+        # A token that matches nothing is not an error: the pass
+        # simply finds nothing due for that token.
+        cmd = self.write_send_cmd()
+        result = self.dispatch(cmd, token="no-such-token")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["checked"], 0)
+        self.assertEqual(result["delivered"], [])
 
 
 if __name__ == "__main__":

@@ -197,6 +197,28 @@ class UnifiedPromptTests(unittest.TestCase):
         ):
             self.assertIn(phrase, text)
 
+    def test_unified_prompt_orders_outbox_then_dispatch(self):
+        # Self-dispatch: the agent writes to the outbox, then
+        # delivers its own entry with --dispatch-outbox in the
+        # turn, so the reply does not wait for the next poll
+        # tick. The poll is only the backstop for entries the
+        # turn never dispatched.
+        text = PROMPT.read_text()
+        send_at = text.index("Send via the outbox FIRST")
+        write_at = text.index("Write the reply to the outbox", send_at)
+        dispatch_at = text.index("--dispatch-outbox CLAIM_TOKEN", send_at)
+        self.assertLess(write_at, dispatch_at)
+        self.assertLess(
+            dispatch_at,
+            text.index(
+                "do NOT call --reply for the same batch", send_at),
+        )
+        self.assertIn("The poll is only the backstop", text)
+        self.assertIn(
+            "do NOT send another: the poll retries a throttled entry",
+            text,
+        )
+
     def test_unified_prompt_carries_commands_voice_media(self):
         text = PROMPT.read_text()
         for phrase in (

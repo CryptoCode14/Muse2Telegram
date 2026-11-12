@@ -1,9 +1,13 @@
 """SQLite outbox for the P1.5 dispatcher (OUTBOX-FIRST delivery).
 
-The agent writes its reply here and closes the turn; the poll
-script (``bridge_core.telegram.dispatch_outbox``, called from
-``run_once``) delivers, retries, and records ``reply_message_id``
-before marking the queue item done. Delivery never needs a turn.
+The agent writes its reply here, dispatches it itself with
+``--dispatch-outbox CLAIM_TOKEN`` so it goes out in the turn,
+and closes the turn; the poll script
+(``bridge_core.telegram.dispatch_outbox``, called from
+``run_once``) is the backstop that delivers any entry the
+turn never dispatched, retries, and records
+``reply_message_id`` before marking the queue item done.
+Delivery never needs a turn.
 
 Path: next to state.json — ``<state stem>.outbox.sqlite3`` (see
 ``telegram.outbox_path``; ``TELEGRAM_BRIDGE_OUTBOX_PATH`` overrides
@@ -210,17 +214,30 @@ class OutboxStore:
         finally:
             conn.close()
 
-    def due_entries(self, now: float, limit: int) -> list:
+    def due_entries(self, now: float, limit: int,
+                    claim_token: str | None = None) -> list:
         """Pending entries due for delivery (``next_attempt_at``
-        NULL or past), oldest first, at most ``limit``."""
+        NULL or past), oldest first, at most ``limit``. With a
+        claim token, only that token's entries: the agent's
+        self-dispatch after an --outbox write delivers its own
+        reply in the turn, never another batch's."""
         conn = self._connect()
         try:
-            rows = conn.execute(
-                "SELECT * FROM outbox WHERE status = 'pending' "
-                "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
-                "ORDER BY created_at ASC, id ASC LIMIT ?",
-                (float(now), int(limit)),
-            ).fetchall()
+            if claim_token is None:
+                rows = conn.execute(
+                    "SELECT * FROM outbox WHERE status = 'pending' "
+                    "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+                    "ORDER BY created_at ASC, id ASC LIMIT ?",
+                    (float(now), int(limit)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM outbox WHERE status = 'pending' "
+                    "AND claim_token = ? "
+                    "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+                    "ORDER BY created_at ASC, id ASC LIMIT ?",
+                    (str(claim_token), float(now), int(limit)),
+                ).fetchall()
             return [_row_to_entry(row) for row in rows]
         finally:
             conn.close()
