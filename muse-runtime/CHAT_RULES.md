@@ -7,7 +7,7 @@ bot keeps its own personality as set up by its owner.
 
 When a Muse installs this repo, adopt these rules as part of the wake
 prompt behaviour: they govern every group reply. The full rule set
-lives here; the wake prompts (`tier-standard.md`, `tier-quick.md`)
+lives here; the unified wake prompt (`prompts/unified.md`)
 carry the short version. If the two ever disagree, this file wins.
 
 These rules come from published group-chat practice (mention-gated

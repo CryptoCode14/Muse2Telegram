@@ -128,6 +128,33 @@ Keeps the operational interface the wake hook drives:
                            {"ok": false, "stage": "record"} when the
                            send went out but a reply record could not
                            be written for every item.
+  --reply CLAIM_TOKEN [--react EMOJI] [--keyboard]
+                           the single send path for a turn (v2): look
+                           up every claimed item under CLAIM_TOKEN
+                           (the caller passes no update/chat/reply
+                           ids — they are derived from the batch),
+                           heartbeat the batch, fire typing, react on
+                           the latest user message when --react is
+                           given, delete any recorded ack message,
+                           then send one reply (the text is read from
+                           stdin) threaded under the latest user
+                           message and close every covered item.
+                           Prints {"ok": true, "stage": "sent",
+                           "message_id": ..., "chat_id": ...,
+                           "replied_update_ids": [...],
+                           "closed_update_ids": [...],
+                           "ack_deleted": ..., "next_batch": null} on
+                           success, or {"ok": false, "stage": ...}
+                           with the same fields on failure. On stage
+                           "unknown" the send outcome is ambiguous:
+                           do NOT resend; check delivery first, and
+                           nothing is closed as replied. --reply is
+                           NOT a substitute for --send-ack: ack first
+                           for work that will take 10+ minutes, then
+                           send the full reply with --reply. The
+                           older --send-and-close and
+                           --send-batch-and-close paths stay available
+                           for backwards compatibility.
   --send-photo-and-close ID TOKEN CHAT_ID FILE_PATH
                            [REPLY_TO_MESSAGE_ID] [--keyboard]
                            [--cover UPDATE_ID ...]
@@ -238,9 +265,12 @@ Keeps the operational interface the wake hook drives:
   --list-allowlisted-groups
                            read-only: list the allowlisted group ids.
 
-Turn protocol per replied item: --send-and-close (fences, sends,
-records the reply and closes, in one process). The manual steps
---send-fenced, --replied and --done remain available for operator use.
+Turn protocol per replied item: --reply (the single send path: it
+derives the batch from the claim token, heartbeats, types, reacts,
+deletes any ack, sends once and closes every covered item, in one
+process). The manual steps --send-fenced, --replied and --done, and
+the older --send-and-close / --send-batch-and-close paths, remain
+available for operator use and backwards compatibility.
 Items closed without a reply only need --done.
 
 Throttling is a DELAY, never a drop. A group item from a non-owner
@@ -603,6 +633,63 @@ def _heartbeat_stale():
     return _env_seconds(
         HEARTBEAT_STALE_ENV, queue_core.HEARTBEAT_STALE_SECONDS
     )
+
+
+#: Environment variable tuning the ACTIVE heartbeat horizon for
+#: the two-phase rule (queue._recycle_stale): a claimed item whose
+#: turn started is recycled once its heartbeat is older than this,
+#: and a never-started claim once its claim is older than this.
+#: Default 180 s (Argon, corrected). When unset/negative the
+#: legacy 600 s rule applies (active_heartbeat_stale None).
+ACTIVE_HEARTBEAT_STALE_ENV = "TELEGRAM_BRIDGE_ACTIVE_HEARTBEAT_STALE_SECONDS"
+
+
+def _active_heartbeat_stale():
+    """The active (two-phase) heartbeat horizon, or None."""
+    return _env_seconds(
+        ACTIVE_HEARTBEAT_STALE_ENV,
+        queue_core.NEVER_STARTED_RECYCLE_SECONDS,
+    )
+
+
+#: Environment variable tuning the warm-baton timeout (seconds).
+WARM_BATON_TIMEOUT_ENV = "TELEGRAM_BRIDGE_WARM_BATON_TIMEOUT_SECONDS"
+
+
+def _warm_baton_timeout():
+    """Warm-baton timeout from the environment (default 30 s)."""
+    return _env_seconds(
+        WARM_BATON_TIMEOUT_ENV, queue_core.WARM_BATON_TIMEOUT_SECONDS
+    )
+
+
+#: Settle / batching constants (OpenClaw bot-handlers + Hermes
+#: adapter, retuned for the hook intake): default settle 300 ms,
+#: max settle 7.5 s, batch cap 12 messages / 50,000 chars, album
+#: (media-group) settle 1.5 s. The settle window is bypassed ONLY
+#: when every item in the current batch is a /command.
+SETTLE_DEFAULT_SECONDS = 0.3
+SETTLE_MAX_SECONDS = 7.5
+BATCH_MAX_MESSAGES = 12
+BATCH_MAX_CHARS = 50000
+ALBUM_SETTLE_SECONDS = 1.5
+
+#: Warm-hold defaults (lane-scoped warm lease, v2 emulation of the
+#: Hermes/OpenClaw warm pattern — our own design, not found in
+#: either repo; see inventory §2). Default hold 25 s; the warm
+#: agent polls for a follow-up in its own lane every 0.25 s and
+#: re-fetches (short poll) at most every 1.5 s while holding.
+WARM_HOLD_DEFAULT_SECONDS = 25.0
+WARM_HOLD_SECONDS_ENV = "TELEGRAM_BRIDGE_WARM_HOLD_SECONDS"
+WARM_HOLD_POLL_INTERVAL_SECONDS = 0.25
+WARM_HOLD_REFETCH_MIN_SECONDS = 1.5
+WARM_HOLD_FETCH_TIMEOUT_SECONDS = 2
+
+
+def _warm_hold_seconds():
+    """Warm-hold length from the environment (default 25 s)."""
+    value = _env_seconds(WARM_HOLD_SECONDS_ENV, WARM_HOLD_DEFAULT_SECONDS)
+    return WARM_HOLD_DEFAULT_SECONDS if value is None else value
 
 
 def _reply_age_limit(item: dict, max_reply_age) -> float | None:
@@ -1403,8 +1490,11 @@ def voice_dir() -> Path | None:
     Returns None when the directory cannot be created (disk full,
     permissions): the caller treats that as a failed download and
     queues the marker instead of aborting the whole ingest.
-    The directory is mode 0700, and old voice files are pruned
-    (best effort) on the way through.
+    The directory is mode 0700. Old voice files are NO LONGER
+    pruned here: pruning walks the filesystem, and this function
+    runs inside ingest, inside the state transaction — a prune
+    walk must never hold the state lock (see _maybe_prune_files,
+    run once per 24 h after the transaction commits).
     """
     path = Path(
         os.environ.get(
@@ -1416,10 +1506,6 @@ def voice_dir() -> Path | None:
         os.chmod(path, 0o700)
     except OSError:
         return None
-    try:
-        prune_old_voice_files()
-    except Exception:
-        pass
     return path
 
 
@@ -1607,8 +1693,10 @@ def media_dir() -> Path | None:
 
     Returns None when the directory cannot be created: the caller
     treats that as a failed download and queues the marker instead
-    of aborting the whole ingest. The directory is mode 0700, and
-    old media files are pruned (best effort) on the way through.
+    of aborting the whole ingest. The directory is mode 0700. Old
+    media files are NO LONGER pruned here (see voice_dir): pruning
+    walks the filesystem and must never run inside the state
+    transaction — see _maybe_prune_files.
     """
     path = Path(
         os.environ.get(
@@ -1621,11 +1709,45 @@ def media_dir() -> Path | None:
         os.chmod(path, 0o700)
     except OSError:
         return None
-    try:
-        prune_old_media_files()
-    except Exception:
-        pass
     return path
+
+
+def _maybe_prune_files(store: JsonStateStore) -> int:
+    """Prune old voice/media files, throttled to once per 24 h.
+
+    Runs OUTSIDE any state transaction (run_once calls this after
+    the ingest transaction commits): pruning walks the filesystem
+    and must never hold the state lock. A marker file
+    ``.last_prune`` next to the state file records the last run;
+    a missing or unreadable marker means "prune now". Best
+    effort; never raises. Returns files removed (0 when throttled).
+
+    Remaining limitation (documented, not fixed here): voice/media
+    DOWNLOADS still happen inside ingest, inside the transaction
+    (``voice_marker`` / ``media_marker`` call the downloaders from
+    ``_ingest_update``). Moving them out needs a prefetch step in
+    run_once that downloads before opening the transaction and
+    hands the local paths to ingest — a bigger restructure than
+    this pass; the prune walks, which were the unbounded
+    filesystem work inside the lock, are out.
+    """
+    try:
+        marker = Path(store.path).parent / ".last_prune"
+        now = time.time()
+        try:
+            last = float(marker.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            last = 0.0
+        if now - last < 86400.0:
+            return 0
+        removed = prune_old_voice_files() + prune_old_media_files()
+        try:
+            marker.write_text(str(now), encoding="utf-8")
+        except OSError:
+            pass
+        return removed
+    except Exception:
+        return 0
 
 
 def download_media_file(file_id: str, update_id, filename_hint=None):
@@ -2097,6 +2219,8 @@ def _record_unanswered(state: dict, update_id, error, text, now: float) -> None:
         unanswered = state.setdefault("intake_unanswered", [])
         unanswered.append(entry)
         del unanswered[:-INTAKE_UNANSWERED_MAX]
+        # Watchdog v2 health counts intake errors from here.
+        state["intake_errors"] = int(state.get("intake_errors") or 0) + 1
     except Exception:
         pass
     try:
@@ -2182,12 +2306,22 @@ def _enqueue_minimal(state: dict, update: dict, now: float) -> bool:
         return False
 
 
-def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> None:
+def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> str:
     """Process one update (message, callback, edit, reaction, member).
 
     Raises on failure; the caller (ingest) holds the message in
     pending via a minimal enqueue instead of losing it. The update
     id is already validated by the caller.
+
+    Returns an outcome string: "enqueued" when a queue item was
+    created (or already existed), "duplicate" when the item was
+    already queued, "handled:<what>" when the update was applied
+    without a new item (e.g. an edit), or "closed:<reason>" when
+    the update was deliberately closed as not-for-me (a reaction,
+    a message in an unadopted group, a non-owner DM, ...). The
+    caller (ingest) advances the offset ONLY on a returned
+    outcome — never before the enqueue — so a failed update is
+    re-delivered instead of lost (OpenClaw offset-after-spool-ack).
     """
     member = update.get("my_chat_member")
     if member:
@@ -2195,22 +2329,22 @@ def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> None:
         if chat.get("type") in ("group", "supergroup"):
             if chat["id"] not in state["candidate_groups"]:
                 state["candidate_groups"].append(chat["id"])
-        return
+        return "closed:my-chat-member"
 
     callback = update.get("callback_query")
     if callback:
-        _handle_callback_query(state, update, callback, api_call=api_call)
-        return
+        queued = _handle_callback_query(state, update, callback, api_call=api_call)
+        return "enqueued" if queued else "closed:callback-not-queued"
 
     edited = update.get("edited_message")
     if edited:
-        _handle_edited_message(state, edited)
-        return
+        applied = _handle_edited_message(state, edited)
+        return "handled:edited" if applied else "closed:edit-no-pending-item"
 
     if update.get("message_reaction"):
         # A reaction is not work: it never wakes a turn and
         # never creates a queue item.
-        return
+        return "closed:reaction"
 
     message = update.get("message") or {}
     sender = message.get("from") or {}
@@ -2224,7 +2358,7 @@ def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> None:
     document = message.get("document")
     is_media = bool((photo or document) and not text)
     if sender_id is None or (not text and not voice and not is_media):
-        return
+        return "closed:missing-sender-or-content"
     if is_voice:
         # A voice message has no text; download it and queue a
         # marker the agent transcribes. Without this the message
@@ -2248,7 +2382,7 @@ def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> None:
     if state["owner_id"] is None:
         if sender_id not in state["candidates"]:
             state["candidates"].append(sender_id)
-        return
+        return "closed:owner-not-adopted"
 
     # A reply is a follow-up to earlier work: protected,
     # whoever sent it (see classify_message). It is also stored
@@ -2278,7 +2412,7 @@ def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> None:
 
     if chat_type == "private":
         if sender_id == state["owner_id"]:
-            queue_core.enqueue(
+            queued = queue_core.enqueue(
                 state,
                 platform=PLATFORM,
                 external_id=update["update_id"],
@@ -2293,7 +2427,8 @@ def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> None:
                 message_id=message.get("message_id"),
                 is_reply=is_reply,
             )
-        return
+            return "enqueued" if queued is not None else "duplicate"
+        return "closed:non-owner-dm"
 
     if chat_type in ("group", "supergroup"):
         # Adopt every group where the owner speaks, and fetch
@@ -2302,7 +2437,7 @@ def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> None:
         if sender_id == state["owner_id"]:
             _adopt_group(state, chat["id"], now=now, api_call=api_call)
         if _group_record(state, chat["id"]) is None:
-            return
+            return "closed:group-not-adopted"
         # Safety trip (trusted mode only, and never for an
         # allowlisted group): the group must still be the owner
         # + known Muse bots. A message from anyone else — a
@@ -2347,7 +2482,7 @@ def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> None:
             }
         )
         group["buffer"] = group["buffer"][-BUFFER_MAX:]
-        queue_core.enqueue(
+        queued = queue_core.enqueue(
             state,
             platform=PLATFORM,
             external_id=update["update_id"],
@@ -2362,6 +2497,10 @@ def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> None:
             message_id=message.get("message_id"),
             is_reply=is_reply,
         )
+        return "enqueued" if queued is not None else "duplicate"
+    # Any other chat type (e.g. channel_post, which arrives under
+    # "message" with an unknown type) is deliberately closed.
+    return "closed:unsupported-chat-type"
 
 
 def ingest(state: dict, result: dict, now: float | None = None, api_call=api) -> None:
@@ -2372,18 +2511,38 @@ def ingest(state: dict, result: dict, now: float | None = None, api_call=api) ->
     (ignored: a reaction never wakes a turn and never creates an
     item). api_call is the Bot API function (injectable for tests).
 
+    Offset advances ONLY after durable commit (OpenClaw
+    telegram-ingress-worker: offset is set only after the spool
+    ack; Hermes receipt file): the offset for an update is
+    advanced inside the same transaction as that update's enqueue
+    (or its deliberate close as not-for-me), never before
+    ``_ingest_update`` runs. If the enqueue fails, the offset
+    does not advance for that update, so Telegram re-delivers it
+    (at-least-once) instead of it being silently lost.
+
+    Receipt dedupe (Hermes update_admission.py, 24 h TTL): a
+    receipt ``"<bot>:<update_id>"`` is recorded for every update
+    whose offset advanced. A re-delivered update whose receipt
+    already exists is skipped without re-enqueueing, and its
+    offset may advance (it was already durably recorded). Receipts
+    older than 24 h are pruned at the start of each ingest.
+
     A single bad update never aborts the poll and never loses its
     message. Each update is processed in isolation: when full
     processing fails, the message is held in pending with a minimal
     enqueue so the next poll retries it. Only when even that is
     impossible (the update has no usable id, chat, or sender) is it
     recorded as unanswered, loudly, with its update id and text --
-    never silently dropped.
+    never silently dropped. In that last case the offset does NOT
+    advance, so the update is re-delivered and retried.
     """
     if not result.get("ok"):
         raise RuntimeError(f"getUpdates failed: {result.get('description')}")
     _ensure_adapter_state(state)
     now = time.time() if now is None else now
+    bot_id = state.get("bot_id") or _bot_username()
+    queue_core.prune_receipts(state, now)
+    receipts = state.setdefault("receipts", {})
     for update in result.get("result", []):
         update_id = update.get("update_id") if isinstance(update, dict) else None
         if not isinstance(update_id, int):
@@ -2394,14 +2553,24 @@ def ingest(state: dict, result: dict, now: float | None = None, api_call=api) ->
                 _update_text(update), now,
             )
             continue
-        state["offset"] = max(state["offset"], update_id + 1)
+        key = queue_core.receipt_key(bot_id, update_id)
+        if key in receipts:
+            # Duplicate delivery of an update already durably
+            # recorded: skip it, but the offset may advance — the
+            # work was committed when the receipt was written.
+            state["offset"] = max(state["offset"], update_id + 1)
+            continue
         try:
             _ingest_update(state, update, now=now, api_call=api_call)
         except Exception as exc:
             # Full processing failed. Do not lose the message: hold
             # it in pending so the next poll retries it. Only when
-            # even a minimal hold is impossible is it unanswered.
+            # even a minimal hold is impossible is it unanswered —
+            # and then the offset does NOT advance, so Telegram
+            # re-delivers the update instead of losing it.
             if _enqueue_minimal(state, update, now):
+                receipts[key] = {"received_at": now}
+                state["offset"] = max(state["offset"], update_id + 1)
                 try:
                     print(
                         f"telegram intake: held update {update_id} in "
@@ -2415,6 +2584,12 @@ def ingest(state: dict, result: dict, now: float | None = None, api_call=api) ->
                     state, update_id, exc, _update_text(update), now
                 )
             continue
+        # Success: enqueued, or deliberately closed as not-for-me
+        # (see _ingest_update's "closed:<reason>" outcomes). Only
+        # now — in the same transaction as the enqueue/close —
+        # does the offset advance, with the receipt recorded.
+        receipts[key] = {"received_at": now}
+        state["offset"] = max(state["offset"], update_id + 1)
 
 
 def _expired_external_ids(state: dict) -> set:
@@ -2628,25 +2803,32 @@ def build_payload(state: dict, batch: dict) -> dict | None:
 #: claimed: when a message lands, the intake waits this long and
 #: re-fetches once (non-blocking) so a rapid follow-up typed a
 #: second later joins the same batch instead of becoming a second
-#: turn. Default 0 (off): the deployment enables it with
-#: TELEGRAM_BRIDGE_SETTLE_SECONDS (the hook sets 2). The wait is
-#: at most the window, and only when a pending item arrived inside
-#: it; a quiet poll claims nothing and waits for nothing.
+#: turn. Default SETTLE_DEFAULT_SECONDS (0.3 s, OpenClaw debounce
+#: retune — the old 2.0 s default over-waited); set
+#: TELEGRAM_BRIDGE_SETTLE_SECONDS to 0 to disable, or up to
+#: SETTLE_MAX_SECONDS (7.5 s, the OpenClaw long-paste max wait).
+#: The wait is at most the window, and only when a pending item
+#: arrived inside it; a quiet poll claims nothing and waits for
+#: nothing. The settle is bypassed entirely when every item in
+#: the current batch is a /command (see _has_immediately_claimable_work
+#: / run_once): commands never wait for a follow-up.
 SETTLE_SECONDS_ENV = "TELEGRAM_BRIDGE_SETTLE_SECONDS"
 
 
 def _settle_seconds() -> float:
-    """Settle window from the environment; 0 when unset or invalid."""
+    """Settle window from the environment; SETTLE_DEFAULT_SECONDS
+    when unset or invalid, 0 when explicitly disabled, clamped to
+    SETTLE_MAX_SECONDS."""
     raw = os.environ.get(SETTLE_SECONDS_ENV, "")
     if not raw:
-        return 0.0
+        return SETTLE_DEFAULT_SECONDS
     try:
         value = float(raw)
     except ValueError:
-        return 0.0
+        return SETTLE_DEFAULT_SECONDS
     if not math.isfinite(value) or value <= 0:
         return 0.0
-    return value
+    return min(value, SETTLE_MAX_SECONDS)
 
 
 def _newest_pending_received_at(state: dict):
@@ -2666,6 +2848,130 @@ def _newest_pending_received_at(state: dict):
         if newest is None or received_at > newest:
             newest = received_at
     return newest
+
+
+def _is_command(text) -> bool:
+    """True when the text is a /command.
+
+    A small local mirror of decide.py's ``is_command`` logic
+    (do NOT import decide here — the adapter stays dependency-
+    free); the settle bypass and the tier hint use this, not the
+    decider. Identical to ``_is_command_text``.
+    """
+    return _is_command_text(text)
+
+
+def preclaim_filter(state: dict, now: float | None = None) -> list:
+    """Close PENDING group noise before any claim wakes a turn.
+
+    Group items only, closed as DONE with done_reason /
+    close_reason "not-for-me" (replied_at stays None — nothing
+    was ever answered). An item is noise when:
+
+    - it is from another bot and does not @mention this bot, or
+    - it @mentions a different bot (and not this bot), or
+    - it is a command from someone not allowed to run commands
+      (see ``_is_command_allowed``: owner, or a group admin).
+
+    DMs are never closed here, owner commands are never closed,
+    and a message with no @mention in a free-for-all group is
+    never closed — only addressed-to-someone-else and
+    unauthorized-command noise is. Group buffer context was
+    appended before enqueue, so closing the item loses no
+    context for later wakes. Returns the closed update ids
+    (external_ids), in queue order.
+    """
+    now = time.time() if now is None else now
+    bot = _bot_username()
+    closed = []
+    for item in state.get("queue", []):
+        if item.get("status") != queue_core.PENDING:
+            continue
+        if item.get("chat_type") not in ("group", "supergroup"):
+            continue
+        if item.get("replied_at") is not None:
+            continue
+        text = item.get("text") or ""
+        mentions = {
+            m.group(0)[1:].lower() for m in MENTION_RE.finditer(text)
+        }
+        mentions_this_bot = bot in mentions
+        sender_name = (item.get("sender_name") or "").strip().lstrip("@").lower()
+        is_this_bot = bool(sender_name) and sender_name == bot
+        noise = False
+        if item.get("is_bot") and not is_this_bot and not mentions_this_bot:
+            # Another bot talking, not to us.
+            noise = True
+        elif mentions and not mentions_this_bot:
+            # Addresses a different bot, never us.
+            noise = True
+        elif _is_command_text(text) and not _is_command_allowed(
+            state,
+            item.get("sender_id"),
+            item.get("chat_type"),
+            item.get("chat_id"),
+        ):
+            # A command from someone who may not run commands.
+            noise = True
+        if not noise:
+            continue
+        item["status"] = queue_core.DONE
+        item["done_at"] = now
+        item["claim_token"] = None
+        item["done_reason"] = "not-for-me"
+        item["close_reason"] = "not-for-me"
+        closed.append(item.get("external_id"))
+    return closed
+
+
+def _has_immediately_claimable_work(
+    state: dict,
+    *,
+    now: float | None = None,
+    active_heartbeat_stale: float | None = None,
+    warm_baton_timeout: float | None = None,
+) -> bool:
+    """True when a poll can skip the long wait: some PENDING item
+    is claimable right now (its lane is free, it is not throttled,
+    and no warm lease holds its lane), or some CLAIMED item is
+    recyclable as stale under the two-phase rules (a dead claim
+    the next claim would free). run_once uses this to fetch with
+    a zero long-poll instead of waiting up to 30 s for work that
+    is already here."""
+    now = time.time() if now is None else now
+    if active_heartbeat_stale is None:
+        active_heartbeat_stale = _active_heartbeat_stale()
+    if warm_baton_timeout is None:
+        warm_baton_timeout = _warm_baton_timeout()
+    if queue_core.stale_claims(
+        state,
+        now=now,
+        heartbeat_stale=_heartbeat_stale(),
+        active_heartbeat_stale=active_heartbeat_stale,
+        warm_baton_timeout=warm_baton_timeout,
+    ):
+        return True
+    busy_lanes = {
+        (item["platform"], item["chat_id"])
+        for item in state.get("queue", [])
+        if item["status"] in queue_core.IN_FLIGHT
+    }
+    for item in state.get("queue", []):
+        if item.get("platform") != PLATFORM:
+            continue
+        if item.get("status") != queue_core.PENDING:
+            continue
+        if item.get("replied_at") is not None:
+            continue
+        wake_after = item.get("wake_after")
+        if wake_after is not None and wake_after > now:
+            continue
+        if (item["platform"], item["chat_id"]) in busy_lanes:
+            continue
+        if queue_core.warm_lease_active(state, item.get("chat_id"), now):
+            continue
+        return True
+    return False
 
 
 def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict | None:
@@ -2699,7 +3005,22 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
         except OSError:
             return None
         snapshot = _ensure_adapter_state(store.load())
-        result = fetch(snapshot["offset"])
+        # Fast-claim: work is already claimable (or a dead claim is
+        # recyclable), so there is nothing to wait for — fetch with
+        # a zero long-poll instead of holding the request up to
+        # 30 s. Otherwise the long poll waits for new arrivals.
+        fast_claim = _has_immediately_claimable_work(snapshot)
+        previous_poll = os.environ.get(LONG_POLL_SECONDS_ENV)
+        if fast_claim:
+            os.environ[LONG_POLL_SECONDS_ENV] = "0"
+        try:
+            result = fetch(snapshot["offset"])
+        finally:
+            if fast_claim:
+                if previous_poll is None:
+                    os.environ.pop(LONG_POLL_SECONDS_ENV, None)
+                else:
+                    os.environ[LONG_POLL_SECONDS_ENV] = previous_poll
         if not result.get("ok"):
             raise RuntimeError(f"getUpdates failed: {result.get('description')}")
         # "Now" is measured AFTER the fetch returns: a long poll can
@@ -2707,27 +3028,48 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
         # wake_after delays) must use the time the updates actually
         # arrived, not the time the poll started.
         now = time.time()
-        batch_size = _env_int("TELEGRAM_BRIDGE_BATCH_SIZE", queue_core.DEFAULT_BATCH_SIZE)
+        batch_size = min(
+            _env_int("TELEGRAM_BRIDGE_BATCH_SIZE", queue_core.DEFAULT_BATCH_SIZE),
+            BATCH_MAX_MESSAGES,
+        )
         stale_ttl = float(_env_int("TELEGRAM_BRIDGE_STALE_TTL", int(queue_core.DEFAULT_STALE_TTL)))
         heartbeat_stale = _heartbeat_stale()
+        active_heartbeat_stale = _active_heartbeat_stale()
+        warm_baton_timeout = _warm_baton_timeout()
         group_ttl, private_ttl = _expiry_ttls()
         rate_state = _load_rate_state()
         with store.transaction() as state:
             _ensure_adapter_state(state)
             ingest(state, result, now=now, api_call=api_call)
             apply_throttle(state, rate_state, now)
+            state["last_successful_poll"] = now
+        # Prune old voice/media files OUTSIDE the transaction (see
+        # _maybe_prune_files): walking the filesystem must never
+        # hold the state lock. Throttled to once per 24 h.
+        _maybe_prune_files(store)
         # Settle: when a message arrived inside the window, wait out
         # the rest of it and re-fetch once (non-blocking) so a rapid
         # follow-up joins this batch instead of a second turn. The
         # re-fetch is deduped by ingest, so a repeated delivery
         # cannot double-queue. No pending item, or no window
-        # configured, means no wait at all.
+        # configured, means no wait at all. Settle is bypassed
+        # when every pending item is a /command (OpenClaw: no
+        # debounce for bot commands) — commands never wait for a
+        # follow-up.
         settle = _settle_seconds()
         if settle > 0:
-            newest = _newest_pending_received_at(
-                _ensure_adapter_state(store.load())
+            loaded = _ensure_adapter_state(store.load())
+            pending_now = [
+                item for item in loaded.get("queue", [])
+                if item.get("platform") == PLATFORM
+                and item.get("status") == queue_core.PENDING
+                and item.get("replied_at") is None
+            ]
+            all_commands = bool(pending_now) and all(
+                _is_command(item.get("text")) for item in pending_now
             )
-            if newest is not None and now - newest < settle:
+            newest = _newest_pending_received_at(loaded)
+            if newest is not None and now - newest < settle and not all_commands:
                 time.sleep(settle - (now - newest))
                 previous_poll = os.environ.get(LONG_POLL_SECONDS_ENV)
                 os.environ[LONG_POLL_SECONDS_ENV] = "0"
@@ -2747,15 +3089,21 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
                     _ensure_adapter_state(state)
                     ingest(state, again, now=now, api_call=api_call)
                     apply_throttle(state, rate_state, now)
+                    state["last_successful_poll"] = now
         payload = None
         with store.transaction() as state:
             _ensure_adapter_state(state)
+            # Pre-claim noise filter: close other-bot chatter and
+            # unauthorized commands before any claim wakes a turn.
+            preclaim_filter(state, now=now)
             batch = queue_core.claim_batch(
                 state,
                 platform=PLATFORM,
                 batch_size=batch_size,
                 stale_ttl=stale_ttl,
                 heartbeat_stale=heartbeat_stale,
+                active_heartbeat_stale=active_heartbeat_stale,
+                warm_baton_timeout=warm_baton_timeout,
                 group_pending_ttl=group_ttl,
                 private_pending_ttl=private_ttl,
                 now=now,
@@ -3460,6 +3808,478 @@ def send_batch_and_close(
     return {"ok": False, "stage": "record"}
 
 
+#: Timeout (seconds) for a best-effort sender subcommand (typing,
+#: reaction, delete): a slow one must never stall the reply it
+#: precedes. Typing itself expires after 5 s, so 10 s is ample.
+BEST_EFFORT_TIMEOUT_SECONDS = 10.0
+
+
+def _run_sender_action(send_cmd, argv_parts) -> bool:
+    """Run one best-effort sender subcommand ([send_cmd, *argv_parts]).
+
+    Returns True only when the sender exits 0. Any failure — the
+    command is unconfigured, cannot start, times out, or exits
+    nonzero — returns False and is logged to stderr; the caller
+    proceeds anyway. Never reads stdin and never returns a message
+    id: typing, reactions and deletes have no reply to record.
+    """
+    if not send_cmd:
+        return False
+    try:
+        proc = subprocess.run(
+            [send_cmd, *[str(part) for part in argv_parts]],
+            input=None,
+            capture_output=True,
+            text=True,
+            timeout=BEST_EFFORT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        print(f"sender-action failed: {exc}", file=sys.stderr)
+        return False
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        print(
+            f"sender-action exit {proc.returncode}: {err[:200]}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def delete_message(send_cmd, chat_id, message_id) -> bool:
+    """Delete one Telegram message via the sender's --delete
+    subcommand ([send_cmd, --delete, CHAT_ID, MESSAGE_ID]).
+
+    Best-effort: returns True only when the sender exits 0
+    (Telegram accepted the deleteMessage). Any failure returns
+    False; the caller sends its reply anyway and reports
+    "ack_deleted": false. ``send_cmd`` is the deployment's send
+    executable, or None when unconfigured (a plain failure, never
+    a crash). Non-integer ids are refused without calling the
+    sender.
+    """
+    try:
+        chat_id = int(chat_id)
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        return False
+    return _run_sender_action(send_cmd, ["--delete", chat_id, message_id])
+
+
+def _warm_hold(
+    store: JsonStateStore,
+    chat_id,
+    token,
+    *,
+    seconds: float,
+    fetch=None,
+    api_call=None,
+    sleep=None,
+) -> dict | None:
+    """Lane-scoped warm hold after a --reply send (v2).
+
+    Blocks up to ``seconds`` waiting for a follow-up in the SAME
+    chat_id lane, WITHOUT holding poll.lock. The lane is marked
+    busy by a warm lease in state.json (see
+    queue_core.set_warm_lease), so intake's claim_batch leaves a
+    follow-up pending for us instead of waking a cold turn; other
+    lanes are never touched and stay claimable.
+
+    When a follow-up arrives in this lane, it is claimed with
+    claim_lane_batch (this lane only), marked warm_claimed, and
+    its wake payload (build_payload, the same shape run_once
+    returns) is returned as the caller's ``next_batch`` — the
+    already-warm agent answers it with --reply again, zero cold
+    start. Typing is fired on the claim so the user sees activity
+    immediately.
+
+    When nothing arrives, the lease expires (or is cleared here)
+    and intake resumes normally; pending items in other lanes are
+    left exactly as they were. If this process is killed -9 mid
+    hold, the lease simply expires at its expires_at and the lane
+    re-opens on its own, with any pending items still PENDING —
+    nothing is lost and nothing is double-claimed.
+
+    The baton guard lives in queue_core: a warm claim whose turn
+    never started (turn_started_at None) is recycled only once
+    its heartbeat is older than the 30 s warm-baton timeout, so a
+    warm agent reading MEMORY before its first heartbeat is never
+    recycled while thinking.
+
+    Polling: the state file is re-read every 0.25 s; a
+    non-blocking getUpdates fetch (long-poll 0) runs at most
+    every 1.5 s, and only when poll.lock is free — if intake
+    owns the lock the fetch is skipped and intake ingests the
+    message instead. ``fetch``/``api_call``/``sleep`` are
+    injectable for tests; defaults are the live fetch_updates /
+    api / time.sleep.
+
+    NOTE (unverified live): a 25 s blocking --reply has not been
+    proven against a real Muse tool-call timeout. The hold length
+    is env-tunable (TELEGRAM_BRIDGE_WARM_HOLD_SECONDS, default
+    25) and 0 disables the hold entirely.
+    """
+    if seconds is None or seconds <= 0:
+        return None
+    fetch = fetch_updates if fetch is None else fetch
+    api_call = api if api_call is None else api_call
+    sleep = time.sleep if sleep is None else sleep
+    start = time.time()
+    deadline = start + float(seconds)
+    # Register the lease: intake treats this lane as busy until
+    # the lease expires, so a follow-up stays pending for us.
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        queue_core.set_warm_lease(
+            state, chat_id, token, "unified", float(seconds), now=start
+        )
+    last_fetch = start - WARM_HOLD_REFETCH_MIN_SECONDS - 1.0
+    send_cmd = os.environ.get(SEND_CMD_ENV)
+    try:
+        while True:
+            now_t = time.time()
+            if now_t >= deadline:
+                return None
+            loaded = _ensure_adapter_state(store.load())
+            pending = [
+                item
+                for item in loaded.get("queue", [])
+                if item.get("platform") == PLATFORM
+                and item.get("status") == queue_core.PENDING
+                and item.get("replied_at") is None
+                and item.get("chat_id") == chat_id
+                and (
+                    item.get("wake_after") is None
+                    or item.get("wake_after") <= now_t
+                )
+            ]
+            if pending:
+                with store.transaction() as state:
+                    _ensure_adapter_state(state)
+                    lease = (state.get("warm_leases") or {}).get(str(chat_id))
+                    if isinstance(lease, dict) and lease.get("token") == token:
+                        queue_core.clear_warm_lease(state, chat_id)
+                    preclaim_filter(state, now=now_t)
+                    batch = queue_core.claim_lane_batch(
+                        state,
+                        chat_id=chat_id,
+                        platform=PLATFORM,
+                        batch_size=BATCH_MAX_MESSAGES,
+                        stale_ttl=float(
+                            _env_int(
+                                "TELEGRAM_BRIDGE_STALE_TTL",
+                                int(queue_core.DEFAULT_STALE_TTL),
+                            )
+                        ),
+                        heartbeat_stale=_heartbeat_stale(),
+                        active_heartbeat_stale=_active_heartbeat_stale(),
+                        warm_baton_timeout=_warm_baton_timeout(),
+                        now=now_t,
+                    )
+                    if not batch:
+                        # The pending items were noise closed by the
+                        # pre-claim filter (or another claimer took
+                        # them): re-check the lane, do not end the
+                        # hold early.
+                        continue
+                    for item in batch["items"]:
+                        item["warm_claimed"] = True
+                    payload = build_payload(state, batch)
+                if payload is None:
+                    # Nothing viewable: the items stay claimed and
+                    # recycle as stale for a later retry.
+                    return None
+                if send_cmd:
+                    _run_sender_action(send_cmd, ["--typing", chat_id])
+                return payload
+            # No follow-up yet: re-fetch (non-blocking, poll lock
+            # permitting) so a message that arrived after intake's
+            # last poll is ingested without waiting for the next
+            # hook tick. The lock is never held: if intake owns
+            # it, the fetch is skipped.
+            if now_t - last_fetch >= WARM_HOLD_REFETCH_MIN_SECONDS:
+                last_fetch = now_t
+                try:
+                    lock_handle = open(poll_lock_path(), "a+")
+                except OSError:
+                    lock_handle = None
+                if lock_handle is not None:
+                    try:
+                        try:
+                            fcntl.flock(
+                                lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB
+                            )
+                        except OSError:
+                            pass
+                        else:
+                            previous_poll = os.environ.get(
+                                LONG_POLL_SECONDS_ENV
+                            )
+                            os.environ[LONG_POLL_SECONDS_ENV] = "0"
+                            try:
+                                offset = _ensure_adapter_state(
+                                    store.load()
+                                )["offset"]
+                                result = fetch(offset)
+                            finally:
+                                if previous_poll is None:
+                                    os.environ.pop(
+                                        LONG_POLL_SECONDS_ENV, None
+                                    )
+                                else:
+                                    os.environ[LONG_POLL_SECONDS_ENV] = (
+                                        previous_poll
+                                    )
+                            if isinstance(result, dict) and result.get("ok"):
+                                fetched_at = time.time()
+                                with store.transaction() as state:
+                                    _ensure_adapter_state(state)
+                                    ingest(
+                                        state,
+                                        result,
+                                        now=fetched_at,
+                                        api_call=api_call,
+                                    )
+                                    state["last_successful_poll"] = fetched_at
+                    finally:
+                        lock_handle.close()
+            sleep(
+                min(
+                    WARM_HOLD_POLL_INTERVAL_SECONDS,
+                    max(0.0, deadline - time.time()),
+                )
+            )
+    finally:
+        # Clear our lease if it is still there (timeout path). If
+        # we claimed a follow-up it is already gone; if this
+        # process is killed -9 the lease simply expires at its
+        # expires_at and the lane re-opens on its own.
+        try:
+            with store.transaction() as state:
+                _ensure_adapter_state(state)
+                lease = (state.get("warm_leases") or {}).get(str(chat_id))
+                if isinstance(lease, dict) and lease.get("token") == token:
+                    queue_core.clear_warm_lease(state, chat_id)
+        except Exception:
+            pass
+
+
+def send_reply(
+    store: JsonStateStore,
+    token,
+    text: str,
+    *,
+    react=None,
+    keyboard: bool = False,
+    max_reply_age: float | None = DEFAULT_MAX_REPLY_AGE,
+    now: float | None = None,
+    warm_hold_seconds: float | None = None,
+    fetch=None,
+    api_call=None,
+    sleep=None,
+) -> dict:
+    """The single send path for a turn (v2 --reply).
+
+    The caller passes only the claim token (plus the reply text);
+    everything else is derived from the claimed batch, in order:
+
+    (a) Look up ALL claimed, unreplied items under the token. No
+        items, or items spanning more than one chat_id, fails
+        closed (stage "fence") with nothing sent: one batch is one
+        lane, so a split batch is corrupt state, never a reply to
+        half of it.
+    (b) Heartbeat the whole batch first (proof the turn is alive).
+    (c) Fire typing in the chat (best-effort, never blocks the
+        send).
+    (d) When --react is given, react on the latest user message in
+        the batch — the most recent claimed item with a real
+        message_id (best-effort, never blocks the send). A batch
+        with no user message (e.g. button taps only) is never
+        reacted to: there is no user message to react to.
+    (e) Delete any temporary ack_message_id recorded on the
+        claimed items (see queue_core.mark_ack / send_ack),
+        best-effort only: a failed delete still sends, and the
+        result reports "ack_deleted": false.
+    (f) Send the reply once, threaded under the latest user
+        message_id (standalone when no item has one), through
+        send_batch_and_close — so the fence, the max-reply-age
+        guard, the keyboard rule and the unknown-send handling are
+        exactly the batch send's. On stage "unknown" nothing is
+        resent and nothing is closed as replied: the primary item
+        stays in "sending" for reconciliation, exactly as the
+        batch send leaves it, so the caller can check delivery
+        first.
+    (g) On success, record the reply against and close ALL items
+        in the batch as DONE (no orphaned siblings), with the same
+        close semantics as send_batch_and_close: the primary item
+        closes plainly, the rest with done_reason
+        "covered-by-batch-reply", and replied_at is recorded on
+        every covered item, as the batch send does today.
+
+    Returns one dict with at least {"ok", "stage", "message_id",
+    "chat_id", "replied_update_ids", "closed_update_ids",
+    "ack_deleted", "next_batch"}: "message_id" is the Telegram
+    message id as an int on success, else None; "chat_id" is the
+    batch's chat, or None when no batch could be derived;
+    "replied_update_ids" / "closed_update_ids" list the covered
+    update ids on success and are empty on failure; "ack_deleted"
+    is True only when at least one ack message existed and every
+    delete succeeded; "next_batch" is the wake payload of a
+    follow-up that arrived in the same lane during the warm hold
+    (see _warm_hold), or None when nothing arrived before the
+    hold expired. When "next_batch" is present, the caller answers
+    it the same way — --reply again with next_batch's
+    claim_token — with zero cold start.
+
+    The warm hold runs after a successful send only, for
+    ``warm_hold_seconds`` seconds (None = the
+    TELEGRAM_BRIDGE_WARM_HOLD_SECONDS env, default 25; 0 =
+    disabled; --no-warm-hold on the CLI). ``fetch`` /
+    ``api_call`` / ``sleep`` are injectable for tests. A 25 s
+    blocking --reply has NOT been proven against a real Muse
+    tool-call timeout — see _warm_hold.
+
+    --reply is NOT a substitute for --send-ack: ack first for work
+    that will take 10+ minutes (send_ack sends the fixed ack and
+    leaves the item claimed), then send the full reply with
+    --reply. --reply itself never acks.
+    """
+    def _result(ok, stage, message_id=None, chat_id=None,
+                replied=(), closed=(), ack_deleted=False,
+                next_batch=None):
+        return {
+            "ok": ok,
+            "stage": stage,
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "replied_update_ids": list(replied),
+            "closed_update_ids": list(closed),
+            "ack_deleted": ack_deleted,
+            "next_batch": next_batch,
+        }
+
+    if not isinstance(text, str) or not text.strip() or len(text) > 4096:
+        return _result(False, "input")
+    # (a) The whole batch, derived from the token alone.
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        items = [
+            item
+            for item in state.get("queue", [])
+            if item.get("platform") == PLATFORM
+            and item.get("status") == queue_core.CLAIMED
+            and item.get("claim_token") == token
+            and item.get("replied_at") is None
+        ]
+    if not items:
+        return _result(False, "fence")
+    chat_ids = {item.get("chat_id") for item in items}
+    if len(chat_ids) != 1:
+        return _result(False, "fence")
+    chat_id = next(iter(chat_ids))
+    if type(chat_id) is not int:
+        return _result(False, "fence")
+    # (b) Heartbeat first: the turn is alive and working.
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        refreshed = queue_core.heartbeat_batch(state, token, now=now)
+    if refreshed == 0:
+        return _result(False, "fence", chat_id=chat_id)
+    ordered = sorted(items, key=lambda it: it.get("received_at") or 0)
+
+    def _message_id(item):
+        try:
+            return int(item.get("message_id"))
+        except (TypeError, ValueError):
+            return None
+
+    with_message = [
+        item for item in ordered if _message_id(item) is not None
+    ]
+    if with_message:
+        primary = with_message[-1]
+        reply_to = _message_id(primary)
+    else:
+        primary = ordered[0]
+        reply_to = None
+    primary_id = int(primary["external_id"])
+    extras = [
+        int(item["external_id"]) for item in ordered if item is not primary
+    ]
+    send_cmd = os.environ.get(SEND_CMD_ENV)
+    # (c) Typing, best-effort: refresh the indicator right before
+    # sending; a failed typing call never blocks the reply.
+    if send_cmd:
+        _run_sender_action(send_cmd, ["--typing", chat_id])
+        # (d) Reaction on the latest user message, best-effort and
+        # only when there is a user message to react to.
+        if react and reply_to is not None:
+            _run_sender_action(
+                send_cmd, ["--react", chat_id, reply_to, react]
+            )
+    # (e) Delete any recorded ack message(s), best-effort only: a
+    # failed delete still sends, and ack_deleted reports it.
+    ack_ids = []
+    for item in ordered:
+        ack_id = item.get("ack_message_id")
+        if ack_id is not None and ack_id not in ack_ids:
+            ack_ids.append(ack_id)
+    ack_deleted = bool(ack_ids) and all(
+        delete_message(send_cmd, chat_id, ack_id) for ack_id in ack_ids
+    )
+    # (f) One fenced batch send, threaded under the latest user
+    # message (or standalone). (g) is inside send_batch_and_close:
+    # it records the reply and closes every covered item.
+    result = send_batch_and_close(
+        store,
+        primary_id,
+        token,
+        chat_id,
+        text,
+        reply_to=reply_to,
+        keyboard=keyboard,
+        extra_targets=extras,
+        max_reply_age=max_reply_age,
+        now=now,
+    )
+    if not result.get("ok"):
+        return _result(
+            False, result.get("stage", "unknown"),
+            chat_id=chat_id, ack_deleted=ack_deleted,
+        )
+    message_id = result.get("message_id")
+    try:
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        message_id = None
+    covered_ids = [primary_id] + extras
+    # Warm hold: after a successful send only. The hold length
+    # comes from the caller, else the env (default 25 s); 0
+    # disables it. A follow-up in this lane comes back as
+    # next_batch for the already-warm agent.
+    hold_seconds = (
+        warm_hold_seconds
+        if warm_hold_seconds is not None
+        else _warm_hold_seconds()
+    )
+    next_batch = None
+    if hold_seconds and hold_seconds > 0:
+        next_batch = _warm_hold(
+            store,
+            chat_id,
+            token,
+            seconds=hold_seconds,
+            fetch=fetch,
+            api_call=api_call,
+            sleep=sleep,
+        )
+    return _result(
+        True, "sent", message_id=message_id, chat_id=chat_id,
+        replied=covered_ids, closed=covered_ids,
+        ack_deleted=ack_deleted, next_batch=next_batch,
+    )
+
+
 def _parse_send_args(extra: list) -> tuple:
     """Optional args after UPDATE_ID CLAIM_TOKEN CHAT_ID for the send
     commands: a bare integer is the REPLY_TO_MESSAGE_ID, and
@@ -3806,6 +4626,66 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
             print(json.dumps({"ok": True, "items": []}))
             return 0
         print(json.dumps({"ok": True, **claimed}))
+        return 0
+
+    if args[:1] == ["--reply"]:
+        # --reply CLAIM_TOKEN [--react EMOJI] [--keyboard]: the
+        # single send path for a turn (v2). The reply text is read
+        # from stdin (heredoc, never pasted into a shell command);
+        # the batch, chat, reply target and cover list are all
+        # derived from the claim token — the caller passes no
+        # update/chat/reply ids. Prints the send_reply result JSON.
+        # --reply sends the full reply and closes the batch; it is
+        # NOT a substitute for --send-ack (ack first for long work,
+        # then send the full reply with --reply).
+        _reply_usage = (
+            "usage: --reply CLAIM_TOKEN [--react EMOJI] [--keyboard] "
+            "[--no-warm-hold] — reply text on stdin; --reply sends the "
+            "full reply and closes the batch, it is NOT a substitute "
+            "for --send-ack (ack first for long work, then --reply)."
+        )
+        if len(args) < 2:
+            print(json.dumps({"ok": False, "error": _reply_usage}))
+            return 2
+        react = None
+        keyboard = False
+        no_warm_hold = False
+        valid = True
+        index = 2
+        while index < len(args):
+            arg = args[index]
+            if arg == "--keyboard":
+                keyboard = True
+                index += 1
+            elif arg == "--no-warm-hold":
+                no_warm_hold = True
+                index += 1
+            elif arg == "--react":
+                if (
+                    index + 1 >= len(args)
+                    or not args[index + 1].strip()
+                    or react is not None
+                ):
+                    valid = False
+                    break
+                react = args[index + 1]
+                index += 2
+            else:
+                valid = False
+                break
+        if not valid:
+            print(json.dumps({"ok": False, "error": _reply_usage}))
+            return 2
+        result = send_reply(
+            store,
+            args[1],
+            sys.stdin.read(),
+            react=react,
+            keyboard=keyboard,
+            max_reply_age=_max_reply_age(),
+            warm_hold_seconds=0.0 if no_warm_hold else None,
+        )
+        print(json.dumps(result))
         return 0
 
     if args[:1] == ["--send-batch-and-close"]:

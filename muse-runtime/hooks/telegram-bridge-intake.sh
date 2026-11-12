@@ -52,30 +52,47 @@ if [ -z "$payload" ]; then
 fi
 
 decision=$(printf '%s' "$payload" | python3 "$DECIDER")
-# The decider prints "wake <tier>" / "hold <tier>" / "done <ids>" /
-# "empty". The tier is rule-based (see telegram-bridge-decide.py)
-# and only changes how much context the woken agent loads.
+# The decider prints "wake" / "hold" / "done <ids>" / "empty" (v2:
+# no tier word — the woken agent always follows the single unified
+# prompt). The hook pre-loads the agent's context into the wake
+# payload instead of selecting a prompt file.
 action=${decision%% *}
-tier=${decision#* }
-if [ "$tier" = "$decision" ] || [ -z "$tier" ]; then tier="standard"; fi
-case "$tier" in quick|standard|deep) ;; *) tier="standard" ;; esac
-# Inject the tier into the payload JSON so the woken agent (via the
-# router prompt in the hook definition) knows which prompt file to
-# follow. Validates to compact JSON; the runtime compacts it again.
-inject_tier() {
-  python3 -c "import json,sys; p=json.load(sys.stdin); p['tier']=sys.argv[1]; print(json.dumps(p, separators=(',',':')))" "$1" <<<"$payload"
+# Hook-layer helpers from the decider module (hydrate_payload,
+# typing_chat_id), run without executing its main(). Reads the
+# payload on stdin; prints the hydrated payload JSON on line 1 and
+# the pre-wake typing chat id (or an empty line) on line 2.
+hydrate_and_typing() {
+  python3 -c 'import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("telegram_bridge_decide", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+payload = json.load(sys.stdin)
+print(json.dumps(mod.hydrate_payload(payload), separators=(",", ":")))
+typing = mod.typing_chat_id(payload)
+print("" if typing is None else typing)' "$DECIDER"
 }
 case "$action" in
   wake)
-    # The typing indicator is NOT fired here. Typing must mean "I am
-    # responding": the agent fires it only after it decides to reply
-    # (see the wake prompt). Firing it on wake would show typing even
-    # when the agent decides there is nothing to add.
-    payload=$(inject_tier "$tier")
+    # Pre-hydrate context_md into the payload (bounded to 6000
+    # chars, null when context.md is missing — never fails the
+    # wake). If hydration itself fails, wake with the original
+    # payload instead of going silent.
+    typing_chat=""
+    if hydrated=$(printf '%s' "$payload" | hydrate_and_typing 2>/dev/null); then
+      payload=$(printf '%s' "$hydrated" | sed -n '1p')
+      typing_chat=$(printf '%s' "$hydrated" | sed -n '2p')
+    fi
+    # Typing must mean "I am responding": fire it pre-wake ONLY for
+    # a DM, a command, or an @mention, where a reply is definite.
+    # Never for an open group message, where the agent may stay
+    # silent. Best-effort: a failed typing call never blocks the
+    # wake.
+    if [ -n "$typing_chat" ]; then
+      "$TELEGRAM_BRIDGE_SEND_CMD" --typing "$typing_chat" >/dev/null 2>&1 || true
+    fi
     wake "telegram-message" "$payload"
     ;;
   hold)
-    payload=$(inject_tier "$tier")
     printf '%s\n' "$payload" >> "$TELEGRAM_BRIDGE_HELD_PATH"
     silent "telegram-held-while-paused"
     ;;

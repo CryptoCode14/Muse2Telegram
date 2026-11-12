@@ -1,3 +1,4 @@
+SUPERSEDED by prompts/unified.md (v2); kept for history, do not install.
 TIER: deep — complex work. Read the standard prompt file first, then apply the additions below.
 
 Read ~/hooks/prompts/tier-standard.md and follow it exactly. Then, before replying, do the deep additions:

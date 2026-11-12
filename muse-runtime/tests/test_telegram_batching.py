@@ -577,11 +577,18 @@ class SettleWindowTests(unittest.TestCase):
         self.assertEqual(fetch.calls, 2)
 
     def test_no_settle_means_a_single_fetch(self):
+        # v2: the settle default is now 0.3 s (OpenClaw debounce
+        # retune), so "no settle" must be requested explicitly
+        # with TELEGRAM_BRIDGE_SETTLE_SECONDS=0; an unset env no
+        # longer means "off".
         fetch = SeqFetch([
             [msg_update(1, OWNER, "private", OWNER, "first")],
             [msg_update(2, OWNER, "private", OWNER, "second")],
         ])
-        payload = run_cli(self.path, [], fetch=fetch)
+        payload = run_cli(
+            self.path, [], fetch=fetch,
+            extra_env={telegram.SETTLE_SECONDS_ENV: "0"},
+        )
         self.assertIsNotNone(payload)
         self.assertEqual(
             [it["update_id"] for it in payload["items"]], [1]

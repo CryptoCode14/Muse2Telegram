@@ -110,6 +110,31 @@ DEFAULT_GROUP_PENDING_TTL = 600.0
 #: age limit (the claim-time sweep or the operator purge).
 EXPIRED_REASON = "expired"
 
+#: Receipt TTL (seconds) for the ingest dedupe file (see
+#: ``receipt_key`` / ``prune_receipts``): Hermes
+#: ``update_admission.py`` persists completed update ids per bot
+#: with a 24 h TTL, matching Telegram holding unconfirmed updates
+#: for at most 24 h. A receipt older than this is pruned on ingest.
+RECEIPT_TTL_SECONDS = 86400.0
+
+#: Warm-baton timeout (seconds): a CLAIMED item that was claimed
+#: under a warm hold (``warm_claimed``) but whose turn never sent
+#: its first heartbeat/ack/claim-more (``turn_started_at`` is None)
+#: is recycled once its heartbeat is older than this. The baton
+#: must not be held by a dead warm agent: 30 s is long enough for
+#: a live warm turn to heartbeat, short enough that a dead one
+#: frees the lane fast. See ``_recycle_stale``.
+WARM_BATON_TIMEOUT_SECONDS = 30.0
+
+#: Default never-heartbeated recycle age (seconds) under the
+#: two-phase heartbeat rule (see ``_recycle_stale``): a claimed
+#: item whose turn never started (``turn_started_at`` is None) is
+#: recycled once its claim is older than this, when the caller
+#: passes ``active_heartbeat_stale``. Argon (corrected): the
+#: original Argon figure was a 180 s re-wake for never-heartbeated
+#: claims; live heartbeating turns keep the 600 s horizon.
+NEVER_STARTED_RECYCLE_SECONDS = 180.0
+
 #: Intake classifications stored on the queue record as
 #: ``item_class``. Only CLASS_CONVERSATION ("ordinary conversation")
 #: is eligible for pending expiry; CLASS_REQUEST marks work that
@@ -143,7 +168,89 @@ IN_FLIGHT = (CLAIMED, SENDING)
 
 def ensure_state(state: dict) -> dict:
     state.setdefault("queue", [])
+    # Ingest receipts (Hermes update_admission.py: completed ids
+    # persisted per bot, 24 h TTL) and lane-scoped warm leases
+    # (v2 emulation of the Hermes/OpenClaw warm pattern, our own
+    # design — not found in either repo; see inventory §2).
+    state.setdefault("receipts", {})
+    state.setdefault("warm_leases", {})
     return state
+
+
+def receipt_key(bot_id, update_id) -> str:
+    """Dedupe key for one update: ``"<bot_id>:<update_id>"``.
+
+    Hermes ``update_admission.py`` keys its claims/receipts
+    ``{bot_id}:{update_id}``; the same key is used for the
+    ``state["receipts"]`` dict the Telegram adapter maintains.
+    """
+    return f"{bot_id}:{update_id}"
+
+
+def prune_receipts(state: dict, now: float | None = None) -> int:
+    """Drop receipt entries older than RECEIPT_TTL_SECONDS (24 h).
+
+    Returns how many were pruned. Entries without a parseable
+    ``received_at`` are kept: dropping a receipt whose age cannot
+    be established could re-admit an already-answered update.
+    """
+    ensure_state(state)
+    now = _now(now)
+    receipts = state.get("receipts") or {}
+    stale = [
+        key
+        for key, entry in receipts.items()
+        if isinstance(entry, dict)
+        and isinstance(entry.get("received_at"), (int, float))
+        and now - float(entry["received_at"]) > RECEIPT_TTL_SECONDS
+    ]
+    for key in stale:
+        receipts.pop(key, None)
+    return len(stale)
+
+
+def warm_lease_active(state: dict, chat_id, now: float | None = None) -> bool:
+    """True when the lane holds a live warm lease.
+
+    Expired leases are ignored and pruned on sight, so a dead
+    warm hold never blocks its lane past its expiry.
+    """
+    now = _now(now)
+    leases = state.get("warm_leases") or {}
+    lease = leases.get(str(chat_id))
+    if not isinstance(lease, dict):
+        return False
+    expires_at = lease.get("expires_at")
+    if not isinstance(expires_at, (int, float)):
+        return False
+    if now >= float(expires_at):
+        leases.pop(str(chat_id), None)
+        return False
+    return True
+
+
+def set_warm_lease(
+    state: dict, chat_id, token, tier, seconds, now: float | None = None
+) -> dict:
+    """Register a lane-scoped warm lease (see module docstring in
+    telegram.py ``_warm_hold``). ``seconds`` is the hold length;
+    ``tier`` records which tier the holding turn booted as."""
+    ensure_state(state)
+    now = _now(now)
+    lease = {
+        "expires_at": now + float(seconds),
+        "token": token,
+        "tier": tier,
+    }
+    state["warm_leases"][str(chat_id)] = lease
+    return lease
+
+
+def clear_warm_lease(state: dict, chat_id) -> bool:
+    """Drop the lane's warm lease, if any. Returns True when one
+    existed."""
+    leases = state.get("warm_leases") or {}
+    return leases.pop(str(chat_id), None) is not None
 
 
 def _now(now: float | None) -> float:
@@ -232,6 +339,19 @@ def enqueue(
         # recycled fast; an item that never recorded one falls back
         # to the claimed_at TTL. None until the first claim.
         "heartbeat_at": None,
+        # Two-phase heartbeat (Argon, corrected — see
+        # ``_recycle_stale``): None until the turn's first explicit
+        # heartbeat/ack/claim-more proves it actually started. A
+        # claim alone does not start the turn.
+        "turn_started_at": None,
+        # True while the item was claimed by a warm hold (see
+        # telegram._warm_hold): the baton guard recycles such a
+        # claim fast when its turn never starts.
+        "warm_claimed": False,
+        # Dispatch dedupe key (OpenClaw message-dispatch-dedupe):
+        # "<platform>:<chat_id>:<update_id>", stable across
+        # re-delivery of the same update.
+        "dispatch_key": f"{platform}:{chat_id}:{external_id}",
         "sending_at": None,
         "replied_at": None,
         "reply_message_id": None,
@@ -248,47 +368,129 @@ def enqueue(
     return item
 
 
+def _is_recyclable(
+    item: dict,
+    stale_ttl: float,
+    now: float,
+    heartbeat_stale: float = HEARTBEAT_STALE_SECONDS,
+    active_heartbeat_stale: float | None = None,
+    warm_baton_timeout: float = WARM_BATON_TIMEOUT_SECONDS,
+) -> bool:
+    """True when a CLAIMED, unreplied item's claim is dead.
+
+    Rules, in order (only CLAIMED, unreplied items with a
+    ``claimed_at`` are candidates at all; SENDING and replied
+    items are never recyclable):
+
+    1. Warm baton guard (v2): a claim held under a warm hold
+       (``warm_claimed``) whose turn never started
+       (``turn_started_at`` is None) is recycled once its
+       heartbeat is older than ``warm_baton_timeout`` (30 s).
+       ``claimed_at`` alone never triggers this — only the
+       heartbeat age, which is the baton proof of life.
+    2. Two-phase heartbeat (Argon, corrected) when
+       ``active_heartbeat_stale`` is passed (e.g. 180 s): a turn
+       that started (``turn_started_at`` set) is recycled once
+       its heartbeat is older than that horizon; a turn that
+       never started is recycled once its claim is older than
+       the same horizon. A live turn that keeps heartbeating is
+       never recycled, however long it runs.
+    3. Legacy rule when ``active_heartbeat_stale`` is None: a
+       recorded heartbeat decides alone (stale past
+       ``heartbeat_stale``, default 600 s); with no heartbeat
+       ever recorded, the ``claimed_at`` TTL is the backstop.
+    """
+    if (
+        item["status"] != CLAIMED
+        or item["replied_at"] is not None
+        or item["claimed_at"] is None
+    ):
+        return False
+    heartbeat_at = item.get("heartbeat_at")
+    if (
+        item.get("warm_claimed")
+        and item.get("turn_started_at") is None
+        and heartbeat_at is not None
+        and now - heartbeat_at > warm_baton_timeout
+    ):
+        return True
+    if active_heartbeat_stale is not None:
+        if item.get("turn_started_at") is not None:
+            if heartbeat_at is None:
+                return now - item["claimed_at"] > active_heartbeat_stale
+            return now - heartbeat_at > active_heartbeat_stale
+        return now - item["claimed_at"] > active_heartbeat_stale
+    if heartbeat_at is not None:
+        return now - heartbeat_at > heartbeat_stale
+    return now - item["claimed_at"] > stale_ttl
+
+
+def stale_claims(
+    state: dict,
+    stale_ttl: float = DEFAULT_STALE_TTL,
+    now: float | None = None,
+    heartbeat_stale: float = HEARTBEAT_STALE_SECONDS,
+    active_heartbeat_stale: float | None = None,
+    warm_baton_timeout: float = WARM_BATON_TIMEOUT_SECONDS,
+) -> list:
+    """Claimed items ``_recycle_stale`` would recycle right now,
+    without mutating anything. The fast-claim check uses this to
+    tell a recyclable dead claim from a live one."""
+    now = _now(now)
+    return [
+        item
+        for item in state.get("queue", [])
+        if _is_recyclable(
+            item,
+            stale_ttl,
+            now,
+            heartbeat_stale=heartbeat_stale,
+            active_heartbeat_stale=active_heartbeat_stale,
+            warm_baton_timeout=warm_baton_timeout,
+        )
+    ]
+
+
 def _recycle_stale(
     state: dict,
     stale_ttl: float,
     now: float,
     heartbeat_stale: float = HEARTBEAT_STALE_SECONDS,
+    active_heartbeat_stale: float | None = None,
+    warm_baton_timeout: float = WARM_BATON_TIMEOUT_SECONDS,
 ) -> list:
     # Only CLAIMED items are candidates. SENDING items are excluded by
     # construction: their send outcome is unknown, so they must never
     # be recycled into a possible duplicate send. Replied items are
     # excluded too — the reply already went out.
     #
-    # Two rules, in order. When a heartbeat was recorded, ONLY the
-    # heartbeat decides: a turn that stops refreshing it is dead,
-    # however recent its claim is — and a live long turn that keeps
-    # refreshing it is never recycled for its claimed_at age alone.
-    # When no heartbeat was ever recorded (an item claimed before
-    # heartbeats existed, or by a turn that never sent one), the
-    # claimed_at TTL is the backstop. Returns the recycled items.
+    # The staleness decision lives in _is_recyclable (baton guard,
+    # then the two-phase rule when active_heartbeat_stale is passed,
+    # else the legacy heartbeat/TTL rule). Returns the recycled items.
     recycled = []
     for item in state["queue"]:
-        if (
-            item["status"] == CLAIMED
-            and item["replied_at"] is None
-            and item["claimed_at"] is not None
+        if not _is_recyclable(
+            item,
+            stale_ttl,
+            now,
+            heartbeat_stale=heartbeat_stale,
+            active_heartbeat_stale=active_heartbeat_stale,
+            warm_baton_timeout=warm_baton_timeout,
         ):
-            heartbeat_at = item.get("heartbeat_at")
-            stale = False
-            if heartbeat_at is not None:
-                stale = now - heartbeat_at > heartbeat_stale
-            else:
-                stale = now - item["claimed_at"] > stale_ttl
-            if not stale:
-                continue
-            item["status"] = PENDING
-            item["claimed_at"] = None
-            item["claim_token"] = None
-            item["heartbeat_at"] = None
-            # ever_claimed deliberately survives the recycle: the
-            # claim history is what keeps a recycled item out of the
-            # first-pending expiry sweep on every later poll.
-            recycled.append(item)
+            continue
+        item["status"] = PENDING
+        item["claimed_at"] = None
+        item["claim_token"] = None
+        item["heartbeat_at"] = None
+        # A recycled claim is a fresh start when re-claimed: the
+        # next turn must prove it started again, and the warm
+        # baton flag belongs to the dead claim, not the next one.
+        item["turn_started_at"] = None
+        item["warm_claimed"] = False
+        # ever_claimed deliberately survives the recycle: the
+        # claim history is what keeps a recycled item out of the
+        # first-pending expiry sweep on every later poll.
+        recycled.append(item)
     return recycled
 
 
@@ -413,6 +615,8 @@ def claim_batch(
     batch_size: int = DEFAULT_BATCH_SIZE,
     stale_ttl: float = DEFAULT_STALE_TTL,
     heartbeat_stale: float = HEARTBEAT_STALE_SECONDS,
+    active_heartbeat_stale: float | None = None,
+    warm_baton_timeout: float = WARM_BATON_TIMEOUT_SECONDS,
     group_pending_ttl: float | None = DEFAULT_GROUP_PENDING_TTL,
     private_pending_ttl: float | None = None,
     now: float | None = None,
@@ -461,7 +665,14 @@ def claim_batch(
         private_ttl=private_pending_ttl,
         now=now,
     )
-    _recycle_stale(state, stale_ttl, now, heartbeat_stale=heartbeat_stale)
+    _recycle_stale(
+        state,
+        stale_ttl,
+        now,
+        heartbeat_stale=heartbeat_stale,
+        active_heartbeat_stale=active_heartbeat_stale,
+        warm_baton_timeout=warm_baton_timeout,
+    )
     pending = [
         item
         for item in state["queue"]
@@ -486,9 +697,15 @@ def claim_batch(
     lane = None
     for item in pending:
         candidate = (item["platform"], item["chat_id"])
-        if candidate not in busy_lanes:
-            lane = candidate
-            break
+        if candidate in busy_lanes:
+            continue
+        # A lane holding an active warm lease is busy too: the
+        # warm agent owns that lane until its hold ends (see
+        # warm_lease_active). Other lanes stay claimable.
+        if warm_lease_active(state, item["chat_id"], now):
+            continue
+        lane = candidate
+        break
     if lane is None:
         return None
     batch = [
@@ -503,6 +720,85 @@ def claim_batch(
         item["claim_token"] = token
         item["heartbeat_at"] = now
         item["ever_claimed"] = True
+        # A claim alone does not start the turn (turn_started_at
+        # stays None until the first heartbeat/ack/claim-more),
+        # and a fresh claim is not a warm claim unless the
+        # warm-hold caller marks it so afterwards.
+        item["turn_started_at"] = None
+        item["warm_claimed"] = False
+    return {"claim_token": token, "items": batch}
+
+
+def claim_lane_batch(
+    state: dict,
+    *,
+    chat_id,
+    platform: str = "telegram",
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    stale_ttl: float = DEFAULT_STALE_TTL,
+    heartbeat_stale: float = HEARTBEAT_STALE_SECONDS,
+    active_heartbeat_stale: float | None = None,
+    warm_baton_timeout: float = WARM_BATON_TIMEOUT_SECONDS,
+    now: float | None = None,
+) -> dict | None:
+    """Claim up to ``batch_size`` pending items of ONE lane only.
+
+    The warm-hold path: a warm agent that just saw a follow-up in
+    its own lane claims exactly that lane, in received order, and
+    only when the lane has nothing in flight and holds no active
+    warm lease. A lane with an active lease owned by a different
+    token is busy; the warm-hold caller clears its OWN lease
+    before claiming, so by the time this runs the lease is gone.
+    Other lanes are never touched, whatever their state.
+
+    Newly claimed items carry ``warm_claimed=False`` by default;
+    the warm-hold caller sets it True afterwards, in the same
+    transaction, so the baton guard can tell a warm claim from an
+    ordinary one. Like ``claim_batch``, a claim alone does not
+    start the turn (``turn_started_at`` stays None).
+
+    Returns ``{"claim_token": token, "items": [...]}`` or None.
+    """
+    ensure_state(state)
+    now = _now(now)
+    _recycle_stale(
+        state,
+        stale_ttl,
+        now,
+        heartbeat_stale=heartbeat_stale,
+        active_heartbeat_stale=active_heartbeat_stale,
+        warm_baton_timeout=warm_baton_timeout,
+    )
+    lane = (platform, chat_id)
+    if any(
+        (item["platform"], item["chat_id"]) == lane
+        and item["status"] in IN_FLIGHT
+        for item in state["queue"]
+    ):
+        return None
+    if warm_lease_active(state, chat_id, now):
+        return None
+    pending = [
+        item
+        for item in state["queue"]
+        if item["status"] == PENDING
+        and item["replied_at"] is None
+        and (item["platform"], item["chat_id"]) == lane
+        and (item.get("wake_after") is None or item["wake_after"] <= now)
+    ]
+    pending.sort(key=lambda item: item["received_at"])
+    batch = pending[:batch_size]
+    if not batch:
+        return None
+    token = secrets.token_hex(8)
+    for item in batch:
+        item["status"] = CLAIMED
+        item["claimed_at"] = now
+        item["claim_token"] = token
+        item["heartbeat_at"] = now
+        item["ever_claimed"] = True
+        item["turn_started_at"] = None
+        item["warm_claimed"] = False
     return {"claim_token": token, "items": batch}
 
 
@@ -559,6 +855,17 @@ def claim_more(
         item["claim_token"] = token
         item["heartbeat_at"] = now
         item["ever_claimed"] = True
+        # Claiming more proves the turn started: the new items join
+        # a live turn, so their turn_started_at is now, and so is
+        # the existing batch's (a turn that claims more is alive).
+        item["turn_started_at"] = now
+    for item in state["queue"]:
+        if (
+            item["status"] == CLAIMED
+            and item.get("claim_token") == token
+            and item.get("turn_started_at") is None
+        ):
+            item["turn_started_at"] = now
     return {"claim_token": token, "items": batch}
 
 
@@ -579,6 +886,11 @@ def heartbeat(
         return False
     if item["replied_at"] is not None:
         return False
+    # An explicit heartbeat is proof the turn started: record it
+    # once, on the first heartbeat (two-phase rule, Argon
+    # corrected — a claim alone does not start the turn).
+    if item.get("turn_started_at") is None:
+        item["turn_started_at"] = _now(now)
     item["heartbeat_at"] = _now(now)
     return True
 
@@ -601,6 +913,11 @@ def heartbeat_batch(state: dict, token, *, now: float | None = None) -> int:
             and item.get("claim_token") == token
             and item["replied_at"] is None
         ):
+            # First heartbeat of the batch starts the turn (see
+            # heartbeat()): a batch heartbeat is explicit proof
+            # the turn is alive and working.
+            if item.get("turn_started_at") is None:
+                item["turn_started_at"] = now
             item["heartbeat_at"] = now
             refreshed += 1
     return refreshed
@@ -611,6 +928,8 @@ def watchdog_sweep(
     *,
     heartbeat_stale: float = HEARTBEAT_STALE_SECONDS,
     stale_ttl: float = DEFAULT_STALE_TTL,
+    active_heartbeat_stale: float | None = None,
+    warm_baton_timeout: float = WARM_BATON_TIMEOUT_SECONDS,
     now: float | None = None,
 ) -> dict:
     """One watchdog pass: recycle dead claims, report queue health.
@@ -633,7 +952,12 @@ def watchdog_sweep(
     ensure_state(state)
     now = _now(now)
     recycled = _recycle_stale(
-        state, stale_ttl, now, heartbeat_stale=heartbeat_stale
+        state,
+        stale_ttl,
+        now,
+        heartbeat_stale=heartbeat_stale,
+        active_heartbeat_stale=active_heartbeat_stale,
+        warm_baton_timeout=warm_baton_timeout,
     )
     counts_now = counts(state)
     return {
@@ -836,6 +1160,13 @@ def mark_ack(
         return False
     item["ack_sent_at"] = _now(now)
     item["ack_message_id"] = str(message_id)
+    # An ack is explicit proof the turn started (two-phase rule):
+    # the turn sent a message, so it is alive — record the start
+    # and refresh the heartbeat, so the acking turn is never
+    # recycled as never-started.
+    if item.get("turn_started_at") is None:
+        item["turn_started_at"] = _now(now)
+    item["heartbeat_at"] = _now(now)
     return True
 
 

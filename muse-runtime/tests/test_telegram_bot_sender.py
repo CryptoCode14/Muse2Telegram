@@ -303,14 +303,15 @@ class BotSenderTests(unittest.TestCase):
 
     def test_bot_message_mentioning_this_bot_wakes(self):
         # When the other bot asks this bot directly, it wakes so the
-        # agent can answer. A bot message is never quick.
+        # agent can answer. The decider prints a bare "wake" (v2:
+        # no tier word; the agent always follows the unified prompt).
         result = self.run_decider({"items": [
             decider_item(1, GROUP, "group", OTHER_BOT,
                          "@Westinmusebot what do you think?",
                          is_bot=True,
                          sender_name="@" + OTHER_BOT_USERNAME),
         ]})
-        self.assertEqual(result, "wake standard")
+        self.assertEqual(result, "wake")
 
     def test_bot_message_with_mention_of_another_bot_is_closed(self):
         # A bot message @mentioning a third bot is not for this bot.

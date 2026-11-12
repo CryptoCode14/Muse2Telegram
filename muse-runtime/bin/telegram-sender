@@ -23,6 +23,11 @@ Contract (from bridge_core/telegram.py):
       set an emoji reaction on a message (setMessageReaction).
       Best effort: a failure never blocks the reply that follows.
       Exit 0 on success, nonzero on failure. Reads no stdin.
+  telegram-sender --delete <chat_id> <message_id>
+      delete a message (deleteMessage), e.g. a temporary ack
+      message before the full reply goes out. Best effort: a
+      failure never blocks the reply that follows. Exit 0 on
+      success, nonzero on failure. Reads no stdin.
   telegram-sender --register-commands <chat_id>
       register the command menu (setMyCommands) scoped to one
       private chat only, so the commands appear in the Telegram UI
@@ -397,6 +402,17 @@ def send_reaction(chat_id, message_id, emoji):
     return bool(body.get("ok"))
 
 
+def delete_message(chat_id, message_id):
+    """Delete a message (deleteMessage). Returns True when Telegram
+    accepted it. Best effort: the caller sends its reply either
+    way, so a failed delete never blocks it."""
+    body = _post(
+        "deleteMessage",
+        {"chat_id": chat_id, "message_id": message_id},
+    )
+    return bool(body.get("ok"))
+
+
 def register_commands(chat_id):
     """Register the command menu, scoped to one private chat only
     (BotCommandScopeChat), so the commands appear in the Telegram UI
@@ -455,6 +471,14 @@ def main() -> int:
                   file=sys.stderr)
             return 2
         return _run_api_call(send_reaction, chat_id, message_id, emoji)
+    if len(sys.argv) == 4 and sys.argv[1] == "--delete":
+        chat_id = _int_arg(sys.argv[2], "chat_id")
+        message_id = _int_arg(sys.argv[3], "message_id")
+        if chat_id is None or message_id is None:
+            print("usage: telegram-sender --delete <chat_id> <message_id>",
+                  file=sys.stderr)
+            return 2
+        return _run_api_call(delete_message, chat_id, message_id)
     if len(sys.argv) == 3 and sys.argv[1] == "--register-commands":
         chat_id = _int_arg(sys.argv[2], "chat_id")
         if chat_id is None:
@@ -516,6 +540,7 @@ def main() -> int:
             "usage: telegram-sender <chat_id> [--reply-to <id>] [--keyboard] | "
             "telegram-sender --typing <chat_id> | "
             "telegram-sender --react <chat_id> <message_id> <emoji> | "
+            "telegram-sender --delete <chat_id> <message_id> | "
             "telegram-sender --register-commands <chat_id> | "
             "telegram-sender --photo <chat_id> <file_path> [--reply-to <id>] [--keyboard] | "
             "telegram-sender --document <chat_id> <file_path> [--reply-to <id>] [--keyboard]",

@@ -917,8 +917,13 @@ class IntakeProtectionClassificationTests(unittest.TestCase):
 
     def test_idle_greeting_expires_but_active_work_greeting_survives(self):
         store = JsonStateStore(self.path)
-        for work_class in (queue_core.CLASS_REQUEST, None,
-                           queue_core.CLASS_CONVERSATION):
+        # v2 receipt dedupe: each subTest must use a distinct update
+        # id. The loop clears the queue but the ingest receipt for
+        # an update id persists 24 h, so re-ingesting the same id
+        # is (correctly) skipped as a duplicate delivery.
+        for index, work_class in enumerate((queue_core.CLASS_REQUEST, None,
+                           queue_core.CLASS_CONVERSATION)):
+            uid = 91 + 100 * index
             with self.subTest(work_class=work_class):
                 with store.transaction() as state:
                     state["queue"] = []
@@ -931,10 +936,10 @@ class IntakeProtectionClassificationTests(unittest.TestCase):
                     if work_class == queue_core.CLASS_CONVERSATION:
                         queue_core.claim_batch(state, platform="telegram")
                     telegram.ingest(state, {"ok": True, "result": [
-                        msg_update(91, GROUP, "group", 222, "hello")
+                        msg_update(uid, GROUP, "group", 222, "hello")
                     ]})
-                    queue_core.find_item(state, "telegram", 91)["received_at"] -= 7200
-                self.assertEqual(self.item(91)["item_class"], queue_core.CLASS_REQUEST)
+                    queue_core.find_item(state, "telegram", uid)["received_at"] -= 7200
+                self.assertEqual(self.item(uid)["item_class"], queue_core.CLASS_REQUEST)
                 self.assertEqual(run_cli(self.path, ["--purge-expired"])["expired"], 0)
         with store.transaction() as state:
             for item in state["queue"]:

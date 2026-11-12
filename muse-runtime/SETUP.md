@@ -9,7 +9,7 @@ else, you do.
 
 ## Credit
 
-This project is built on [`usedhonda/muse-agent-bridge`](https://github.com/usedhonda/muse-agent-bridge) (MIT, Copyright (c) 2026 usedhonda). It is not all original code. The core bridge (`bridge_core/` — the queue, the store, the Telegram adapter, and the intake / claim / send lifecycle) is that project's code, kept under its MIT license (see `LICENSE`). What this repo adds on top of it is the Telegram sender, the polling hook with routing, the decider, the tiered wake prompts, the trusted / guarded group modes, the file and media handling, the one-reply-per-batch behaviour, and this guide.
+This project is built on [`usedhonda/muse-agent-bridge`](https://github.com/usedhonda/muse-agent-bridge) (MIT, Copyright (c) 2026 usedhonda). It is not all original code. The core bridge (`bridge_core/` — the queue, the store, the Telegram adapter, and the intake / claim / send lifecycle) is that project's code, kept under its MIT license (see `LICENSE`). What this repo adds on top of it is the Telegram sender, the polling hook with routing, the decider, the unified wake prompt, the trusted / guarded group modes, the file and media handling, the one-reply-per-batch behaviour, and this guide.
 
 ## What this installs
 
@@ -117,15 +117,17 @@ muse-runtime/
                       sendDocument / typing / reactions / setMyCommands)
   hooks/
     telegram-bridge-intake.sh   the hook script (polls, decides, wakes)
-    telegram-bridge-decide.py   the router (wake / hold / done + tiers)
+    telegram-bridge-decide.py   the router (wake / hold / done)
     telegram-bridge-watchdog.sh the queue watchdog (recycles dead claims)
     telegram-bridge-watchdog.json
                                 the watchdog hook definition (120s poll)
   prompts/
-    router.md         the hook-definition prompt (tiny router)
-    tier-quick.md     quick tier prompt (simple chat)
-    tier-standard.md  standard tier prompt (normal conversation)
-    tier-deep.md      deep tier prompt (complex work)
+    unified.md        the hook-definition prompt (one static prompt
+                      for every wake; 12220 chars, ~3055 modelled
+                      tokens)
+    router.md, tier-quick.md, tier-standard.md, tier-deep.md
+                      superseded in v2; kept for history only,
+                      do not install
 ```
 
 Set up a venv and install the requirements, then run the offline tests.
@@ -166,9 +168,11 @@ Copy the pieces to where they live on this host. Use these exact paths
   is silent on health and on successful repair, and wakes an agent
   only when the sweep itself fails. To stop it sweeping by hand,
   create `~/workspace/telegram-bridge/WATCHDOG_PAUSE`.
-- Prompts: copy `muse-runtime/prompts/tier-quick.md`,
-  `tier-standard.md`, and `tier-deep.md` to the prompts folder
-  (e.g. `~/hooks/prompts/`).
+- Prompts: the unified prompt is installed as the hook definition
+  prompt itself (see Step 10); do NOT copy the superseded
+  `router.md` or `tier-*.md` files anywhere. Keep a copy of
+  `muse-runtime/prompts/unified.md` with the bridge checkout for
+  reference.
 - Routing note (local only, not in the repo): the repo ships without a
   group-routing note on purpose — the installing Muse writes it into
   their own local prompt files, in their own words, during this step.
@@ -333,7 +337,7 @@ username exactly as it appears in the room history. When its message
 is general, open-ended, or just sharing information, it does NOT
 @mention the other bot. Once the question is answered it stops
 @mentioning unless a new question comes up. This rule is in the wake
-prompt (`tier-standard.md`); do not change the decider for it.
+prompt (`unified.md`); do not change the decider for it.
 
 **Can the bot be added to groups at all?** If a group will not
 accept the bot, check `/setjoingroups` in BotFather (it must allow
@@ -360,13 +364,17 @@ poll interval. The hook script polls Telegram (long-poll 30s), feeds the
 payload to the decider, and wakes your Muse only when a message needs
 it. Silent polls cost no model tokens.
 
-The hook definition prompt is the tiny router in
-`muse-runtime/prompts/router.md` — use that text verbatim as the hook
-definition prompt (replacing the placeholders). It tells the woken agent
-to read only the prompt file for the payload's tier
-(`tier-quick.md`, `tier-standard.md`, or `tier-deep.md`) and follow it
-exactly. Do not paste a full prompt into the hook definition; the router
-keeps it small and the tier files carry the detail.
+The hook definition prompt is the unified prompt in
+`muse-runtime/prompts/unified.md` — use that text verbatim as the hook
+definition prompt (replacing the placeholders), following the exact
+install steps in `muse-runtime/hooks/hook-definition-unified-prompt.md`.
+It is the woken agent's full instruction for the turn: one static text
+for every wake (12220 chars, ~3055 modelled tokens). There is no
+per-batch prompt selection any more: the decider prints only `wake` /
+`hold` / `done` / `empty`, and the intake hook pre-loads the agent's
+context into the wake payload as `context_md` (the bounded contents of
+context.md, at most 6000 chars, null when the file is missing). Do not
+install the superseded `router.md` or `tier-*.md` files.
 
 **Done looks like:** the hook is enabled, polling every 5s, and a dry
 run (no messages waiting) exits silently.
@@ -383,8 +391,8 @@ with a healthy sweep report.
 ## Step 11 — Test it live
 
 1. Send a test DM ("How are you?"). The hook should answer it on its
-   own within about 5 seconds (a simple greeting uses the quick tier;
-   expect roughly 25–35 seconds for the full agent turn, not instant).
+   own within about 5 seconds (expect roughly 25–35 seconds for the
+   full agent turn, not instant).
 2. Confirm the reply threads under the question and the bot's display
    name is right. If the display name is not what the user wants, the
    bot can rename itself with the Bot API `setMyName` call (or the user
@@ -418,15 +426,15 @@ Verify all of these before telling the user it is ready:
 - [ ] Connector `custom.telegram-muse-bot` registered with the exact
   details from Step 2.
 - [ ] Offline tests pass.
-- [ ] Sender, hook, decider, and tier prompts installed at the paths in
-  Step 4; env vars set, including the bot username.
+- [ ] Sender, hook, decider, and unified prompt installed at the paths in
+  Step 4 and Step 10; env vars set, including the bot username.
 - [ ] Mode asked and recorded (`state.json` `default_group_mode` is the
   answer from Step 5; the first group adopted gets it, later groups
   start guarded).
 - [ ] Owner adopted (`--adopt` printed the owner id and the mode).
 - [ ] Group Privacy set as the user chose (OFF for the free-for-all); Bot-to-Bot Communication Mode ON if the group has more than one bot.
 - [ ] Command menu registered (scoped to the owner's DM).
-- [ ] Hook enabled, 5s poll, router prompt in the hook definition.
+- [ ] Hook enabled, 5s poll, unified prompt in the hook definition.
 - [ ] Test DM answered on its own. Group (if any) adopted and the mode
   confirmed with `--group-mode`.
 
@@ -501,9 +509,9 @@ not change its mode and does not clear a safety trip.
 - Intake failures are logged to
   `~/workspace/telegram-bridge/intake-errors.log` with a timestamp (a
   failed intake used to look exactly like "no message").
-- How the bridge routes messages (see the tier prompts): replies are
-  written to a file and piped into the send command, never pasted into
-  a shell command. Group routing: see the install-time routing note
+- How the bridge routes messages (see the unified prompt): the agent
+  sends with `--reply` (reply text on stdin via heredoc), never pasted
+  into a shell command. Group routing: see the install-time routing note
   in Step 4. In a guarded group the bridge never reveals personal,
   financial, or account details; in a trusted group it may share them
   with the owner when the owner asks, and may ask another Muse bot a

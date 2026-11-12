@@ -159,18 +159,14 @@ so Telegram rejects the call with a 404.
 - The agent never pastes reply text into a shell command. It writes the
   reply to a file and redirects that file into `--send-fenced`, so the
   text never passes through the shell.
-- Wake-prompt tiers: the decider picks one tier per batch, rule-based,
-  from the payload alone (no model call). `quick` is clearly simple
-  chat (a standalone greeting, or /who / /help / /menu) — a minimal
-  prompt, no context file, no memory file, no typing, no reaction, no
-  claim-more. `standard` is the default (the normal prompt with the
-  context file). `deep` is complex work (a lookup / task / long message,
-  a reference to past work, a media item needing real analysis, or a
-  follow-up to unfinished work) — full context including memory. A batch
-  uses the highest tier any item in it needs; when uncertain it errs
-  upward, never quick. The tier only changes how much context the agent
-  loads. No script replies and no external model: the agent reads and
-  replies to every message; the decider only picks the prompt.
+- One unified wake prompt: the woken agent always follows the same
+  static prompt (`prompts/unified.md`, installed as the hook definition
+  prompt), whatever the batch. The decider prints only `wake` / `hold` /
+  `done` / `empty` and picks no prompt. The agent's context arrives
+  pre-loaded in the wake payload as `context_md` (the bounded contents
+  of context.md); it reads `~/MEMORY.md` only when the message needs
+  past work or detail beyond that. No script replies and no external
+  model: the agent reads and replies to every message.
 - In a group chat the agent never reveals personal, financial, or
   account details about the owner, to anyone except the owner (not other
   bots, not strangers) — unless the group mode is trusted (see below).
@@ -237,7 +233,7 @@ so Telegram rejects the call with a 404.
   For general, open-ended, or information-only messages it does NOT
   @mention the other bot, and once the question is answered it stops
   @mentioning unless a new question comes up. This rule lives in the
-  wake prompt (`tier-standard.md`); the decider is unchanged.
+  wake prompt (`unified.md`); the decider is unchanged.
 - If a group will not accept the bot at all, check `/setjoingroups`
   in BotFather (it must allow the bot to be added to groups; `getMe`
   reports it as `can_join_groups`).
@@ -304,7 +300,7 @@ so Telegram rejects the call with a 404.
   the mode is guarded or the trip is active, "trusted" otherwise; an allowlisted group in trusted mode is always "trusted"),
   `group_mode_notice` (the one-time trip notice), and
   `adopted_group_ids` (every group the bot serves). A private DM is
-  always trusted. The tier system is unchanged — the mode only changes
+  always trusted. The unified prompt applies the same way in every group — the mode only changes
   what the agent may share.
 - Inspect the modes with `--group-mode` (read-only: one record per
   adopted group — mode, allowlisted, trip status, effective mode,
