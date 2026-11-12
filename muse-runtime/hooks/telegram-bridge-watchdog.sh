@@ -2,10 +2,13 @@
 # Watchdog for the Telegram bridge queue (telegram-bridge-watchdog).
 # Polls: any claimed item whose heartbeat went stale (its turn died
 # mid-work)? Recycle it back to pending so the intake's next poll
-# re-claims and re-wakes it. Silent on health and on successful
-# repair (recovery is logged to watchdog_recoveries.log for the
-# supervisor to report). Wakes an agent ONLY when the sweep itself
-# fails.
+# re-claims and re-wakes it. Also checks intake liveness: if the
+# intake has not polled successfully in over INTAKE_STALE_SECONDS
+# (reported by the sweep as intake_wake, once per stale episode),
+# wake an agent so the stuck intake gets looked at. Silent on
+# health and on successful repair (recovery is logged to
+# watchdog_recoveries.log for the supervisor to report). Wakes an
+# agent ONLY when the sweep itself fails or the intake is stale.
 # Never sends a Telegram message, never closes work, never touches
 # "sending" items (their send outcome is unknown — only an operator
 # reconciles those), never touches a live-heartbeat claim.
@@ -53,7 +56,17 @@ fi
 
 recycled=$(python3 -c "import json,sys; print(len(json.load(open('$sweep_out')).get('recycled', [])))" 2>/dev/null || echo 0)
 pending=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('pending', 0))" 2>/dev/null || echo 0)
+intake_wake=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('intake_wake', False))" 2>/dev/null || echo False)
+intake_age=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('intake_age_seconds'))" 2>/dev/null || echo null)
 rm -f "$sweep_out"
+
+# Stale intake: wake once per episode (the sweep enforces the
+# cooldown and clears it when the intake recovers). This exits
+# via wake, so a stale intake is reported instead of "healthy".
+if [ "$intake_wake" = "True" ]; then
+  printf '%s intake-stale age=%s recycled=%s pending=%s\n' "$ts_now" "$intake_age" "$recycled" "$pending" >> "$REC_LOG"
+  wake "telegram bridge intake stale - no successful poll for ${intake_age}s" "{\"at\":\"$ts_now\",\"intake_age_seconds\":$intake_age,\"recycled\":$recycled,\"pending\":$pending}"
+fi
 
 if [ "$recycled" -gt 0 ]; then
   printf '%s recycled=%s pending=%s\n' "$ts_now" "$recycled" "$pending" >> "$REC_LOG"

@@ -662,7 +662,7 @@ def _heartbeat_stale():
 #: the two-phase rule (queue._recycle_stale): a claimed item whose
 #: turn started is recycled once its heartbeat is older than this,
 #: and a never-started claim once its claim is older than this.
-#: Default 180 s (Argon, corrected). When unset/negative the
+#: Default 600 s (Argon, corrected). When unset/negative the
 #: legacy 600 s rule applies (active_heartbeat_stale None).
 ACTIVE_HEARTBEAT_STALE_ENV = "TELEGRAM_BRIDGE_ACTIVE_HEARTBEAT_STALE_SECONDS"
 

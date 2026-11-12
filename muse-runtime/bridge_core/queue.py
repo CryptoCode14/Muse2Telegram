@@ -132,8 +132,37 @@ WARM_BATON_TIMEOUT_SECONDS = 30.0
 #: recycled once its claim is older than this, when the caller
 #: passes ``active_heartbeat_stale``. Argon (corrected): the
 #: original Argon figure was a 180 s re-wake for never-heartbeated
-#: claims; live heartbeating turns keep the 600 s horizon.
-NEVER_STARTED_RECYCLE_SECONDS = 180.0
+#: claims; live heartbeating turns keep the 600 s horizon. 180 s
+#: proved too tight for post-gap recovery: on 2026-11-12 a worker
+#: turn that was still starting up after a ~60 min runtime gap had
+#: its batch recycled mid-startup, the batch was re-claimed under
+#: a new token, and the first turn's reply fenced. 600 s gives a
+#: slow-starting turn room to start; the cost is a genuinely dead
+#: never-started claim waiting up to ten minutes before recycling.
+NEVER_STARTED_RECYCLE_SECONDS = 600.0
+
+#: Age (seconds) of the intake's last successful poll past which
+#: the intake is treated as stale by the watchdog sweep. The
+#: intake long-polls on every tick (30 s long poll, ~31 s cycle
+#: in live logs: median 31.2 s, p99 50.1 s, worst healthy gap
+#: 132.7 s across ~10 h on 2026-11-12), so 120 s is ~4x the normal
+#: cycle: one slow poll cannot trip it, but a genuinely stuck
+#: intake is caught within about two minutes of its last poll.
+#: 60 s would cry wolf (7 healthy gaps over 60 s in the same
+#: window); waiting 15 min would leave the bridge down a quarter
+#: of an hour for no benefit.
+INTAKE_STALE_SECONDS = 120.0
+
+#: Minimum gap (seconds) between intake-stale wakes while the
+#: intake stays stale: the watchdog must not wake an agent on
+#: every sweep tick for the same stuck intake. One wake per stale
+#: episode, then silence until the intake recovers (the marker is
+#: cleared on a fresh poll) or ten minutes pass.
+INTAKE_STALE_WAKE_COOLDOWN_SECONDS = 600.0
+
+#: State key recording the last intake-stale wake (epoch seconds),
+#: so the sweep can enforce the cooldown above.
+LAST_INTAKE_STALE_WAKE_KEY = "last_intake_stale_wake"
 
 #: Intake classifications stored on the queue record as
 #: ``item_class``. Only CLASS_CONVERSATION ("ordinary conversation")
@@ -389,7 +418,7 @@ def _is_recyclable(
        ``claimed_at`` alone never triggers this — only the
        heartbeat age, which is the baton proof of life.
     2. Two-phase heartbeat (Argon, corrected) when
-       ``active_heartbeat_stale`` is passed (e.g. 180 s): a turn
+       ``active_heartbeat_stale`` is passed (e.g. 600 s): a turn
        that started (``turn_started_at`` set) is recycled once
        its heartbeat is older than that horizon; a turn that
        never started is recycled once its claim is older than
@@ -932,7 +961,8 @@ def watchdog_sweep(
     warm_baton_timeout: float = WARM_BATON_TIMEOUT_SECONDS,
     now: float | None = None,
 ) -> dict:
-    """One watchdog pass: recycle dead claims, report queue health.
+    """One watchdog pass: recycle dead claims, report queue health
+    and intake liveness.
 
     The sweep runs the same stale-claim rule as ``claim_batch``
     (heartbeat first, claimed_at TTL as backstop for items that
@@ -942,12 +972,28 @@ def watchdog_sweep(
     heartbeat is still fresh. Recycled items return to ``pending``
     with their token cleared, so the intake's next poll re-claims
     and re-wakes them — the watchdog itself never sends anything
-    and never wakes an agent; waking is the intake's job once the
-    lane is free again.
+    and never wakes an agent for a recycled claim; waking is the
+    intake's job once the lane is free again.
+
+    It also reports intake liveness from the state's
+    ``last_successful_poll`` (set by the intake on every
+    successful poll): ``intake_stale`` is True once the last poll
+    is older than ``INTAKE_STALE_SECONDS``, and ``intake_wake``
+    is True only on the first stale sweep of an episode (further
+    sweeps stay silent for ``INTAKE_STALE_WAKE_COOLDOWN_SECONDS``,
+    and a fresh poll clears the episode). The sweep only reports:
+    the hook script reads ``intake_wake`` and wakes an agent.
+    This catches a stuck intake while the runtime is alive; it
+    cannot cover a dead runtime — if the runtime itself is down,
+    this sweep never runs either. A state with no recorded poll
+    yet (fresh install, intake never ran) reports no age and is
+    never stale: there is nothing to judge yet.
 
     Returns ``{"recycled": [external_id, ...], "pending": n,
-    "claimed_live": n, "sending": n}`` — counts taken after the
-    recycle, so ``pending`` includes the items just freed.
+    "claimed_live": n, "sending": n, "intake_age_seconds": age
+    | None, "intake_stale": bool, "intake_wake": bool}`` — counts
+    taken after the recycle, so ``pending`` includes the items
+    just freed.
     """
     ensure_state(state)
     now = _now(now)
@@ -959,12 +1005,38 @@ def watchdog_sweep(
         active_heartbeat_stale=active_heartbeat_stale,
         warm_baton_timeout=warm_baton_timeout,
     )
+    last_poll = state.get("last_successful_poll")
+    if not isinstance(last_poll, (int, float)):
+        intake_age = None
+        intake_stale = False
+        intake_wake = False
+    else:
+        intake_age = now - last_poll
+        intake_stale = intake_age > INTAKE_STALE_SECONDS
+        if not intake_stale:
+            # Fresh poll ends the stale episode: clear the wake
+            # marker so the next episode wakes promptly.
+            state.pop(LAST_INTAKE_STALE_WAKE_KEY, None)
+            intake_wake = False
+        else:
+            last_wake = state.get(LAST_INTAKE_STALE_WAKE_KEY)
+            if (
+                not isinstance(last_wake, (int, float))
+                or now - last_wake > INTAKE_STALE_WAKE_COOLDOWN_SECONDS
+            ):
+                state[LAST_INTAKE_STALE_WAKE_KEY] = now
+                intake_wake = True
+            else:
+                intake_wake = False
     counts_now = counts(state)
     return {
         "recycled": [item["external_id"] for item in recycled],
         "pending": counts_now[PENDING],
         "claimed_live": counts_now[CLAIMED],
         "sending": counts_now[SENDING],
+        "intake_age_seconds": intake_age,
+        "intake_stale": intake_stale,
+        "intake_wake": intake_wake,
     }
 
 

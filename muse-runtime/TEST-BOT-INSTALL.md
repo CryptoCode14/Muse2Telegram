@@ -75,7 +75,7 @@ failing suite you cannot explain.
 - Watchdog: copy `muse-runtime/hooks/telegram-bridge-watchdog.sh`
   to `~/hooks-test/scripts/` and
   `muse-runtime/hooks/telegram-bridge-watchdog.json` to
-  `~/hooks-test/definitions/` (poll every 120 seconds, as in
+  `~/hooks-test/definitions/` (poll every 60 seconds, as in
   `SETUP.md` Step 10).
 - Prompts: do NOT copy `router.md` or any `tier-*.md` file. The
   unified prompt is installed as the hook definition prompt itself
@@ -127,7 +127,7 @@ the old router text and do NOT install any `tier-*.md` file.
 
 Also install the queue watchdog hook from
 `muse-runtime/hooks/telegram-bridge-watchdog.json` (poll every
-**120 seconds**).
+**60 seconds**).
 
 **Done looks like:** both hooks are enabled and a dry run (no
 messages waiting) exits silently.

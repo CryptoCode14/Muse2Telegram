@@ -124,7 +124,7 @@ muse-runtime/
     telegram-bridge-decide.py   the router (wake / hold / done)
     telegram-bridge-watchdog.sh the queue watchdog (recycles dead claims)
     telegram-bridge-watchdog.json
-                                the watchdog hook definition (120s poll)
+                                the watchdog hook definition (60s poll)
   prompts/
     unified.md        the hook-definition prompt (one static prompt
                       for every wake; 12220 chars, ~3055 modelled
@@ -169,12 +169,15 @@ Copy the pieces to where they live on this host. Use these exact paths
   hooks scripts folder and make it executable, and copy
   `muse-runtime/hooks/telegram-bridge-watchdog.json` to the hooks
   definitions folder (e.g. `~/hooks/definitions/`). It polls every
-  120 seconds and recycles claimed items whose heartbeat went stale
+  60 seconds and recycles claimed items whose heartbeat went stale
   (a turn that died mid-work) back to pending, so the intake's next
-  poll re-claims and re-wakes them. It never sends a Telegram
+  poll re-claims and re-wakes them. It also watches intake liveness:
+  if the intake has not polled successfully in over 120 seconds it
+  wakes an agent (once per stale episode) so the stuck intake gets
+  looked at. It never sends a Telegram
   message, never closes work, and never touches "sending" items. It
   is silent on health and on successful repair, and wakes an agent
-  only when the sweep itself fails. To stop it sweeping by hand,
+  only when the sweep itself fails or the intake is stale. To stop it sweeping by hand,
   create `~/workspace/telegram-bridge/WATCHDOG_PAUSE`.
 - Prompts: the unified prompt is installed as the hook definition
   prompt itself (see Step 10); do NOT copy the superseded
@@ -421,15 +424,16 @@ install the superseded `router.md` or `tier-*.md` files.
 run (no messages waiting) exits silently.
 
 Also create the queue watchdog hook using the settings in
-`muse-runtime/hooks/telegram-bridge-watchdog.json` (poll every **120
+`muse-runtime/hooks/telegram-bridge-watchdog.json` (poll every **60
 seconds**) — create it through the hook tool, which stamps its own
 created and updated times; do not copy the JSON file verbatim, it
 has no timestamps and will not parse. It recycles claimed items
 whose heartbeat went stale — a
 turn that died mid-work — back to pending, so the intake's next poll
-re-claims and re-wakes them. It never sends a Telegram message and
-wakes an agent only when the sweep itself fails. **Done looks like:**
-the hook is enabled, polling every 120s, and a dry run exits silently
+re-claims and re-wakes them. It also wakes an agent if the intake
+has not polled successfully in over 120 seconds. It never sends a Telegram message and
+wakes an agent only when the sweep itself fails or the intake is stale. **Done looks like:**
+the hook is enabled, polling every 60s, and a dry run exits silently
 with a healthy sweep report.
 
 ## Step 11 — Test it live

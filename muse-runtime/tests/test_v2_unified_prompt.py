@@ -217,7 +217,10 @@ class WatchdogDefinitionTests(unittest.TestCase):
         path = RUNTIME / "hooks" / "telegram-bridge-watchdog.json"
         data = json.loads(path.read_text())
         self.assertEqual(data["id"], "telegram-bridge-watchdog")
-        self.assertEqual(data["poll_interval_secs"], 120)
+        # 60 s poll since the intake-liveness fix: the watchdog is
+        # the detector now, so it has to check often enough to
+        # catch a stuck intake within ~2 minutes of its last poll.
+        self.assertEqual(data["poll_interval_secs"], 60)
         self.assertEqual(
             data["script_path"],
             "~/hooks/scripts/telegram-bridge-watchdog.sh",

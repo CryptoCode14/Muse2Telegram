@@ -85,6 +85,43 @@ class HeartbeatTests(unittest.TestCase):
         self.assertIsNone(batch)
         self.assertEqual(self.items(store)[0]["status"], "claimed")
 
+    def test_never_started_claim_survives_slow_start(self):
+        # Regression (2026-11-12): a worker turn still starting up
+        # after a runtime gap had its batch recycled at 180 s, the
+        # batch was re-claimed under a new token, and the first
+        # turn's reply fenced. With the 600 s never-started horizon
+        # a claim 300 s old is still owned; at 601 s it recycles.
+        store = JsonStateStore(self.path)
+        with store.transaction() as state:
+            queue_core.enqueue(
+                state, platform="telegram", external_id=100,
+                chat_id=111, chat_type="group", sender_id=7,
+                text="slow start", message_id=50, now=1000.0,
+            )
+            batch = queue_core.claim_batch(
+                state, platform="telegram",
+                active_heartbeat_stale=queue_core.NEVER_STARTED_RECYCLE_SECONDS,
+                now=1000.0,
+            )
+        token = batch["claim_token"]
+        with store.transaction() as state:
+            batch = queue_core.claim_batch(
+                state, platform="telegram",
+                active_heartbeat_stale=queue_core.NEVER_STARTED_RECYCLE_SECONDS,
+                now=1300.0,
+            )
+        self.assertIsNone(batch)
+        self.assertEqual(self.items(store)[0]["status"], "claimed")
+        with store.transaction() as state:
+            batch = queue_core.claim_batch(
+                state, platform="telegram",
+                active_heartbeat_stale=queue_core.NEVER_STARTED_RECYCLE_SECONDS,
+                now=1601.0,
+            )
+        self.assertIsNotNone(batch)
+        self.assertNotEqual(batch["claim_token"], token)
+        self.assertEqual(self.items(store)[0]["status"], "claimed")
+
     def test_stale_heartbeat_recycles_claim_fast(self):
         store, token = _state_with_claimed(self.path, at=1000.0)
         with store.transaction() as state:
@@ -216,7 +253,74 @@ class WatchdogSweepTests(unittest.TestCase):
             report = queue_core.watchdog_sweep(state, now=1050.0)
         self.assertEqual(report, {
             "recycled": [], "pending": 0, "claimed_live": 1, "sending": 0,
+            # No poll ever recorded: no age to judge, never stale.
+            "intake_age_seconds": None, "intake_stale": False,
+            "intake_wake": False,
         })
+
+    def _intake_state(self, last_poll):
+        store = JsonStateStore(self.path)
+        with store.transaction() as state:
+            state["last_successful_poll"] = last_poll
+        return store
+
+    def test_sweep_fresh_intake_is_not_stale(self):
+        store = self._intake_state(1970.0)
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, now=2000.0)
+        self.assertEqual(report["intake_age_seconds"], 30.0)
+        self.assertFalse(report["intake_stale"])
+        self.assertFalse(report["intake_wake"])
+
+    def test_sweep_stale_intake_wakes_once_per_episode(self):
+        store = self._intake_state(1800.0)
+        # First stale sweep (age 200s): wakes.
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, now=2000.0)
+        self.assertEqual(report["intake_age_seconds"], 200.0)
+        self.assertTrue(report["intake_stale"])
+        self.assertTrue(report["intake_wake"])
+        # Second stale sweep a minute later: still stale, silent
+        # (cooldown, same episode).
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, now=2060.0)
+        self.assertTrue(report["intake_stale"])
+        self.assertFalse(report["intake_wake"])
+        # After the 10-minute cooldown: wakes again.
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, now=2601.0)
+        self.assertTrue(report["intake_stale"])
+        self.assertTrue(report["intake_wake"])
+
+    def test_sweep_fresh_poll_clears_stale_episode(self):
+        store = self._intake_state(1800.0)
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, now=2000.0)
+        self.assertTrue(report["intake_wake"])
+        # The intake recovers: a fresh poll ends the episode.
+        with store.transaction() as state:
+            state["last_successful_poll"] = 2090.0
+            report = queue_core.watchdog_sweep(state, now=2100.0)
+        self.assertFalse(report["intake_stale"])
+        self.assertFalse(report["intake_wake"])
+        self.assertNotIn(
+            queue_core.LAST_INTAKE_STALE_WAKE_KEY, store.load()
+        )
+        # It goes stale again right away: a NEW episode wakes
+        # immediately, without waiting out the old cooldown.
+        with store.transaction() as state:
+            state["last_successful_poll"] = 1800.0
+            report = queue_core.watchdog_sweep(state, now=2200.0)
+        self.assertTrue(report["intake_stale"])
+        self.assertTrue(report["intake_wake"])
+
+    def test_sweep_never_polled_intake_is_not_stale(self):
+        store = JsonStateStore(self.path)
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, now=2000.0)
+        self.assertIsNone(report["intake_age_seconds"])
+        self.assertFalse(report["intake_stale"])
+        self.assertFalse(report["intake_wake"])
 
 
 class HeartbeatCliTests(unittest.TestCase):
@@ -267,6 +371,26 @@ class HeartbeatCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(result["recycled"], [])
         self.assertEqual(result["claimed_live"], 1)
+
+    def test_cli_watchdog_reports_stale_intake(self):
+        with self.store.transaction() as state:
+            state["last_successful_poll"] = 1800.0
+        with mock.patch("time.time", return_value=2000.0):
+            code, result = self.run_cli(["--watchdog"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result["intake_age_seconds"], 200.0)
+        self.assertTrue(result["intake_stale"])
+        self.assertTrue(result["intake_wake"])
+
+    def test_cli_watchdog_reports_fresh_intake(self):
+        with self.store.transaction() as state:
+            state["last_successful_poll"] = 1990.0
+        with mock.patch("time.time", return_value=2000.0):
+            code, result = self.run_cli(["--watchdog"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result["intake_age_seconds"], 10.0)
+        self.assertFalse(result["intake_stale"])
+        self.assertFalse(result["intake_wake"])
 
 
 if __name__ == "__main__":

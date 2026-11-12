@@ -122,9 +122,10 @@ so Telegram rejects the call with a 404.
   stale for 120s (`TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS`) is
   recycled on the next claim, so a turn that died mid-work blocks
   its lane for minutes, not the full 30-minute stale TTL. A queue
-  watchdog hook polls every 120s and recycles dead claims the same
+  watchdog hook polls every 60s and recycles dead claims the same
   way, silently; it never sends a Telegram message and wakes an
-  agent only when the sweep itself fails.
+  agent only when the sweep itself fails or the intake goes stale
+  (no successful poll for over 120 seconds).
 - Batching: when a batch holds several messages the agent sends ONE
   reply for all of them, not one per message. Before sending it
   re-checks with `--claim-more CHAT_ID CLAIM_TOKEN` (messages that
