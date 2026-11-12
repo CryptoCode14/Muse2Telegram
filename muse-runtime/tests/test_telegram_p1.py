@@ -594,6 +594,276 @@ class ClaimAckCardTests(unittest.TestCase):
         self.assertEqual(report["recovery"]["lease_escalated_now"], 1)
 
 
+class IntakeAckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "state.json"
+        self.store = JsonStateStore(self.path)
+
+    def enqueue_pending(self, external_id=101, chat_id=CHAT, at=1000.0,
+                        message_id=55, text="hello"):
+        with self.store.transaction() as state:
+            queue_core.enqueue(
+                state, platform="telegram", external_id=external_id,
+                chat_id=chat_id, chat_type="private", sender_id=OWNER,
+                text=text, message_id=message_id, now=at,
+            )
+
+    def item(self, external_id=101):
+        return queue_core.find_item(self.store.load(), "telegram", external_id)
+
+    def intake_ack(self, external_id=101, sender_result=("sent", "777")):
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with mock.patch.object(
+                telegram, "_run_send_command", return_value=sender_result
+            ) as sender:
+                result = telegram.send_intake_ack(self.store, external_id)
+        return result, sender
+
+    def test_intake_ack_sends_card_with_lane_position_and_records_it(self):
+        self.enqueue_pending()
+        result, sender = self.intake_ack()
+        self.assertEqual(result, {
+            "ok": True, "message_id": "777", "queue_position": 1,
+        })
+        sender.assert_called_once_with(
+            "/fake/sender", CHAT, telegram.claim_ack_text(1), reply_to=55
+        )
+        item = self.item()
+        self.assertEqual(item["status"], "pending")
+        self.assertEqual(item["ack_message_id"], "777")
+        self.assertEqual(item["ack_card_text"], telegram.claim_ack_text(1))
+        self.assertIsNotNone(item["ack_sent_at"])
+        self.assertIsNone(item["replied_at"])
+
+    def test_intake_ack_does_not_start_the_turn(self):
+        # The hinge, same as the claim card: the card is a
+        # receipt, not proof a turn is alive. If it set
+        # turn_started_at or refreshed the heartbeat, a carded
+        # pending item would look started and the claim lease
+        # could never fire on it.
+        self.enqueue_pending()
+        result, _sender = self.intake_ack()
+        self.assertTrue(result["ok"])
+        item = self.item()
+        self.assertIsNone(item["turn_started_at"])
+        # A pending item has no heartbeat yet, and the card must
+        # not create one: the heartbeat is the turn's proof of
+        # life, not the card's.
+        self.assertIsNone(item["heartbeat_at"])
+        self.assertEqual(item["status"], "pending")
+
+    def test_second_intake_ack_is_refused_and_sender_not_called(self):
+        self.enqueue_pending()
+        first, _sender = self.intake_ack()
+        self.assertTrue(first["ok"])
+        second, sender = self.intake_ack()
+        self.assertEqual(second, {"ok": False, "stage": "already-acked"})
+        sender.assert_not_called()
+        self.assertEqual(self.item()["ack_message_id"], "777")
+
+    def test_intake_ack_unknown_and_rejected_clear_reservation(self):
+        self.enqueue_pending()
+        result, _sender = self.intake_ack(sender_result=("unknown", None))
+        self.assertEqual(result, {"ok": False, "stage": "unknown"})
+        self.assertIsNone(self.item()["ack_sent_at"])
+        self.assertIsNone(self.item()["ack_message_id"])
+        result, _sender = self.intake_ack(sender_result=("rejected", None))
+        self.assertEqual(result, {"ok": False, "stage": "rejected"})
+        self.assertIsNone(self.item()["ack_sent_at"])
+        result, _sender = self.intake_ack(sender_result=("sent", "778"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.item()["ack_message_id"], "778")
+
+    def test_intake_ack_not_pending_and_config(self):
+        result, sender = self.intake_ack(external_id=999)
+        self.assertEqual(result, {"ok": False, "stage": "not-pending"})
+        sender.assert_not_called()
+        self.enqueue_pending()
+        with self.store.transaction() as state:
+            batch = queue_core.claim_batch(
+                state, platform="telegram", now=1000.0)
+        token = batch["claim_token"]
+        result, sender = self.intake_ack()
+        self.assertEqual(result, {"ok": False, "stage": "not-pending"})
+        sender.assert_not_called()
+        with self.store.transaction() as state:
+            queue_core.release(state, "telegram", 101, token)
+        with mock.patch.dict(os.environ, {
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            os.environ.pop(telegram.SEND_CMD_ENV, None)
+            result = telegram.send_intake_ack(self.store, 101)
+        self.assertEqual(result, {"ok": False, "stage": "config"})
+
+    def test_intake_ack_position_counts_messages_ahead_in_lane(self):
+        # Lane A: two messages; lane B: one. The second lane-A
+        # message is #2 (one ahead in its own lane); the lane-B
+        # message does not count against it.
+        self.enqueue_pending(external_id=101, at=1000.0, message_id=55)
+        self.enqueue_pending(external_id=102, at=1001.0, message_id=56)
+        self.enqueue_pending(external_id=201, chat_id=222, at=1002.0,
+                             message_id=66)
+        result, _sender = self.intake_ack(external_id=102)
+        self.assertEqual(result["queue_position"], 2)
+        self.assertIn("#2 in the queue", telegram.claim_ack_text(2))
+        result, _sender = self.intake_ack(external_id=101)
+        self.assertEqual(result["queue_position"], 1)
+        result, _sender = self.intake_ack(external_id=201)
+        self.assertEqual(result["queue_position"], 1)
+
+    def test_run_once_acks_pending_lane_at_intake(self):
+        # Two lanes in one fetch: lane A is claimed and woken;
+        # lane B stays pending — and each of its messages gets
+        # its intake card in the same tick, while the claimed
+        # lane-A items get no intake card.
+        run_cli(self.path, ["--adopt", str(OWNER)])
+        fetch = FakeFetch([
+            msg_update(1 + i, CHAT, "private", OWNER, f"lane A {i}")
+            for i in range(3)
+        ] + [
+            msg_update(10 + i, 222, "private", OWNER, f"lane B {i}")
+            for i in range(3)
+        ])
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with mock.patch.object(
+                telegram, "_run_send_command",
+                side_effect=[("sent", "771"), ("sent", "772"), ("sent", "773")],
+            ) as sender:
+                code, payload = run_cli(
+                    self.path, [], fetch=fetch,
+                    extra_env={
+                        "TELEGRAM_BRIDGE_SETTLE_SECONDS": "0",
+                        telegram.SEND_CMD_ENV: "/fake/sender",
+                    },
+                )
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["count"], 3)
+        state = JsonStateStore(self.path).load()
+        claimed = [i for i in state["queue"] if i["status"] == "claimed"]
+        self.assertEqual(len(claimed), 3)
+        self.assertTrue(all(i["ack_message_id"] is None for i in claimed))
+        pending = [i for i in state["queue"] if i["status"] == "pending"]
+        self.assertEqual(len(pending), 3)
+        self.assertEqual(
+            [i["ack_message_id"] for i in pending], ["771", "772", "773"])
+        self.assertEqual(sender.call_count, 3)
+        self.assertEqual(
+            [call.kwargs["reply_to"] for call in sender.call_args_list],
+            [10, 11, 12],
+        )
+
+    def test_claim_ack_adopts_intake_card_no_second_card(self):
+        self.enqueue_pending()
+        result, _sender = self.intake_ack()
+        self.assertTrue(result["ok"])
+        with self.store.transaction() as state:
+            batch = queue_core.claim_batch(
+                state, platform="telegram", now=1000.0)
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with mock.patch.object(
+                telegram, "_run_send_command", return_value=("sent", "778")
+            ) as sender:
+                result = telegram.send_claim_ack(
+                    self.store, batch["claim_token"])
+        self.assertEqual(result, {"ok": False, "stage": "already-acked"})
+        sender.assert_not_called()
+        self.assertEqual(self.item()["ack_message_id"], "777")
+
+    def test_sweeper_edits_intake_card_when_lane_shortens(self):
+        self.enqueue_pending(external_id=101, at=1000.0, message_id=55)
+        self.enqueue_pending(external_id=102, at=1001.0, message_id=56)
+        result, _sender = self.intake_ack(external_id=102)
+        self.assertEqual(result["queue_position"], 2)
+        self.assertEqual(
+            self.item(102)["ack_card_text"], telegram.claim_ack_text(2))
+        # The item ahead is answered elsewhere: the lane
+        # shortens, and the next sweep edits the card to #1.
+        with self.store.transaction() as state:
+            state["queue"] = [
+                item for item in state["queue"]
+                if str(item["external_id"]) != "101"
+            ]
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with mock.patch.object(
+                telegram, "_run_sender_action", return_value=True
+            ) as edit_mock:
+                report = telegram.watchdog_sweep(self.store, now=1010.0)
+        self.assertEqual(report["ack_cards"]["edited"], 1)
+        edit_mock.assert_called_once_with(
+            "/fake/sender", ["--edit", CHAT, 777],
+            stdin_text=telegram.claim_ack_text(1),
+        )
+        self.assertEqual(
+            self.item(102)["ack_card_text"], telegram.claim_ack_text(1))
+
+    def test_sweeper_deletes_card_on_done_unreplied_item(self):
+        self.enqueue_pending()
+        result, _sender = self.intake_ack()
+        self.assertTrue(result["ok"])
+        with self.store.transaction() as state:
+            batch = queue_core.claim_batch(
+                state, platform="telegram", now=1000.0)
+            queue_core.mark_done(
+                state, "telegram", 101, batch["claim_token"],
+                reason="closed-no-reply",
+            )
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with mock.patch.object(
+                telegram, "_run_sender_action", return_value=True
+            ) as action_mock:
+                report = telegram.refresh_ack_cards(self.store)
+        self.assertEqual(report["deleted"], 1)
+        action_mock.assert_called_once_with(
+            "/fake/sender", ["--delete", CHAT, 777])
+        self.assertIsNone(self.item()["ack_message_id"])
+        self.assertIsNone(self.item().get("ack_card_text"))
+        # A second sweep has nothing left to delete.
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with mock.patch.object(
+                telegram, "_run_sender_action", return_value=True
+            ) as action_mock:
+                report = telegram.refresh_ack_cards(self.store)
+        self.assertEqual(report["deleted"], 0)
+        action_mock.assert_not_called()
+
+    def test_done_deletes_card_when_closing_unreplied_carded_item(self):
+        self.enqueue_pending()
+        result, _sender = self.intake_ack()
+        self.assertTrue(result["ok"])
+        with self.store.transaction() as state:
+            batch = queue_core.claim_batch(
+                state, platform="telegram", now=1000.0)
+            token = batch["claim_token"]
+        with mock.patch.dict(os.environ, {
+                telegram.SEND_CMD_ENV: "/fake/sender",
+                telegram.BOT_USERNAME_ENV: "ExampleBot"}):
+            with mock.patch.object(
+                telegram, "_run_sender_action", return_value=True
+            ) as action_mock:
+                code, result = run_cli(
+                    self.path, ["--done", "101", token, "closed-no-reply"],
+                    extra_env={telegram.SEND_CMD_ENV: "/fake/sender"},
+                )
+        self.assertEqual(code, 0)
+        self.assertEqual(result, {"ok": True})
+        action_mock.assert_called_once_with(
+            "/fake/sender", ["--delete", CHAT, 777])
+        self.assertIsNone(self.item()["ack_message_id"])
+
+
 class ReactBatchTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

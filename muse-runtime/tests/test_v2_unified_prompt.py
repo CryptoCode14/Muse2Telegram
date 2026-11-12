@@ -219,6 +219,22 @@ class UnifiedPromptTests(unittest.TestCase):
             text,
         )
 
+    def test_unified_prompt_ack_step_names_intake_card(self):
+        # Ack on sight at intake: the card goes out when the
+        # message first arrives (even behind a busy lane), or at
+        # claim — and the claim adopts an existing card instead
+        # of sending a second one.
+        text = PROMPT.read_text()
+        self.assertIn(
+            "status card at intake when the message first arrived,"
+            " or at claim for this batch",
+            text,
+        )
+        self.assertIn(
+            "do NOT send a second ack for an item that already has one",
+            text,
+        )
+
     def test_unified_prompt_carries_commands_voice_media(self):
         text = PROMPT.read_text()
         for phrase in (

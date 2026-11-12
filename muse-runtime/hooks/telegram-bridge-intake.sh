@@ -8,9 +8,12 @@
 #          hook sends the ack status card for the batch
 #          (--send-claim-ack, one message with the queue position)
 #          and then wakes the agent: the card is the receipt that
-#          covers the wait before any turn starts. The hook never
-#          fires the typing indicator: typing means "I am
-#          responding", so it fires only while a turn is actually
+#          covers the wait before any turn starts. (Messages that
+#          arrived while the lane was busy already got their card
+#          at intake, from run_once itself; --send-claim-ack
+#          adopts an existing card and never sends a second.)
+#          The hook never fires the typing indicator: typing means
+#          "I am responding", so it fires only while a turn is actually
 #          running (the agent fires it after deciding to reply).
 #   hold - paused and no command; each item is held in the queue
 #          itself (wake_after +24h) for the resume turn to
@@ -117,7 +120,9 @@ case "$action" in
       # Send the ack status card for the batch (one message, with
       # the queue position) before waking: the card is the receipt
       # that covers the wait before any turn starts, and the
-      # sweeper edits that same message to keep it current. A
+      # sweeper edits that same message to keep it current. When
+      # a batch item already carries an intake card, this adopts
+      # it and sends nothing — never a second card. A
       # failed card never blocks the wake — the turn's own
       # --send-ack still works, and the wake is the priority.
       .venv/bin/python -m bridge_core.telegram --send-claim-ack "$claim_token" >/dev/null 2>&1 || true

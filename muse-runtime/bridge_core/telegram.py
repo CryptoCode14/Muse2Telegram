@@ -3552,9 +3552,60 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
                         chat_key = str(items[0].get("chat_id"))
                         rate_state["chats"].setdefault(chat_key, []).append(now)
         _save_rate_state(rate_state)
+        # Intake ack: every item this tick enqueued that is still
+        # pending (its lane is busy behind a claimed batch) gets
+        # its ack status card now, at intake, instead of waiting
+        # for the claim — so the ack lands within seconds of the
+        # message arriving even when the claim is delayed. The
+        # claim flow adopts the card (see send_claim_ack) and
+        # never sends a second. Best-effort per item: a failed
+        # card never blocks the wake or the poll, and the
+        # claim-time card is the backstop.
+        try:
+            _send_intake_acks(store, snapshot, now=now)
+        except Exception as exc:  # noqa: BLE001 - the poll must survive an ack failure
+            print(f"intake ack failed: {exc}", file=sys.stderr)
         return payload
     finally:
         lock_handle.close()
+
+
+def _send_intake_acks(
+    store: JsonStateStore, before_state: dict, *, now: float | None = None
+) -> dict:
+    """Send intake ack cards for the items this tick enqueued
+    that are still pending after the claim transaction.
+
+    "New" means the item's external_id was not in the queue
+    before this tick's fetch (``before_state`` is the
+    pre-fetch snapshot): items pending from an earlier tick
+    already got their intake card then, or the claim-time card
+    when their lane frees. Items the claim took, items the
+    pre-claim filter closed, and recycled items (already in
+    the queue before this tick) are never carded here.
+    Returns {"ok": true, "sent": [...], "failed": [...]}.
+    """
+    before_ids = {
+        item["external_id"]
+        for item in before_state.get("queue", []) or []
+    }
+    state = _ensure_adapter_state(store.load())
+    new_pending = [
+        item
+        for item in state.get("queue", [])
+        if item.get("status") == queue_core.PENDING
+        and item.get("replied_at") is None
+        and item["external_id"] not in before_ids
+    ]
+    sent = []
+    failed = []
+    for item in new_pending:
+        result = send_intake_ack(store, item["external_id"], now=now)
+        if result.get("ok"):
+            sent.append(item["external_id"])
+        else:
+            failed.append(item["external_id"])
+    return {"ok": True, "sent": sent, "failed": failed}
 
 
 #: Sender exit codes (see bin/telegram-sender): 0 = sent (message
@@ -4517,6 +4568,14 @@ def send_claim_ack(
         if token is None or not items:
             return {"ok": False, "stage": "stale-token"}
         items.sort(key=lambda item: item.get("received_at") or 0)
+        # Adopt an intake card: if ANY item in the batch already
+        # carries a card (sent at intake while the lane was busy),
+        # the batch already has one — the sweeper owns it now,
+        # and no second card goes out. The anchor-only check in
+        # reserve_ack is not enough here: the card may sit on a
+        # later batch item, not the anchor.
+        if any(item.get("ack_message_id") is not None for item in items):
+            return {"ok": False, "stage": "already-acked"}
         anchor = items[0]
         chat_id = anchor.get("chat_id")
         if type(chat_id) is not int:
@@ -4551,6 +4610,133 @@ def send_claim_ack(
         _ensure_adapter_state(state)
         queue_core.mark_claim_ack(
             state, PLATFORM, anchor["external_id"], message_id, token,
+            card_text=text, now=now,
+        )
+    return {"ok": True, "message_id": message_id, "queue_position": position}
+
+
+def _intake_queue_position(state: dict, item: dict) -> int:
+    """This item's lane position at intake: 1 + the number of
+    unreplied items in the same lane (pending, claimed, or
+    sending) received before it. Counts messages, not batches:
+    the card is per message, so a lane with two messages ahead
+    of it is position 3. Other lanes never count: the card
+    says where the message stands in its own conversation."""
+    lane = (item.get("platform"), item.get("chat_id"))
+    received_at = item.get("received_at") or 0
+    ahead = 0
+    for other in state.get("queue", []) or []:
+        if other is item:
+            continue
+        if (other.get("platform"), other.get("chat_id")) != lane:
+            continue
+        if other.get("replied_at") is not None:
+            continue
+        if other.get("status") not in (
+            queue_core.PENDING,
+            queue_core.CLAIMED,
+            queue_core.SENDING,
+        ):
+            continue
+        if (other.get("received_at") or 0) < received_at:
+            ahead += 1
+    return 1 + ahead
+
+
+def send_intake_ack(
+    store: JsonStateStore,
+    external_id,
+    *,
+    now: float | None = None,
+) -> dict:
+    """Send the ack status card for a newly enqueued message
+    that is still pending (its lane is busy behind a claimed
+    batch), without closing anything. The intake calls this
+    right after the claim transaction, for each item this tick
+    enqueued that the claim did not take — so the card goes out
+    within seconds of the message arriving even when the claim
+    is delayed behind a busy lane, with the lane queue position
+    in it. The card is one message per item, threaded under the
+    item's own message when it has a message_id, and recorded
+    on the item (``ack_message_id`` + ``ack_card_text``), so
+    the sweeper can edit it and the reply can delete it.
+
+    The fence is the same one-ack-per-item guard as a claim
+    ack (``reserve_intake_ack`` / ``mark_intake_ack``): a
+    second concurrent intake ack is refused as
+    "already-acked" without sending, so the card can never go
+    out twice. The claim flow ADOPTS an existing card
+    (``send_claim_ack`` returns "already-acked" when any batch
+    item carries one) and never sends a second. Like
+    ``send_claim_ack`` this does NOT prove a turn started: the
+    card is recorded with ``mark_intake_ack``, which leaves
+    ``turn_started_at`` and the heartbeat alone — a carded
+    item whose turn never starts is still lease-released by
+    the sweeper.
+
+    Only items that survived the pre-claim filter ever get
+    this card: group noise (other-bot chatter,
+    @mention-someone-else, unauthorized commands) is closed
+    before the claim, and DMs are never closed there — so an
+    intake card is never a false promise. An item the claim
+    took in this same tick is not pending and gets no card
+    here; its claim-time card covers it.
+
+    Returns {"ok": true, "message_id": ..., "queue_position": n}
+    on success, {"ok": false, "stage": "already-acked"} when a
+    card is already recorded (or reserved), {"ok": false,
+    "stage": "not-pending"} when the item is not pending
+    (claimed, done, or unknown id), {"ok": false, "stage":
+    "config"} when no send command is configured, {"ok":
+    false, "stage": "rejected"} / "retryable" / "unknown"
+    when the send did not go out (the reservation is cleared
+    on those, so a retry is safe). Nothing is recorded on
+    "unknown": the item stays pending and the claim-time card
+    is the backstop.
+    """
+    send_cmd = os.environ.get(SEND_CMD_ENV)
+    if not send_cmd:
+        return {"ok": False, "stage": "config"}
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        item = queue_core.find_item(state, PLATFORM, external_id)
+        if item is None or item.get("status") != queue_core.PENDING:
+            return {"ok": False, "stage": "not-pending"}
+        if item.get("replied_at") is not None:
+            return {"ok": False, "stage": "not-pending"}
+        chat_id = item.get("chat_id")
+        if type(chat_id) is not int:
+            return {"ok": False, "stage": "fence"}
+        position = _intake_queue_position(state, item)
+        text = claim_ack_text(position)
+        reply_to = item.get("message_id")
+        if not queue_core.reserve_intake_ack(
+            state, PLATFORM, external_id, now=now
+        ):
+            return {"ok": False, "stage": "already-acked"}
+    send_result = _run_send_command(
+        send_cmd, chat_id, text, reply_to=reply_to
+    )
+    outcome, message_id = send_result
+    if outcome != "sent":
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            queue_core.clear_intake_ack(state, PLATFORM, external_id)
+        if outcome == "rejected":
+            return {"ok": False, "stage": "rejected"}
+        if outcome == "retryable":
+            return {
+                "ok": False,
+                "stage": "retryable",
+                "retry_after": _retryable_delay_seconds(
+                    getattr(send_result, "retry_after", None)
+                ),
+            }
+        return {"ok": False, "stage": "unknown"}
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        queue_core.mark_intake_ack(
+            state, PLATFORM, external_id, message_id,
             card_text=text, now=now,
         )
     return {"ok": True, "message_id": message_id, "queue_position": position}
@@ -4648,9 +4834,10 @@ def _desired_ack_card_text(state: dict, item: dict) -> str | None:
     edited. Escalated wins over delayed: an escalated item's
     card says flagged; a pending item that was lease-released
     says delayed; a claimed item's card says its live queue
-    position. A pending item that was never lease-released has
-    no card to update (it never had one, or its turn already
-    closed it)."""
+    position. A pending item that was never lease-released got
+    its card at intake (its lane was busy when it arrived):
+    its card says its live lane position, kept fresh until
+    the claim adopts it or the lease releases it."""
     if item.get("ack_message_id") is None:
         return None
     if item.get("ack_card_text") is None:
@@ -4674,7 +4861,45 @@ def _desired_ack_card_text(state: dict, item: dict) -> str | None:
         "lease_attempts", 0
     ) > 0:
         return CLAIM_ACK_DELAYED_TEXT
+    if item.get("status") == queue_core.PENDING:
+        # Intake-carded and never lease-released: keep the card
+        # fresh with the live lane position (it shortens as the
+        # items ahead of it are answered or closed).
+        return claim_ack_text(_intake_queue_position(state, item))
     return None
+
+
+def _delete_recorded_ack_card(store: JsonStateStore, external_id) -> bool:
+    """Delete one item's recorded ack card, best-effort, and
+    clear the ack fields when the delete succeeds.
+
+    Used when an unreplied item is closed without a reply
+    (the sweeper's DONE pass, the --done handler): the card
+    must not linger as a stale "we'll reply soon" after the
+    item will never be answered. A failed delete leaves the
+    fields recorded, so the next sweep retries it; a missing
+    send command is a plain failure, never a crash. Returns
+    True only when a card was recorded and Telegram accepted
+    the delete.
+    """
+    state = _ensure_adapter_state(store.load())
+    item = queue_core.find_item(state, PLATFORM, external_id)
+    if item is None:
+        return False
+    ack_id = item.get("ack_message_id")
+    if ack_id is None or item.get("replied_at") is not None:
+        return False
+    send_cmd = os.environ.get(SEND_CMD_ENV)
+    if not delete_message(send_cmd, item.get("chat_id"), ack_id):
+        return False
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        item = queue_core.find_item(state, PLATFORM, external_id)
+        if item is not None and item.get("ack_message_id") == ack_id:
+            item["ack_message_id"] = None
+            item["ack_card_text"] = None
+            item["ack_sent_at"] = None
+    return True
 
 
 def refresh_ack_cards(store: JsonStateStore, *, now: float | None = None) -> dict:
@@ -4686,16 +4911,23 @@ def refresh_ack_cards(store: JsonStateStore, *, now: float | None = None) -> dic
     queue position), edits only the cards whose text actually
     differs — an identical-text edit is a Telegram 400, so it
     is skipped, not attempted — and records the new text on
-    the items whose edit succeeded. Best-effort throughout: a
-    failed edit leaves the old text recorded (the next sweep
-    retries it), and a missing send command reports "config"
-    without failing anything. The watchdog sweep calls this
-    after its queue pass, so a lease release or escalation
-    updates its card within one sweep (~60 s).
+    the items whose edit succeeded. Cards on DONE, unreplied
+    items are DELETED instead (a closed item is never
+    answered, so its card must not linger as a stale "we'll
+    reply soon" — this covers pending-TTL expiry and any
+    other close-without-reply path); the ack fields are
+    cleared on a successful delete so the next sweep does not
+    retry it. Best-effort throughout: a failed edit or delete
+    leaves the old text recorded (the next sweep retries it),
+    and a missing send command reports "config" without
+    failing anything. The watchdog sweep calls this after its
+    queue pass, so a lease release or escalation updates its
+    card within one sweep (~60 s).
 
-    Returns {"ok": true, "checked": n, "edited": n, "failed":
-    [external_id, ...]} (checked counts the cards examined,
-    edited the ones whose text changed on Telegram), or
+    Returns {"ok": true, "checked": n, "edited": n,
+    "deleted": n, "failed": [external_id, ...]} (checked
+    counts the cards examined, edited the ones whose text
+    changed on Telegram, deleted the DONE cards removed), or
     {"ok": false, "stage": "config", "checked": n} when no
     send command is configured.
     """
@@ -4709,8 +4941,20 @@ def refresh_ack_cards(store: JsonStateStore, *, now: float | None = None) -> dic
         and item.get("replied_at") is None
         and item.get("status") != queue_core.DONE
     ]
+    done_cards = [
+        item
+        for item in state.get("queue", [])
+        if item.get("ack_message_id") is not None
+        and item.get("ack_card_text") is not None
+        and item.get("replied_at") is None
+        and item.get("status") == queue_core.DONE
+    ]
     if not send_cmd:
-        return {"ok": False, "stage": "config", "checked": len(cards)}
+        return {
+            "ok": False,
+            "stage": "config",
+            "checked": len(cards) + len(done_cards),
+        }
     pending_edits = []
     for item in cards:
         desired = _desired_ack_card_text(state, item)
@@ -4736,10 +4980,17 @@ def refresh_ack_cards(store: JsonStateStore, *, now: float | None = None) -> dic
                 item = queue_core.find_item(state, PLATFORM, external_id)
                 if item is not None and item.get("ack_message_id") is not None:
                     item["ack_card_text"] = desired
+    deleted = []
+    for item in done_cards:
+        if _delete_recorded_ack_card(store, item["external_id"]):
+            deleted.append(item["external_id"])
+        else:
+            failed.append(item["external_id"])
     return {
         "ok": True,
-        "checked": len(cards),
+        "checked": len(cards) + len(done_cards),
         "edited": len(edited),
+        "deleted": len(deleted),
         "failed": failed,
     }
 
@@ -6269,6 +6520,15 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
                 )
             else:
                 ok = queue_core.release(state, PLATFORM, target, token)
+        if args[0] == "--done" and ok:
+            # Delete the ack card when closing an unreplied
+            # carded item, best-effort like send_reply: the card
+            # must not linger as a stale "we'll reply soon"
+            # after the item will never be answered. A failed
+            # delete leaves the fields recorded, so the sweeper
+            # retries it on the next pass. The close result is
+            # unchanged — the delete is cleanup, not the close.
+            _delete_recorded_ack_card(store, target)
         print(json.dumps({"ok": ok}))
         return 0
 

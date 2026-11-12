@@ -2072,6 +2072,109 @@ def clear_ack(state: dict, platform: str, external_id, token) -> bool:
     return True
 
 
+def _pending_item(state: dict, platform: str, external_id) -> dict | None:
+    """The item, iff it exists and is still pending (never
+    claimed). No token: an intake ack is sent before any claim
+    exists, so there is nothing to check a token against.
+    Refuses claimed, sending, and done items — a card recorded
+    on an item that has since been claimed belongs to the claim
+    ack path, not this one."""
+    item = find_item(state, platform, external_id)
+    if item is None or item["status"] != PENDING:
+        return None
+    return item
+
+
+def reserve_intake_ack(
+    state: dict, platform: str, external_id, *, now: float | None = None
+) -> bool:
+    """Reserve the intake ack inside the send transaction, before
+    sending (see telegram.send_intake_ack).
+
+    Same two-phase shape as ``reserve_ack``, but for a PENDING
+    item with no claim token: sets ``ack_sent_at`` with NO
+    message id, a tentative reservation that stops a second
+    concurrent intake ack from sending, completed by
+    ``mark_intake_ack`` after a successful send, or cleared by
+    ``clear_intake_ack`` when the send did not go out, so a
+    retry is safe.
+
+    Refused when the item is not pending, when a full reply is
+    already recorded, or when any ack is already recorded —
+    tentative or completed (a reservation is not re-reservable).
+    Returns True when the reservation was set.
+    """
+    item = _pending_item(state, platform, external_id)
+    if item is None:
+        return False
+    if item["replied_at"] is not None:
+        return False
+    if item.get("ack_sent_at") is not None:
+        return False
+    if item.get("ack_message_id") is not None:
+        return False
+    item["ack_sent_at"] = _now(now)
+    return True
+
+
+def mark_intake_ack(
+    state: dict,
+    platform: str,
+    external_id,
+    message_id,
+    *,
+    card_text: str,
+    now: float | None = None,
+) -> bool:
+    """Record the script's intake status card (see
+    telegram.send_intake_ack): the ack the intake sends when it
+    first sees a message that is still pending behind a busy
+    lane, before any claim exists.
+
+    Same fence as ``reserve_intake_ack`` (pending, no reply
+    recorded, no completed ack already recorded; a tentative
+    reservation is completed, not refused), and it records
+    ``ack_card_text`` so the sweeper can keep the card current.
+    Like ``mark_claim_ack`` it does NOT set ``turn_started_at``
+    and does NOT refresh the heartbeat: the card is a receipt
+    sent before any turn starts, not proof a turn is alive — so
+    the claim lease still applies to a carded item whose turn
+    never starts.
+    """
+    item = _pending_item(state, platform, external_id)
+    if item is None:
+        return False
+    if item["replied_at"] is not None:
+        return False
+    if item.get("ack_message_id") is not None:
+        return False
+    item["ack_sent_at"] = _now(now)
+    item["ack_message_id"] = str(message_id)
+    item["ack_card_text"] = card_text
+    return True
+
+
+def clear_intake_ack(state: dict, platform: str, external_id) -> bool:
+    """Clear a tentative intake ack reservation (the send did
+    not go out).
+
+    Refused when a message id was ever recorded: a completed
+    ack is proof the ack went out and must never be
+    un-recorded. Only ``ack_sent_at`` is cleared; a reservation
+    that never existed is a no-op success (False only when the
+    item is not pending or a completed ack exists). Returns True
+    when the reservation was cleared (or there was none to
+    clear on a pending, un-acked item).
+    """
+    item = _pending_item(state, platform, external_id)
+    if item is None:
+        return False
+    if item.get("ack_message_id") is not None:
+        return False
+    item["ack_sent_at"] = None
+    return True
+
+
 def counts(state: dict) -> dict:
     result = {PENDING: 0, CLAIMED: 0, SENDING: 0, DONE: 0}
     for item in state.get("queue", []):
