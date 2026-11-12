@@ -252,8 +252,11 @@ class BotSenderTests(unittest.TestCase):
         self.assertEqual(len(queued), 1)
         self.assertTrue(queued[0]["is_bot"])
         self.assertEqual(queued[0]["text"], "Hey! I am the other bot.")
-        self.assertIsNotNone(payload)
-        self.assertTrue(payload["group_allowlisted"])
+        # v2: a lone bot message produces no wake payload — it is
+        # closed silently, as the decider test below asserts — but
+        # it is still buffered and queued, which is what this test
+        # protects.
+        self.assertIsNone(payload)
 
     def test_bot_message_advances_offset(self):
         # The intake must not get stuck on a bot sender's update:

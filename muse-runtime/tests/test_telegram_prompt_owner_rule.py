@@ -21,6 +21,7 @@ This file only checks prompt and doc text. The decider is unchanged
 and its behaviour is already covered by test_telegram_decide.py /
 test_telegram_bot_sender.py. No network or credentials are used.
 """
+import json
 import unittest
 from pathlib import Path
 
@@ -153,14 +154,29 @@ class RoutingNoteOutsideRepoTests(unittest.TestCase):
         _assert_no_flagged_phrasing(self, text, "SETUP.md")
 
     def test_live_prompts_keep_routing_note(self):
-        # The installed prompts keep the note the repo templates lack;
-        # that difference is intentional.
-        for path in (LIVE_STANDARD, LIVE_QUICK):
-            if not path.is_file():
-                self.skipTest(f"live prompt not present: {path}")
-            text = path.read_text()
-            self.assertIn("room context only", text, str(path))
-            self.assertIn("work item from", text, str(path))
+        # The installed prompt keeps the note the repo templates lack;
+        # that difference is intentional. In v2 the installed prompt
+        # is the unified prompt in the hook definition (and the
+        # unified-live.md reference copy), not the superseded tier
+        # files, so that is where the note must be.
+        candidates = []
+        hook_def = (
+            Path.home() / "hooks" / "definitions" / "telegram-bridge.json"
+        )
+        if hook_def.is_file():
+            try:
+                candidates.append(
+                    json.loads(hook_def.read_text())["prompt"])
+            except (KeyError, ValueError):
+                pass
+        live_unified = Path.home() / "hooks" / "prompts" / "unified-live.md"
+        if live_unified.is_file():
+            candidates.append(live_unified.read_text())
+        if not candidates:
+            self.skipTest("live unified prompt not present")
+        for text in candidates:
+            self.assertIn("room context only", text)
+            self.assertIn("work item from", text)
 
     def test_flagged_phrasing_absent_from_live_connector_doc(self):
         # The live connector doc is installed from the repo; it must

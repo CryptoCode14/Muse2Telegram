@@ -157,17 +157,23 @@ class AdapterTests(unittest.TestCase):
         # DM items carry no conversation context.
         self.assertNotIn("context", payload["items"][0])
         run_cli(self.path, ["--done", "1", payload["claim_token"]])
-        # The next wake takes the group lane: both group items, with
-        # context attached.
+        # The next wake takes the group lane: the owner's group item
+        # alone. The bot message in the lane is closed as noise by
+        # the v2 preclaim (a bot message on its own never wakes a
+        # turn), but its text still rides along as context.
         payload = run_cli(self.path, [], fetch=FakeFetch())
-        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["count"], 1)
         self.assertEqual(
-            [item["update_id"] for item in payload["items"]], [2, 3]
+            [item["update_id"] for item in payload["items"]], [2]
         )
         for key in ("chat_id", "chat_type", "sender_name", "is_bot"):
             self.assertEqual(payload[key], payload["items"][0][key])
         self.assertIn("context", payload["items"][0])
-        self.assertIn("context", payload["items"][1])
+        # No content is lost: the bot message's text is in the
+        # wake's context, marked as a third-party bot message.
+        texts = [e["text"] for e in payload["items"][0]["context"]]
+        self.assertIn("first in group", texts)
+        self.assertIn("agent note", texts)
         # Group adoption happened through the owner's group message.
         state = JsonStateStore(self.path).load()
         self.assertEqual(state["group_ids"], [GROUP])
@@ -872,9 +878,16 @@ class IntakeProtectionClassificationTests(unittest.TestCase):
         result = run_cli(self.path, ["--purge-expired"])
         self.assertEqual(result["expired"], 0)
         self.assertEqual(result["external_ids"], [])
-        for uid in range(2, 9):
+        # The expiry purge itself expired nothing: the protection
+        # holds. The human items and the legacy record stay pending.
+        for uid in (4, 6, "legacy-1"):
             self.assertEqual(self.item(uid)["status"], "pending")
-        self.assertEqual(self.item("legacy-1")["status"], "pending")
+        # v2: the bot messages and the mention-of-another-bot are
+        # closed by the preclaim filter as noise (not by expiry) —
+        # their text stays in the group buffer as context.
+        for uid in (2, 3, 5, 7, 8):
+            self.assertEqual(self.item(uid)["status"], "done")
+            self.assertEqual(self.item(uid)["done_reason"], "not-for-me")
 
     def test_exact_greetings_only_and_protection_overrides(self):
         for text in ("hello", "  HELLO  ", "こんにちは", "こんばんは"):
@@ -1009,19 +1022,22 @@ class ExpiredContextTests(unittest.TestCase):
         self.assertEqual(self.item(11)["done_reason"], "expired")
         self.assertEqual(self.item(12)["status"], "pending")
         # A fresh arrival's wake keeps live context and drops expired talk.
+        # v2: the live greeting is itself a bot message, so the
+        # preclaim closes it as noise and it is not a wake item —
+        # but its text still rides in the wake's context, while the
+        # expired greeting is gone.
         payload = run_cli(
             self.path, [],
             fetch=FakeFetch(
                 [msg_update(13, GROUP, "group", OWNER, "fresh question")]
             ),
         )
-        self.assertEqual(payload["count"], 2)
-        for view in payload["items"]:
-            texts = [entry["text"] for entry in view["context"]]
-            self.assertIn("room open", texts)
-            self.assertIn("こんばんは", texts)
-            self.assertIn("fresh question", texts)
-            self.assertNotIn("こんにちは", texts)
+        self.assertEqual(payload["count"], 1)
+        texts = [entry["text"] for entry in payload["items"][0]["context"]]
+        self.assertIn("room open", texts)
+        self.assertIn("こんばんは", texts)
+        self.assertIn("fresh question", texts)
+        self.assertNotIn("こんにちは", texts)
 
 
 class NumericInputValidationTests(unittest.TestCase):
@@ -1697,10 +1713,12 @@ class CallbackQueryTests(unittest.TestCase):
         self.assertEqual(state["queue"], [])
 
     def test_callback_from_stranger_in_group_is_queued_but_not_privileged(self):
-        # The bridge queues the tap; the decider/prompt gates the
-        # command on owner-or-admin, so a stranger's /pause never
-        # runs. Here the queue side is proven: the item exists and
-        # is not marked as an admin.
+        # The bridge queues the tap; a stranger's /pause never runs.
+        # v2: the preclaim filter closes it as an unauthorized
+        # command before any wake, so there is no payload — the
+        # gate moved earlier, the outcome is the same. The queue
+        # record still exists, done as not-for-me, and the spinner
+        # was still dismissed via answerCallbackQuery.
         payload = run_cli(
             self.path, [],
             fetch=FakeFetch([msg_update(1, GROUP, "group", OWNER, "adopt")]),
@@ -1715,11 +1733,17 @@ class CallbackQueryTests(unittest.TestCase):
             ]),
             api_call=api,
         )
-        self.assertIsNotNone(payload)
-        item = payload["items"][0]
-        self.assertEqual(item["text"], "/pause")
-        self.assertFalse(item["is_owner"])
-        self.assertFalse(item["is_group_admin"])
+        self.assertIsNone(payload)
+        state = JsonStateStore(self.path).load()
+        queued = [i for i in state["queue"] if i["external_id"] == "2"]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["text"], "/pause")
+        self.assertEqual(queued[0]["status"], "done")
+        self.assertEqual(queued[0]["done_reason"], "not-for-me")
+        self.assertIn(
+            ("answerCallbackQuery", {"callback_query_id": "cb-2"}),
+            api.calls,
+        )
 
 
 class EditedAndReactionTests(unittest.TestCase):
@@ -1873,15 +1897,19 @@ class GroupAdminTests(unittest.TestCase):
         )
         self.assertEqual(len(api.calls), calls_before + 1)
         self.assertEqual(api.calls[-1][0], "getChatAdministrators")
-        self.assertFalse(payload["items"][0]["is_group_admin"])
+        # v2: the stranger's /pause is closed by the preclaim filter
+        # as an unauthorized command, so there is no wake payload —
+        # the command never runs. The refresh still happened, which
+        # is what this test protects.
+        self.assertIsNone(payload)
         # A second command within 60s does NOT re-fetch again.
-        run_cli(self.path, ["--done", "2", payload["claim_token"]])
         calls_before = len(api.calls)
-        run_cli(
+        payload = run_cli(
             self.path, [],
             fetch=FakeFetch([msg_update(3, GROUP, "group", 444, "/pause")]),
             api_call=api,
         )
+        self.assertIsNone(payload)
         self.assertEqual(len(api.calls), calls_before)
 
     def test_refresh_admins_cli(self):
