@@ -103,6 +103,18 @@ Keeps the operational interface the wake hook drives:
                            is recycled on the next claim, so a turn
                            that died mid-work blocks its lane for
                            about ten minutes, not half an hour.
+  --wake-issued CLAIM_TOKEN
+                           record when the wake was issued for a
+                           claimed batch: stamps ``wake_issued_at``
+                           on every claimed item under the token
+                           (and counts the wake on each item), so
+                           --latency-report can measure wake latency
+                           (wake issued -> turn started). The intake
+                           hook calls this immediately before waking;
+                           it never sends anything and never wakes
+                           anyone. Prints {"ok": true, "stamped": n},
+                           or {"ok": false, "stage": "stale-token"}
+                           when the token owns no live batch.
   --watchdog               one watchdog pass: recycle claimed items
                            whose heartbeat went stale (a turn that
                            died mid-work) back to pending, and print
@@ -112,6 +124,16 @@ Keeps the operational interface the wake hook drives:
                            this every few minutes; the intake's next
                            poll re-claims and re-wakes anything
                            recycled here.
+  --latency-report         read-only: per-stage latency medians from
+                           the state file's items (ack, pickup, wake,
+                           turn, total, plus the claim-to-wake
+                           diagnostic) with the P0 targets alongside,
+                           and recovery metrics (recycles, re-wakes,
+                           wakes whose turn never started, stuck
+                           claims / sends now). Stages with no
+                           samples report "insufficient-data" instead
+                           of a number. Prints one JSON object and
+                           never mutates state.
   --send-batch-and-close PRIMARY_ID TOKEN CHAT_ID
                            [REPLY_TO_MESSAGE_ID] [--keyboard]
                            [--cover UPDATE_ID ...]
@@ -409,6 +431,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -4224,6 +4247,189 @@ def watchdog_sweep(store: JsonStateStore, *, now: float | None = None) -> dict:
         )
 
 
+def mark_wake_issued(store: JsonStateStore, token, *, now: float | None = None) -> dict:
+    """Stamp the wake-issue time on a claimed batch (see
+    ``queue_core.mark_wake_issued``). The intake hook calls this
+    immediately before issuing the wake for the batch; it never
+    sends anything and never wakes anyone. Returns ``{"ok": true,
+    "stamped": n}`` when n > 0, and ``{"ok": false, "stage":
+    "stale-token"}`` when the token owns no live batch (stale
+    token, or every item already replied / closed).
+    """
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        stamped = queue_core.mark_wake_issued(state, token, now=now)
+    if stamped == 0:
+        return {"ok": False, "stage": "stale-token"}
+    return {"ok": True, "stamped": stamped}
+
+
+#: P0 latency targets (seconds) from the latency synthesis
+#: (latency-synthesis-20261112.md): --latency-report compares each
+#: stage's measured p50 — and p90 for total — against these.
+LATENCY_TARGETS = {
+    "ack": {"p50": 10.0, "p90": None},
+    "pickup": {"p50": 10.0, "p90": None},
+    "wake": {"p50": 30.0, "p90": None},
+    "turn": {"p50": 120.0, "p90": None},
+    "total": {"p50": 180.0, "p90": 300.0},
+}
+
+#: Exact stage definitions for --latency-report. Each stage is a
+#: difference of two epoch timestamps recorded on the item, over
+#: the items that carry both endpoints; anything else contributes
+#: no sample (a claimed item whose turn never started has no wake
+#: sample — it is counted under recovery.wakes_without_turn
+#: instead — and an item closed without a reply has no turn or
+#: total sample). claim_to_wake is a diagnostic with no target:
+#: the hook-side delay between claim and wake issue (settle +
+#: decide), as opposed to wake, which is the runtime-side delay
+#: between the issued wake and the turn starting.
+LATENCY_STAGE_DEFINITIONS = {
+    "ack": "ack_sent_at - received_at, over items with an ack recorded",
+    "pickup": "claimed_at - received_at, over items ever claimed",
+    "wake": "turn_started_at - wake_issued_at, over items with a wake issued and a turn started",
+    "turn": "replied_at - turn_started_at, over items with a turn started and a reply recorded",
+    "total": "replied_at - received_at, over items with a reply recorded",
+    "claim_to_wake": "wake_issued_at - claimed_at, over items with a wake issued (diagnostic, no target)",
+}
+
+
+def _stage_summary(values: list) -> dict:
+    """Median/p90 of non-negative durations, or the
+    insufficient-data shape when there are no samples."""
+    if not values:
+        return {
+            "n": 0,
+            "p50": None,
+            "p90": None,
+            "status": "insufficient-data",
+        }
+    ordered = sorted(values)
+    return {
+        "n": len(ordered),
+        "p50": statistics.median(ordered),
+        "p90": ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)],
+        "status": "ok",
+    }
+
+
+def latency_report(state: dict, *, now: float | None = None) -> dict:
+    """Per-stage latency medians + recovery metrics, from the state.
+
+    Read-only: it never mutates the state (or the items). Stages
+    are defined in ``LATENCY_STAGE_DEFINITIONS`` and compared
+    against ``LATENCY_TARGETS``; a stage with no samples reports
+    ``"status": "insufficient-data"`` with null p50/p90 instead of
+    inventing a number, and ``"meets_target"`` is null there. A
+    sample with a negative duration (hand-edited or corrupt
+    timestamps) is dropped, never reported.
+
+    Recovery metrics are counts over the same items: ``recycles``
+    (total stale-claim recycle events), ``re_woken_items`` (items
+    woken more than once) and ``extra_wakes`` (wakes beyond the
+    first per item), ``wakes_without_turn`` (items with a wake
+    issued and no recorded turn start — the Issue 1 failure mode),
+    ``stuck_claims_now`` (claimed items recyclable right now under
+    the same rule the watchdog sweep uses), and
+    ``stuck_sending_now`` / ``stuck_sending`` (sending items past
+    ``STUCK_SENDING_SECONDS``, same rule as the watchdog sweep).
+    """
+    now = time.time() if now is None else now
+    items = state.get("queue", []) or []
+    samples: dict[str, list] = {
+        name: [] for name in LATENCY_STAGE_DEFINITIONS
+    }
+
+    def _sample(stage: str, start, end) -> None:
+        if isinstance(start, (int, float)) and isinstance(
+            end, (int, float)
+        ):
+            value = float(end) - float(start)
+            if value >= 0:
+                samples[stage].append(value)
+
+    recycles = 0
+    re_woken_items = 0
+    extra_wakes = 0
+    wakes_without_turn = 0
+    for item in items:
+        _sample("ack", item.get("received_at"), item.get("ack_sent_at"))
+        _sample("pickup", item.get("received_at"), item.get("claimed_at"))
+        _sample(
+            "wake", item.get("wake_issued_at"), item.get("turn_started_at")
+        )
+        _sample(
+            "turn", item.get("turn_started_at"), item.get("replied_at")
+        )
+        _sample("total", item.get("received_at"), item.get("replied_at"))
+        _sample(
+            "claim_to_wake",
+            item.get("claimed_at"),
+            item.get("wake_issued_at"),
+        )
+        recycles += item.get("recycle_count", 0) or 0
+        wake_count = item.get("wake_count", 0) or 0
+        if wake_count > 1:
+            re_woken_items += 1
+            extra_wakes += wake_count - 1
+        if (
+            isinstance(item.get("wake_issued_at"), (int, float))
+            and item.get("turn_started_at") is None
+        ):
+            wakes_without_turn += 1
+
+    stages = {}
+    for name, definition in LATENCY_STAGE_DEFINITIONS.items():
+        entry = _stage_summary(samples[name])
+        entry["definition"] = definition
+        target = LATENCY_TARGETS.get(name, {})
+        entry["target_p50"] = target.get("p50")
+        entry["target_p90"] = target.get("p90")
+        entry["meets_target"] = None
+        if entry["status"] == "ok" and (
+            entry["target_p50"] is not None
+            or entry["target_p90"] is not None
+        ):
+            meets = True
+            if entry["target_p50"] is not None:
+                meets = meets and entry["p50"] <= entry["target_p50"]
+            if entry["target_p90"] is not None:
+                meets = meets and entry["p90"] <= entry["target_p90"]
+            entry["meets_target"] = meets
+        stages[name] = entry
+
+    stuck_claims = queue_core.stale_claims(
+        state,
+        heartbeat_stale=_heartbeat_stale(),
+        active_heartbeat_stale=_active_heartbeat_stale(),
+        now=now,
+    )
+    stuck_sending = [
+        item["external_id"]
+        for item in items
+        if item["status"] == queue_core.SENDING
+        and (
+            not isinstance(item.get("sending_at"), (int, float))
+            or now - item["sending_at"] > queue_core.STUCK_SENDING_SECONDS
+        )
+    ]
+    return {
+        "ok": True,
+        "items": len(items),
+        "stages": stages,
+        "recovery": {
+            "recycles": recycles,
+            "re_woken_items": re_woken_items,
+            "extra_wakes": extra_wakes,
+            "wakes_without_turn": wakes_without_turn,
+            "stuck_claims_now": len(stuck_claims),
+            "stuck_sending_now": len(stuck_sending),
+            "stuck_sending": stuck_sending,
+        },
+    }
+
+
 def send_batch_and_close(
     store: JsonStateStore,
     target: int,
@@ -5133,6 +5339,23 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         print(json.dumps(heartbeat_batch(store, args[1])))
         return 0
 
+    if args[:1] == ["--wake-issued"]:
+        # --wake-issued CLAIM_TOKEN: stamp wake_issued_at on every
+        # claimed item under the token, immediately before the
+        # intake hook issues the wake for the batch. Prints
+        # {"ok": true, "stamped": n}, or {"ok": false, "stage":
+        # "stale-token"} when the token owns no live batch. Never
+        # sends anything; the hook calls it best-effort (|| true)
+        # so a stamp failure can never block the wake.
+        if len(args) != 2:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --wake-issued CLAIM_TOKEN",
+            }))
+            return 2
+        print(json.dumps(mark_wake_issued(store, args[1])))
+        return 0
+
     if args[:1] == ["--watchdog"]:
         # --watchdog: one watchdog pass — recycle claimed items
         # whose heartbeat went stale (a turn that died mid-work)
@@ -5154,6 +5377,23 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         except Exception as exc:
             print(json.dumps({"ok": False, "error": str(exc)[:200]}))
             return 1
+        return 0
+
+    if args[:1] == ["--latency-report"]:
+        # --latency-report: read-only per-stage latency medians
+        # (ack, pickup, wake, turn, total + the claim-to-wake
+        # diagnostic) with the P0 targets alongside, and recovery
+        # metrics (recycles, re-wakes, wakes whose turn never
+        # started, stuck claims / sends now). Stages with no
+        # samples report "insufficient-data" instead of a number.
+        # Never mutates state; prints one JSON object.
+        if len(args) != 1:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --latency-report",
+            }))
+            return 2
+        print(json.dumps(latency_report(store.load())))
         return 0
 
     if args[:1] == ["--claim-more"]:

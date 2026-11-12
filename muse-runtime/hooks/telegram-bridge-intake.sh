@@ -113,6 +113,14 @@ case "$action" in
     if [ -n "$typing_chat" ]; then
       "$TELEGRAM_BRIDGE_SEND_CMD" --typing "$typing_chat" >/dev/null 2>&1 || true
     fi
+    # Record when this wake is issued, so --latency-report can
+    # measure wake latency (wake issued -> turn started). The claim
+    # token comes from the payload; a stamp failure never blocks
+    # the wake.
+    claim_token=$(printf '%s' "$payload" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_token',''))")
+    if [ -n "$claim_token" ]; then
+      .venv/bin/python -m bridge_core.telegram --wake-issued "$claim_token" >/dev/null 2>&1 || true
+    fi
     wake "telegram-message" "$payload"
     ;;
   hold)

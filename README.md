@@ -49,13 +49,13 @@ What changed:
 - **Offset advances only after durable commit, plus receipt dedupe.** Updates are no longer consumed before they are safely queued, and a 24 hour receipt record stops redelivery from ever double-answering.
 - **Pre-claim noise filter.** Messages that are not for this bot (open group chatter, commands to other bots, non-mentions) are closed before claiming, so they never occupy a lane.
 - **Delivery ledger, message cache, prompt pin, deterministic recall.** New modules under `bridge_core/`: a SQLite delivery ledger replacing the old sending black hole, a disk-backed message cache with reply chains, a byte-stable prompt pin, and keyword recall with bounded summaries.
-- **Simulation harness.** `simulation/` replays scripted Telegram scenarios against the real queue and claim code with a fake Telegram and a fake agent turn, and reports duplicate sends and silent drops. 469 tests in `muse-runtime/tests/`.
+- **Simulation harness.** `simulation/` replays scripted Telegram scenarios against the real queue and claim code with a fake Telegram and a fake agent turn, and reports duplicate sends and silent drops. 492 tests in `muse-runtime/tests/`.
 
 What v2 does not do: no webhooks, no Redis or Postgres, no parallel turns in one lane, no hardcoded conversational answers, and no script that answers `/status` or `/who` for the agent. Speed comes from plumbing, not from taking the agent out of the loop.
 
 ## Measured latency (live test, test bot)
 
-Measured against a test bot with the author DMing it: cold first reply about 20 seconds, warm follow-ups about 15 to 25 seconds in rapid back-and-forth, 0 duplicate sends, 0 silent drops across the test. The 5 to 8 seconds you feel is the typing indicator to reply tail, not send to reply. The remaining cost is the intake poll plus settle, the hook wake, and a full inference pass per reply, which plumbing cannot shorten. A persistent-session design could go faster, but it needs a paired device per agent, so it is not this bridge.
+Measured against a test bot with the author DMing it: cold first reply about 20 seconds, warm follow-ups about 15 to 25 seconds in rapid back-and-forth, 0 duplicate sends, 0 silent drops across the test. The 5 to 8 seconds you feel is the typing indicator to reply tail, not send to reply. The remaining cost is the intake poll plus settle, the hook wake, and a full inference pass per reply, which plumbing cannot shorten. A persistent-session design could go faster, but it needs a paired device per agent, so it is not this bridge. To measure your own bridge, run `.venv/bin/python -m bridge_core.telegram --latency-report`: it reports per-stage medians (ack, pickup, wake, turn, total) against the P0 targets, plus recovery metrics, from the live state file.
 
 ## Install
 

@@ -73,8 +73,10 @@ Claim discipline (the rules that keep wake turns from double-answering):
   sweep likewise never expires an item while its ``wake_after`` is
   in the future: a delay must not turn into a silent drop.
 
-Every item records ``received_at``, ``claimed_at``, ``sending_at``
-and ``replied_at`` so intake latency can be measured end to end.
+Every item records ``received_at``, ``claimed_at``, ``wake_issued_at``
+(the epoch second the intake issued the wake for the batch — see
+``mark_wake_issued``), ``sending_at`` and ``replied_at`` so intake
+latency can be measured end to end.
 """
 from __future__ import annotations
 
@@ -416,6 +418,18 @@ def enqueue(
         # heartbeat/ack/claim-more proves it actually started. A
         # claim alone does not start the turn.
         "turn_started_at": None,
+        # Wake-issue stamp (P0 latency instrument): the epoch second
+        # the intake issued the wake for this claim (see
+        # ``mark_wake_issued``). None until the first wake; cleared
+        # when the claim recycles, so it always belongs to the live
+        # claim. ``wake_count`` counts every wake issued for the
+        # item across claims (a re-wake after a recycle counts
+        # again); ``recycle_count`` counts stale-claim recycles.
+        # Both counters survive a recycle — they are the recovery
+        # history ``--latency-report`` reads.
+        "wake_issued_at": None,
+        "wake_count": 0,
+        "recycle_count": 0,
         # True while the item was claimed by a warm hold (see
         # telegram._warm_hold): the baton guard recycles such a
         # claim fast when its turn never starts.
@@ -559,6 +573,11 @@ def _recycle_stale(
         # baton flag belongs to the dead claim, not the next one.
         item["turn_started_at"] = None
         item["warm_claimed"] = False
+        # The dead claim's wake stamp dies with it; the next claim
+        # is stamped by its own wake. The counters survive: the
+        # recycle itself is recovery history (see mark_wake_issued).
+        item["wake_issued_at"] = None
+        item["recycle_count"] = item.get("recycle_count", 0) + 1
         # A tentative ack reservation dies with the claim: the ack
         # never went out (no message id was recorded), so the next
         # turn may ack again. A completed ack (message id recorded)
@@ -802,9 +821,12 @@ def claim_batch(
         # A claim alone does not start the turn (turn_started_at
         # stays None until the first heartbeat/ack/claim-more),
         # and a fresh claim is not a warm claim unless the
-        # warm-hold caller marks it so afterwards.
+        # warm-hold caller marks it so afterwards. Likewise no
+        # wake has been issued for the fresh claim yet
+        # (wake_issued_at stays None until mark_wake_issued).
         item["turn_started_at"] = None
         item["warm_claimed"] = False
+        item["wake_issued_at"] = None
     return {"claim_token": token, "items": batch}
 
 
@@ -878,6 +900,8 @@ def claim_lane_batch(
         item["ever_claimed"] = True
         item["turn_started_at"] = None
         item["warm_claimed"] = False
+        # No wake issued for the fresh claim yet (see claim_batch).
+        item["wake_issued_at"] = None
     return {"claim_token": token, "items": batch}
 
 
@@ -1097,6 +1121,8 @@ def claim_ids(
         item["ever_claimed"] = True
         item["turn_started_at"] = None
         item["warm_claimed"] = False
+        # No wake issued for the fresh claim yet (see claim_batch).
+        item["wake_issued_at"] = None
     return {"claim_token": token, "items": batch}
 
 
@@ -1152,6 +1178,38 @@ def heartbeat_batch(state: dict, token, *, now: float | None = None) -> int:
             item["heartbeat_at"] = now
             refreshed += 1
     return refreshed
+
+
+def mark_wake_issued(state: dict, token, *, now: float | None = None) -> int:
+    """Stamp the wake-issue time on a claimed batch.
+
+    The intake hook calls this immediately before issuing the wake
+    for a claimed batch, so wake latency (wake issued -> turn
+    started) becomes measurable: ``wake_issued_at`` is the epoch
+    second the wake went out, and ``wake_count`` counts every wake
+    issued for the item — a re-wake after a recycle counts again,
+    so items with ``wake_count`` > 1 are the re-wakes
+    ``--latency-report`` counts. Only CLAIMED, unreplied items
+    under the caller's token are stamped: a stale token (recycled
+    batch) stamps nothing, and items claimed later into the same
+    turn (``claim_more``) carry no wake of their own — they joined
+    a live turn, so they contribute no wake sample. Returns how
+    many items were stamped (0 when the token owns no live batch).
+    """
+    if token is None:
+        return 0
+    now = _now(now)
+    stamped = 0
+    for item in state.get("queue", []):
+        if (
+            item["status"] == CLAIMED
+            and item.get("claim_token") == token
+            and item["replied_at"] is None
+        ):
+            item["wake_issued_at"] = now
+            item["wake_count"] = item.get("wake_count", 0) + 1
+            stamped += 1
+    return stamped
 
 
 def check_bridge_health(*, definitions_dir, bridge_home, send_cmd=None):
