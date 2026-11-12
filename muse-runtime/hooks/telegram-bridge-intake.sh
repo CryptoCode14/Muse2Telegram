@@ -5,8 +5,9 @@
 # Routing lives in telegram-bridge-decide.py (free-for-all + @mention):
 #   wake - a DM, a command, an @mention of this bot, or an open human
 #          message in the group with no @mention at all.
-#   hold - paused and no command; the payload is appended to held.jsonl
-#          for the resume turn to answer or close.
+#   hold - paused and no command; each item is held in the queue
+#          itself (wake_after +24h) for the resume turn to
+#          re-claim with --unhold and answer.
 #   done - nothing in the batch needs this Muse; close each item with
 #          no reply so it never wakes anyone.
 set -euo pipefail
@@ -39,7 +40,6 @@ if [ "$TELEGRAM_BRIDGE_BOT_USERNAME" = "YOUR_BOT_USERNAME" ]; then
 fi
 # export TELEGRAM_BRIDGE_BOT_ALIASES=""  # <-- optional: short names that also @mention this bot, comma-separated, no @ (e.g. "Example")
 export TELEGRAM_BRIDGE_PAUSED_PATH=~/workspace/telegram-bridge/PAUSED
-export TELEGRAM_BRIDGE_HELD_PATH=~/workspace/telegram-bridge/held.jsonl
 # Settle window (seconds): when a message lands, intake waits out
 # the rest of this window and re-fetches once, so a rapid follow-up
 # joins the same batch instead of becoming a second turn.
@@ -116,14 +116,29 @@ case "$action" in
     wake "telegram-message" "$payload"
     ;;
   hold)
-    printf '%s\n' "$payload" >> "$TELEGRAM_BRIDGE_HELD_PATH"
+    # Hold the batch in the queue itself (wake_after +24h), never
+    # in a side file: the queue is the store of record, and the
+    # resume turn re-claims the items with --unhold. The claim
+    # token comes from the payload; a hold that fails for one item
+    # (stale token) leaves the rest held.
+    claim_token=$(printf '%s' "$payload" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_token',''))")
+    ids=$(printf '%s' "$payload" | python3 -c "import json,sys; print(' '.join(str(it.get('update_id')) for it in json.load(sys.stdin).get('items',[]) if it.get('update_id') is not None))")
+    for update_id in $ids; do
+      .venv/bin/python -m bridge_core.telegram --hold "$update_id" "$claim_token" >/dev/null 2>&1 || true
+    done
     silent "telegram-held-while-paused"
     ;;
   done)
     claim_token=$(printf '%s' "$payload" | python3 -c "import json,sys; print(json.load(sys.stdin).get('claim_token',''))")
-    for update_id in ${decision#done }; do
-      .venv/bin/python -m bridge_core.telegram --done "$update_id" "$claim_token" >/dev/null 2>&1 || true
-    done
+    ids=${decision#done }
+    # Guard: a bare "done" (no ids — nothing woke and no item
+    # carried an update id) expands to the literal word "done";
+    # never pass it to --done as an update id.
+    if [ -n "$ids" ] && [ "$ids" != "done" ]; then
+      for update_id in $ids; do
+        .venv/bin/python -m bridge_core.telegram --done "$update_id" "$claim_token" >/dev/null 2>&1 || true
+      done
+    fi
     silent "telegram-not-for-me"
     ;;
   *)

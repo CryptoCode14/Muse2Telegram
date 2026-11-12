@@ -3,7 +3,8 @@
 
 Reads the intake payload JSON on stdin and prints one line:
   wake            - some item needs this Muse; the hook wakes an agent
-  hold            - paused and no command; the hook saves the payload
+  hold            - paused and no command; the hook holds the batch
+                    in the queue itself (wake_after +24h)
   done <ids...>   - nothing needs this Muse; the hook closes the batch
   empty           - no items in the payload
 
@@ -77,9 +78,10 @@ PAUSED_PATH = os.environ.get(
 )
 
 #: An "@username" mention anywhere in the text. Same pattern as the
-#: adapter's MENTION_RE ({3,}) so the two layers agree on what counts
-#: as addressing someone.
-MENTION_RE = re.compile(r"@[A-Za-z0-9_]{3,}")
+#: adapter's MENTION_RE (no length floor in either) so the two layers
+#: agree on what counts as addressing someone — a short alias mention
+#: (e.g. "@jo") is visible to both layers, never silently dropped.
+MENTION_RE = re.compile(r"@[A-Za-z0-9_]+")
 
 #: A command is the command word at the start, optionally followed by
 #: @BotName (Telegram appends it when a command is tapped in a group)

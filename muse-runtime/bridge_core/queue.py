@@ -123,10 +123,23 @@ RECEIPT_TTL_SECONDS = 86400.0
 #: under a warm hold (``warm_claimed``) but whose turn never sent
 #: its first heartbeat/ack/claim-more (``turn_started_at`` is None)
 #: is recycled once its heartbeat is older than this. The baton
-#: must not be held by a dead warm agent: 30 s is long enough for
-#: a live warm turn to heartbeat, short enough that a dead one
-#: frees the lane fast. See ``_recycle_stale``.
-WARM_BATON_TIMEOUT_SECONDS = 30.0
+#: must not be held by a dead warm agent: 120 s is long enough for
+#: a live warm turn to heartbeat (it reads MEMORY and context
+#: first), short enough that a dead one frees the lane fast. The
+#: heartbeat horizon is 600 s and a turn heartbeats every ~60 s,
+#: so the 120 s baton sits between the two: a warm turn that is
+#: alive but slow to start is never recycled, a dead one is gone
+#: in two minutes. See ``_recycle_stale``.
+WARM_BATON_TIMEOUT_SECONDS = 120.0
+
+#: Wake delay (seconds) applied to held items: when the bridge is
+#: paused, a held item's ``wake_after`` is set to now + this, so it
+#: stays unclaimable until the resume turn releases it — or, if
+#: nobody ever resumes, it self-heals and becomes claimable again
+#: on its own within a day. The queue itself is the store of
+#: record for held items (there is no held.jsonl any more); see
+#: ``hold_item`` / ``unhold_item`` / ``held_items``.
+HELD_WAKE_AFTER_SECONDS = 86400.0
 
 #: Default never-heartbeated recycle age (seconds) under the
 #: two-phase heartbeat rule (see ``_recycle_stale``): a claimed
@@ -173,6 +186,13 @@ HEALTH_WAKE_COOLDOWN_SECONDS = 600.0
 
 #: State key recording the last bridge-health wake (epoch seconds).
 LAST_HEALTH_WAKE_KEY = "last_health_wake"
+
+#: Age (seconds) past which a ``sending`` item counts as stuck:
+#: the send went out (or did not) over an hour ago and nobody
+#: reconciled it. The watchdog sweep surfaces these for an
+#: operator wake — it never touches them itself, because the send
+#: outcome is unknown and only evidence may close one.
+STUCK_SENDING_SECONDS = 3600.0
 
 #: The intake hook definition filenames the health check verifies,
 #: in order. The hook tool names a definition file after the hook
@@ -437,7 +457,7 @@ def _is_recyclable(
     1. Warm baton guard (v2): a claim held under a warm hold
        (``warm_claimed``) whose turn never started
        (``turn_started_at`` is None) is recycled once its
-       heartbeat is older than ``warm_baton_timeout`` (30 s).
+       heartbeat is older than ``warm_baton_timeout`` (120 s).
        ``claimed_at`` alone never triggers this — only the
        heartbeat age, which is the baton proof of life.
     2. Two-phase heartbeat (Argon, corrected) when
@@ -539,6 +559,13 @@ def _recycle_stale(
         # baton flag belongs to the dead claim, not the next one.
         item["turn_started_at"] = None
         item["warm_claimed"] = False
+        # A tentative ack reservation dies with the claim: the ack
+        # never went out (no message id was recorded), so the next
+        # turn may ack again. A completed ack (message id recorded)
+        # survives the recycle — the ack went out, and re-acking
+        # would send it twice.
+        if item.get("ack_message_id") is None:
+            item["ack_sent_at"] = None
         # ever_claimed deliberately survives the recycle: the
         # claim history is what keeps a recycled item out of the
         # first-pending expiry sweep on every later poll.
@@ -921,6 +948,158 @@ def claim_more(
     return {"claim_token": token, "items": batch}
 
 
+def hold_item(
+    state: dict,
+    platform: str,
+    external_id,
+    token=None,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Hold one item for the resume turn, in the queue itself.
+
+    Sets ``wake_after`` to now + ``HELD_WAKE_AFTER_SECONDS`` (24 h)
+    and marks the item ``held``. The queue is the store of record:
+    there is no held.jsonl any more, and dedupe by update id falls
+    out of the queue / receipts (an update is enqueued once, and
+    its receipt stops a re-delivery from re-enqueueing it), so a
+    held update can never be held twice.
+
+    The claim is deliberately left intact: the item stays claimed
+    under its token until the normal 600 s heartbeat horizon
+    recycles it to pending, and the ``wake_after`` keeps the
+    recycled item unclaimable until the resume (or the 24 h bound,
+    when it self-heals). The old token is dead by design once that
+    horizon passes — the resume turn must re-claim (``--unhold``)
+    and never ``--reply`` with a held token.
+
+    Only pending or claimed items can be held, and never one with
+    a recorded reply. A claimed item requires its token to match.
+    Returns True when the item was held.
+    """
+    ensure_state(state)
+    item = find_item(state, platform, external_id)
+    if item is None:
+        return False
+    if item["status"] not in (PENDING, CLAIMED):
+        return False
+    if item["replied_at"] is not None:
+        return False
+    if item["status"] == CLAIMED:
+        if token is None or item.get("claim_token") != token:
+            return False
+    item["wake_after"] = _now(now) + HELD_WAKE_AFTER_SECONDS
+    item["held"] = True
+    return True
+
+
+def unhold_item(state: dict, platform: str, external_id) -> bool:
+    """Release one held item: clear its ``wake_after`` and its
+    held flag, so the next claim takes it normally. The item keeps
+    whatever status it had (usually pending after its claim
+    recycled); the caller re-claims it (see ``claim_ids``). Only
+    an item actually marked held can be unheld — clearing a
+    throttle ``wake_after`` by mistake would defeat the delay.
+    Returns True when a held item was released.
+    """
+    ensure_state(state)
+    item = find_item(state, platform, external_id)
+    if item is None or not item.get("held"):
+        return False
+    item["wake_after"] = None
+    item.pop("held", None)
+    return True
+
+
+def held_items(state: dict, platform: str | None = None) -> list:
+    """Held items, in queue order (the resume turn's --held list).
+
+    An item counts as held only while its ``held`` flag is set;
+    a throttle ``wake_after`` alone does not make an item held.
+    """
+    ensure_state(state)
+    return [
+        item
+        for item in state.get("queue", [])
+        if item.get("held")
+        and (platform is None or item["platform"] == platform)
+    ]
+
+
+def claim_ids(
+    state: dict,
+    *,
+    platform: str,
+    external_ids,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    now: float | None = None,
+) -> dict | None:
+    """Claim specific pending items by external id, under one token.
+
+    The resume path: after ``--unhold`` clears the holds, the
+    named items are re-claimed here — in the same transaction as
+    the clear, so the intake hook cannot claim them first. Only
+    pending, unreplied items are claimable, and only in one lane:
+    the batch takes the lane of the first claimable named item
+    (like ``claim_batch`` takes the first eligible lane), and any
+    named item in another lane, or in a lane with a batch already
+    in flight, is left pending for the intake's next poll. A
+    one-lane batch is what ``--reply`` needs — a split batch
+    would fail its fence.
+
+    Returns ``{"claim_token": token, "items": [...]}`` or None
+    when nothing named was claimable.
+    """
+    ensure_state(state)
+    now = _now(now)
+    wanted = [str(eid) for eid in external_ids]
+    candidates = [
+        item
+        for item in state.get("queue", [])
+        if item["platform"] == platform
+        and str(item["external_id"]) in wanted
+        and item["status"] == PENDING
+        and item["replied_at"] is None
+        and (item.get("wake_after") is None or item["wake_after"] <= now)
+    ]
+    candidates.sort(key=lambda item: item["received_at"])
+    if not candidates:
+        return None
+    busy_lanes = {
+        (item["platform"], item["chat_id"])
+        for item in state["queue"]
+        if item["status"] in IN_FLIGHT
+    }
+    lane = None
+    for item in candidates:
+        candidate = (item["platform"], item["chat_id"])
+        if candidate in busy_lanes:
+            continue
+        if warm_lease_active(state, item["chat_id"], now):
+            continue
+        lane = candidate
+        break
+    if lane is None:
+        return None
+    batch = [
+        item
+        for item in candidates
+        if (item["platform"], item["chat_id"]) == lane
+    ][:batch_size]
+    if not batch:
+        return None
+    token = secrets.token_hex(8)
+    for item in batch:
+        item["status"] = CLAIMED
+        item["claimed_at"] = now
+        item["claim_token"] = token
+        item["heartbeat_at"] = now
+        item["ever_claimed"] = True
+        item["turn_started_at"] = None
+        item["warm_claimed"] = False
+    return {"claim_token": token, "items": batch}
+
+
 def heartbeat(
     state: dict, platform: str, external_id, token, *, now: float | None = None
 ) -> bool:
@@ -1170,8 +1349,19 @@ def watchdog_sweep(
     are None and nothing wakes: an unchecked install is reported
     as unchecked, never as healthy.
 
+    The sweep also surfaces items stuck in ``sending`` past
+    ``STUCK_SENDING_SECONDS`` (about an hour) as
+    ``stuck_sending`` (external ids, in queue order): a send
+    whose outcome was never reconciled. It never touches them —
+    only an operator with send evidence may close one — but the
+    watchdog hook wakes an agent for them, so a stuck send does
+    not sit unnoticed. An item with no recorded ``sending_at``
+    (legacy or hand-edited state) counts as stuck: it cannot be
+    shown to be fresh.
+
     Returns ``{"recycled": [external_id, ...], "pending": n,
-    "claimed_live": n, "sending": n, "intake_age_seconds": age
+    "claimed_live": n, "sending": n, "stuck_sending":
+    [external_id, ...], "intake_age_seconds": age
     | None, "intake_stale": bool, "intake_wake": bool,
     "intake_recovered": bool, "health": health | None,
     "health_ok": bool | None, "health_wake": bool,
@@ -1243,11 +1433,21 @@ def watchdog_sweep(
             else:
                 health_wake = False
     counts_now = counts(state)
+    stuck_sending = [
+        item["external_id"]
+        for item in state.get("queue", [])
+        if item["status"] == SENDING
+        and (
+            not isinstance(item.get("sending_at"), (int, float))
+            or now - item["sending_at"] > STUCK_SENDING_SECONDS
+        )
+    ]
     return {
         "recycled": [item["external_id"] for item in recycled],
         "pending": counts_now[PENDING],
         "claimed_live": counts_now[CLAIMED],
         "sending": counts_now[SENDING],
+        "stuck_sending": stuck_sending,
         "intake_age_seconds": intake_age,
         "intake_stale": intake_stale,
         "intake_wake": intake_wake,
@@ -1325,6 +1525,36 @@ def mark_send_failed(
     item["claimed_at"] = None
     item["claim_token"] = None
     item["sending_at"] = None
+    return True
+
+
+def mark_send_retryable(
+    state: dict,
+    platform: str,
+    external_id,
+    token,
+    wake_after: float | None,
+) -> bool:
+    """Return a ``sending`` item to pending after a RETRYABLE send
+    failure (the platform throttled or errored: 429/5xx — the send
+    provably did not go through, but may succeed later).
+
+    Like ``mark_send_failed`` (definitive rejection), but the item
+    also carries ``wake_after``: it is not claimable before then,
+    so the next poll does not immediately re-send into the same
+    throttle. Refused when a reply is recorded (``replied_at``
+    set), exactly like ``mark_send_failed``.
+    """
+    item = _owned_item(state, platform, external_id, token, (SENDING,))
+    if item is None:
+        return False
+    if item["replied_at"] is not None:
+        return False
+    item["status"] = PENDING
+    item["claimed_at"] = None
+    item["claim_token"] = None
+    item["sending_at"] = None
+    item["wake_after"] = wake_after
     return True
 
 
@@ -1437,17 +1667,20 @@ def mark_ack(
 
     Refused when the item is not claimed under the caller's token,
     when a full reply is already recorded (``replied_at`` set — no
-    ack is needed after the answer), or when an ack is already
-    recorded (``ack_sent_at`` set — one ack per item, never a second).
-    Uses ``.get`` for the ack fields so items enqueued before the
-    ack fields existed still work.
+    ack is needed after the answer), or when a COMPLETED ack is
+    already recorded (``ack_message_id`` set — one ack per item,
+    never a second). A TENTATIVE reservation (``ack_sent_at`` set
+    by ``reserve_ack`` with no message id yet) does NOT refuse:
+    completing it is exactly what this call does. Uses ``.get``
+    for the ack fields so items enqueued before the ack fields
+    existed still work.
     """
     item = _owned_item(state, platform, external_id, token, (CLAIMED,))
     if item is None:
         return False
     if item["replied_at"] is not None:
         return False
-    if item.get("ack_sent_at") is not None:
+    if item.get("ack_message_id") is not None:
         return False
     item["ack_sent_at"] = _now(now)
     item["ack_message_id"] = str(message_id)
@@ -1458,6 +1691,61 @@ def mark_ack(
     if item.get("turn_started_at") is None:
         item["turn_started_at"] = _now(now)
     item["heartbeat_at"] = _now(now)
+    return True
+
+
+def reserve_ack(
+    state: dict,
+    platform: str,
+    external_id,
+    token,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Reserve the ack inside the send transaction, before sending.
+
+    Sets ``ack_sent_at`` with NO message id: a tentative
+    reservation that stops a second concurrent ack from sending
+    (``send_ack`` maps it to "already-acked") without claiming the
+    ack went out. The reservation is completed by ``mark_ack``
+    after a successful send, or cleared by ``clear_ack`` when the
+    send is rejected, retryable, or unknown, so a retry is safe.
+
+    Refused when the item is not claimed under the caller's token,
+    when a full reply is already recorded, or when any ack is
+    already recorded — tentative or completed (a reservation is
+    not re-reservable). Returns True when the reservation was set.
+    """
+    item = _owned_item(state, platform, external_id, token, (CLAIMED,))
+    if item is None:
+        return False
+    if item["replied_at"] is not None:
+        return False
+    if item.get("ack_sent_at") is not None:
+        return False
+    if item.get("ack_message_id") is not None:
+        return False
+    item["ack_sent_at"] = _now(now)
+    return True
+
+
+def clear_ack(state: dict, platform: str, external_id, token) -> bool:
+    """Clear a tentative ack reservation (the send did not go out).
+
+    Token-checked, and refused when a message id was ever recorded:
+    a completed ack is proof the ack went out and must never be
+    un-recorded. Only ``ack_sent_at`` is cleared; a reservation
+    that never existed is a no-op success (False only when the
+    item is not claimed under the token or a completed ack
+    exists). Returns True when the reservation was cleared (or
+    there was none to clear on an owned, un-acked item).
+    """
+    item = _owned_item(state, platform, external_id, token, (CLAIMED,))
+    if item is None:
+        return False
+    if item.get("ack_message_id") is not None:
+        return False
+    item["ack_sent_at"] = None
     return True
 
 

@@ -86,6 +86,43 @@ class TelegramSendUnknownTests(unittest.TestCase):
         self.assertEqual(outcome, ("sent", "61"))
         self.assertNotIn("send-unknown", err)
 
+    def test_exit_2_reports_rejected_and_logs_it(self):
+        # B1: the three-way contract — exit 2 is a definitive
+        # rejection, not an unknown.
+        outcome, err = self.run_sender(
+            subprocess.CompletedProcess(
+                args=["sender"], returncode=2,
+                stdout="", stderr="telegram rejected: telegram HTTP 403\n",
+            )
+        )
+        self.assertEqual(outcome, ("rejected", None))
+        self.assertIn("send-rejected", err)
+
+    def test_exit_3_reports_retryable_with_retry_after(self):
+        # B1: exit 3 is retryable; the Retry-After rides on the
+        # result so the caller can delay the re-claim.
+        outcome, err = self.run_sender(
+            subprocess.CompletedProcess(
+                args=["sender"], returncode=3,
+                stdout="",
+                stderr="telegram HTTP 429 retry-after=120\n",
+            )
+        )
+        self.assertEqual(outcome, ("retryable", None))
+        self.assertEqual(getattr(outcome, "retry_after", None), 120)
+        self.assertIn("send-retryable", err)
+
+    def test_exit_3_without_retry_after_reports_retryable(self):
+        outcome, err = self.run_sender(
+            subprocess.CompletedProcess(
+                args=["sender"], returncode=3,
+                stdout="", stderr="telegram HTTP 500\n",
+            )
+        )
+        self.assertEqual(outcome, ("retryable", None))
+        self.assertIsNone(getattr(outcome, "retry_after", None))
+        self.assertIn("send-retryable", err)
+
     def test_sender_stderr_is_truncated_in_log(self):
         outcome, err = self.run_sender(
             subprocess.CompletedProcess(

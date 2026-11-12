@@ -22,6 +22,10 @@ pytest — the suite is `unittest`):
 
 ```bash
 cd <repo root>
+# The bridge fails loud without a bot username (Job 1 template
+# fix), so the runner needs one in the environment — any value
+# works for the fake harness:
+export TELEGRAM_BRIDGE_BOT_USERNAME=ExampleBot
 muse-runtime/.venv/bin/python simulation/run_scenario.py --list
 muse-runtime/.venv/bin/python simulation/run_scenario.py --scenario single-dm-reply --mode v2
 muse-runtime/.venv/bin/python simulation/run_scenario.py --scenario all --mode baseline
@@ -49,7 +53,7 @@ code under test is whatever is in the repo at run time.
 | `send-unknown-not-delivered` | Sender reports unknown, nothing sent; item returns to pending, re-wake sends exactly once. |
 | `sibling-single-send` | Batch of 3, turn answers only the first; expects siblings closed as DONE not replied when auto-cover is on, else reports orphans. |
 | `quick-to-deep-escalation` | Quick turn, then a deep follow-up; expects a tier-escalation / re-hydration hint in the wake payload. |
-| `warm-claim-no-heartbeat` | Warm-claimed batch, no heartbeat; v2 recycle target ~30 s. |
+| `warm-claim-no-heartbeat` | Warm-claimed batch, no heartbeat; v2 recycle target ~120 s. |
 | `kill-9-mid-send` | Worker subprocess SIGKILLed mid-send; restart on the same state dir; recovery without a duplicate. |
 
 Every result has: `duplicate_sends`, `silent_drops`,
@@ -60,7 +64,7 @@ Every result has: `duplicate_sends`, `silent_drops`,
 ## Models and assumptions (read before quoting numbers)
 
 - **Time is simulated.** The fake clock is advanced explicitly;
-  recovery times (30/600 s) cost milliseconds of wall time.
+  recovery times (120/600 s) cost milliseconds of wall time.
   Modelled latencies: wake 0.5 s, quick work 2.0 s, deep work
   30.0 s, re-wake 0.5 s. Only `kill-9-mid-send` recovery_time is
   wall seconds (kill to reconcile).

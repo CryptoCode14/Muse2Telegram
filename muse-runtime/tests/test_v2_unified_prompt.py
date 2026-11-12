@@ -150,7 +150,7 @@ class UnifiedPromptTests(unittest.TestCase):
     def test_unified_prompt_carries_mention_rule(self):
         text = PROMPT.read_text()
         for phrase in (
-            "carries that bot's @mention",
+            "the bridge wakes a bot only when the incoming message @mentions it",
             "exactly as it appears in the group buffer",
             "carries no @mention",
             "Once a question is answered",
@@ -373,6 +373,23 @@ class DeciderOutputTests(unittest.TestCase):
             self._item(1, "@Example check this", chat_type="group",
                        sender_id=222)]}, aliases="Example")
         self.assertEqual(out, "wake")
+
+    def test_at_short_alias_wakes(self):
+        # m5: the decider's mention regex has no length floor, so
+        # a 2-char alias wakes just like a long one. With the old
+        # {3,} floor "@jo" was invisible and this closed.
+        out = run_decider({"items": [
+            self._item(1, "@jo check this", chat_type="group",
+                       sender_id=222)]}, aliases="jo")
+        self.assertEqual(out, "wake")
+
+    def test_short_alias_mention_is_seen_by_has_any_mention(self):
+        # m5: has_any_mention agrees with the adapter's MENTION_RE
+        # (no floor in either) — a short alias mention counts.
+        decider = load_decider()
+        self.assertTrue(decider.has_any_mention("@jo check this"))
+        self.assertTrue(decider.has_any_mention("@ExampleBot hi"))
+        self.assertFalse(decider.has_any_mention("no mention here"))
 
     def test_at_unaliased_short_name_still_closes(self):
         # No aliases configured: "@Example" mentions someone else,

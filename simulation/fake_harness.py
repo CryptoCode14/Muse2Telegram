@@ -19,7 +19,7 @@ What is NOT real here (and is labelled wherever it matters):
 the Muse model turn itself (no LLM runs; the reply text is canned),
 the hook harness process (``FakeHarness`` just records wake
 receipts), and wall-clock time (``FakeClock`` — scenarios advance
-it explicitly, so a "180 s recycle" is measured in simulated
+it explicitly, so a "600 s recycle" is measured in simulated
 seconds, never by sleeping).
 
 No network, no real token, no live state: every run uses
@@ -67,7 +67,7 @@ class FakeClock:
     """A manually advanced clock; ``now()`` replaces time.time().
 
     Scenarios advance this instead of sleeping, so recovery times
-    (30 s / 180 s / 600 s) are measured in simulated seconds.
+    (120 s / 600 s / 600 s) are measured in simulated seconds.
     """
 
     def __init__(self, start=CLOCK_START):
@@ -243,7 +243,7 @@ def detect_features():
         feats["warm_lease"] and tg_src.count("set_warm_lease(") > 0)
     feats["warm_baton_timeout_seconds"] = getattr(
         queue_core, "WARM_BATON_TIMEOUT_SECONDS", None)
-    # Two-phase heartbeat: 180 s never-started recycle (Argon,
+    # Two-phase heartbeat: 600 s never-started recycle (Argon,
     # corrected). Machinery = the constant + _is_recyclable support;
     # wired = run_once / watchdog_sweep pass active_heartbeat_stale.
     feats["two_phase_machinery"] = hasattr(
@@ -253,20 +253,13 @@ def detect_features():
     feats["two_phase_wired"] = (
         "active_heartbeat_stale=" in _source_of(telegram.run_once)
         or "active_heartbeat_stale=" in _source_of(telegram.watchdog_sweep))
-    # Delivery ledger (v2 design): a bridge_core.ledger module or a
-    # delivery_obligations table/key.
-    try:
-        import importlib
-        importlib.import_module("bridge_core.delivery_ledger")
-        feats["delivery_ledger"] = True
-    except Exception:
-        feats["delivery_ledger"] = hasattr(
-            telegram, "delivery_ledger") or hasattr(
-            queue_core, "delivery_ledger")
-    feats["delivery_ledger_wired"] = (
-        feats["delivery_ledger"]
-        and ("record_obligation" in tg_src
-             or "DeliveryLedger(" in tg_src))
+    # Delivery ledger (v2 design): DELETED as dead code in the
+    # round-2 redo — bridge_core/delivery_ledger.py never had a
+    # live caller (the queue fence already stops duplicates), so
+    # the flags are False explicitly and scenarios that would have
+    # used it degrade instead of failing hard.
+    feats["delivery_ledger"] = False
+    feats["delivery_ledger_wired"] = False
     # Sibling auto-cover: siblings closed as DONE (not replied) when
     # a batch reply goes out, without an explicit --cover list.
     # (The baseline's explicit --cover via send_batch_and_close is
@@ -494,7 +487,7 @@ class FakeTurn:
     def stale_claims_probe(self, now=None, **kwargs):
         """Read-only: what queue.stale_claims would recycle right now.
 
-        Used to probe UNWIRED machinery (e.g. the two-phase 180 s
+        Used to probe UNWIRED machinery (e.g. the two-phase 600 s
         rule) without changing what the wired watchdog does.
         """
         now = self.clock.now() if now is None else now

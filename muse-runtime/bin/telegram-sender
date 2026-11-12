@@ -15,6 +15,26 @@ Contract (from bridge_core/telegram.py):
       at most 10MB. Same exit contract as the text send.
   telegram-sender --document <chat_id> <file_path> [--reply-to <id>] [--keyboard]
       send a file (sendDocument), same shape as --photo, at most 50MB.
+
+  Exit codes (the three-way sender contract, so the bridge can tell
+  a definitive rejection from a retryable one instead of collapsing
+  both to "unknown"):
+    0  sent: the message id is the last nonempty stdout line.
+    2  definitive rejection: Telegram answered 400/403/404, so the
+       send provably did not go out. The bridge returns the item to
+       pending and it may be sent again.
+    3  retryable: Telegram answered 429 or 5xx, so the send did not
+       go out but may succeed later. The bridge returns the item to
+       pending with a wake_after delay. On 429 the sender prints
+       "telegram HTTP 429 retry-after=N" to stderr (N is the raw
+       Retry-After seconds, when Telegram sent one).
+    1  unknown: credential failure, transport failure, timeout, or
+       any other failure — the send may or may not have gone out, so
+       the bridge never resends blindly.
+  A usage error (bad arguments, bad text/caption length) also exits
+  2: the send was never attempted, so it is provably not delivered
+  too. The bridge validates its arguments first, so a usage error
+  from a bridge call means a bridge bug, not a Telegram rejection.
   telegram-sender --typing <chat_id>  show "typing..." in the chat
       (sendChatAction). Free, costs no tokens. Expires after 5
       seconds, so re-run it every few seconds during a long turn.
@@ -54,6 +74,7 @@ import os
 import re
 import secrets
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -121,6 +142,106 @@ def _post(method, payload):
         return json.loads(response.read().decode("utf-8"))
 
 
+class DefinitiveSendError(Exception):
+    """Telegram provably rejected the send (400/403/404, or a 200
+    with ok:false): the message did not go out. Maps to exit 2.
+    ``code`` is the HTTP status, or None for a 200 ok:false."""
+
+    def __init__(self, code):
+        if code is None:
+            super().__init__("telegram API returned ok:false")
+        else:
+            super().__init__(f"telegram HTTP {code}")
+        self.code = code
+
+
+class RetryableSendError(Exception):
+    """Telegram throttled or errored (429, or 5xx): the send did
+    not go out but may succeed later. Maps to exit 3.
+    ``retry_after`` is the raw Retry-After seconds Telegram sent
+    (429 only), or None when it sent none (5xx)."""
+
+    def __init__(self, code, retry_after=None):
+        super().__init__(f"telegram HTTP {code}")
+        self.code = code
+        self.retry_after = retry_after
+
+
+class _TryNextVariant(Exception):
+    """One format variant got a 400: try the next variant."""
+
+
+def _retry_after_value(exc):
+    """Raw Retry-After seconds from an HTTPError, or None when
+    Telegram sent none or it is not a number."""
+    try:
+        headers = exc.headers
+        raw = headers.get("Retry-After") if headers is not None else None
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _retry_after_wait_seconds(exc):
+    """Seconds to sleep before the one 429 retry: min(Retry-After,
+    60). Zero when Telegram sent no usable Retry-After (retry at
+    once). Capped at 60 s so the sleep plus the retry still fits
+    the bridge's 200 s sender timeout."""
+    value = _retry_after_value(exc)
+    if value is None:
+        return 0
+    return min(value, 60)
+
+
+def _map_send_error(exc):
+    """Map an HTTPError from a send attempt to the control
+    exception the variant loop handles: 400 -> try the next
+    variant, 403/404 -> definitive, 429/5xx -> retryable.
+    Any other HTTP error is returned as-is to be re-raised."""
+    if exc.code == 400:
+        return _TryNextVariant()
+    if exc.code in (403, 404):
+        return DefinitiveSendError(exc.code)
+    if exc.code == 429:
+        return RetryableSendError(429, _retry_after_value(exc))
+    if 500 <= exc.code < 600:
+        return RetryableSendError(exc.code)
+    return exc
+
+
+def _post_with_429_retry(post_fn, retry_state):
+    """Call post_fn() (one Bot API POST), honouring one 429 retry.
+
+    Returns the decoded body. Raises _TryNextVariant on 400,
+    DefinitiveSendError on 403/404, RetryableSendError on 429
+    (after the one retry) or 5xx; any other HTTP or transport
+    error propagates. ``retry_state`` is a per-send dict carrying
+    "retried_429": the sleep + retry happens at most once per
+    send call (not once per format variant), so the worst case —
+    three 30 s text calls plus one 60 s sleep plus one 30 s retry
+    — still fits the bridge's 200 s sender timeout.
+    """
+    try:
+        return post_fn()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429 and not retry_state.get("retried_429"):
+            retry_state["retried_429"] = True
+            wait = _retry_after_wait_seconds(exc)
+            if wait:
+                time.sleep(wait)
+            try:
+                return post_fn()
+            except urllib.error.HTTPError as exc2:
+                raise _map_send_error(exc2)
+        raise _map_send_error(exc)
+
+
 #: Formatting tags the agent may use in a reply. Everything else
 #: that looks like markup is escaped, so it can never break the send.
 _TAG_RE = re.compile(r"<(/?)(b|i|u|s|code|pre)>", re.IGNORECASE)
@@ -173,12 +294,19 @@ def _command_keyboard():
 
 
 def send_message(chat_id, text, reply_to=None, keyboard=False):
-    """Send one message. Returns the Telegram message_id, or None when
-    Telegram rejected it (the error is printed to stderr).
+    """Send one message. Returns the Telegram message_id.
 
-    Attempts, in order (only a 400 is retried — a definitive
-    rejection, so the send provably did not go out; any other failure
-    may mean it did, so it is never retried):
+    Raises DefinitiveSendError when Telegram rejected it (all
+    variants 400, or 403/404, or a 200 with ok:false — provably
+    not delivered) and RetryableSendError on 429 (after one
+    Retry-After wait + retry) or 5xx. Any other failure
+    (transport, timeout, a 200 ok:true with no message_id)
+    propagates, so the caller reports it as unknown — the send
+    may have gone out.
+
+    Attempts, in order (only a 400 is retried across variants — a
+    definitive rejection, so the send provably did not go out; any
+    other failure may mean it did, so it is never retried):
       1. HTML (sanitized) + reply threading + keyboard.
       2. Plain text + reply threading + keyboard.
       3. Plain text, no threading (the reply target may be gone).
@@ -206,26 +334,28 @@ def send_message(chat_id, text, reply_to=None, keyboard=False):
         if key not in seen:
             seen.add(key)
             unique.append(payload)
+    retry_state = {"retried_429": False}
     for payload in unique:
         try:
-            body = _post("sendMessage", payload)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 400:
-                continue
-            raise
+            body = _post_with_429_retry(
+                lambda payload=payload: _post("sendMessage", payload),
+                retry_state,
+            )
+        except _TryNextVariant:
+            continue
         if not body.get("ok"):
             print(
                 f"telegram error: {body.get('description', 'unknown')}",
                 file=sys.stderr,
             )
-            return None
+            raise DefinitiveSendError(None)
         message_id = body.get("result", {}).get("message_id")
         if message_id is None:
             print("telegram response had no message_id", file=sys.stderr)
             return None
         return message_id
     print("telegram error: all send attempts rejected (400)", file=sys.stderr)
-    return None
+    raise DefinitiveSendError(400)
 
 
 def _post_multipart(method, fields, file_field, filename, data, content_type):
@@ -278,14 +408,17 @@ MAX_CAPTION_CHARS = 1024
 
 def _send_media(method, file_field, chat_id, path, caption="",
                 reply_to=None, keyboard=False, max_bytes=MAX_DOCUMENT_BYTES):
-    """Send one photo or document. Returns the Telegram message_id,
-    or None when Telegram rejected it (the error is printed to
-    stderr).
+    """Send one photo or document. Returns the Telegram message_id.
+
+    Raises DefinitiveSendError / RetryableSendError exactly like
+    ``send_message`` (see there): a 400 is retried across format
+    variants, 403/404 and ok:false are definitive, 429 gets one
+    Retry-After wait + retry and then is retryable, 5xx is
+    retryable. Any other failure propagates (unknown — the send
+    may have gone out).
 
     The file is read once and sent with the same retry chain as a
-    text send (only a 400 is retried — a definitive rejection, so
-    the send provably did not go out; any other failure may mean
-    it did, so it is never retried):
+    text send:
       1. HTML caption (sanitized) + reply threading + keyboard.
       2. Plain caption + reply threading + keyboard.
       3. Plain caption, no threading (the reply target may be gone).
@@ -340,32 +473,36 @@ def _send_media(method, file_field, chat_id, path, caption="",
         if key not in seen:
             seen.add(key)
             unique.append(fields)
+    retry_state = {"retried_429": False}
     for fields in unique:
         try:
-            body = _post_multipart(
-                method, fields, file_field, filename, data, content_type
+            body = _post_with_429_retry(
+                lambda fields=fields: _post_multipart(
+                    method, fields, file_field, filename, data, content_type
+                ),
+                retry_state,
             )
-        except urllib.error.HTTPError as exc:
-            if exc.code == 400:
-                continue
-            raise
+        except _TryNextVariant:
+            continue
         if not body.get("ok"):
             print(
                 f"telegram error: {body.get('description', 'unknown')}",
                 file=sys.stderr,
             )
-            return None
+            raise DefinitiveSendError(None)
         message_id = body.get("result", {}).get("message_id")
         if message_id is None:
             print("telegram response had no message_id", file=sys.stderr)
             return None
         return message_id
     print("telegram error: all send attempts rejected (400)", file=sys.stderr)
-    return None
+    raise DefinitiveSendError(400)
 
 
 def send_photo(chat_id, path, caption="", reply_to=None, keyboard=False):
-    """Send a photo (sendPhoto). Returns the Telegram message_id or None."""
+    """Send a photo (sendPhoto). Returns the Telegram message_id;
+    raises DefinitiveSendError / RetryableSendError on a
+    definitive / retryable rejection (see send_message)."""
     return _send_media(
         "sendPhoto", "photo", chat_id, path, caption=caption,
         reply_to=reply_to, keyboard=keyboard, max_bytes=MAX_PHOTO_BYTES,
@@ -373,7 +510,9 @@ def send_photo(chat_id, path, caption="", reply_to=None, keyboard=False):
 
 
 def send_document(chat_id, path, caption="", reply_to=None, keyboard=False):
-    """Send a file (sendDocument). Returns the Telegram message_id or None."""
+    """Send a file (sendDocument). Returns the Telegram message_id;
+    raises DefinitiveSendError / RetryableSendError on a
+    definitive / retryable rejection (see send_message)."""
     return _send_media(
         "sendDocument", "document", chat_id, path, caption=caption,
         reply_to=reply_to, keyboard=keyboard, max_bytes=MAX_DOCUMENT_BYTES,
@@ -522,6 +661,16 @@ def main() -> int:
                 chat_id, file_path, caption=caption,
                 reply_to=reply_to, keyboard=keyboard,
             )
+        except DefinitiveSendError as exc:
+            print(f"telegram rejected: {exc}", file=sys.stderr)
+            return 2
+        except RetryableSendError as exc:
+            if exc.retry_after is not None:
+                print(f"telegram HTTP {exc.code} "
+                      f"retry-after={exc.retry_after}", file=sys.stderr)
+            else:
+                print(f"telegram HTTP {exc.code}", file=sys.stderr)
+            return 3
         except DynamicCredentialError as exc:
             print(f"credential unavailable: {exc}", file=sys.stderr)
             return 1
@@ -572,6 +721,16 @@ def main() -> int:
         return 2
     try:
         message_id = send_message(chat_id, text, reply_to=reply_to, keyboard=keyboard)
+    except DefinitiveSendError as exc:
+        print(f"telegram rejected: {exc}", file=sys.stderr)
+        return 2
+    except RetryableSendError as exc:
+        if exc.retry_after is not None:
+            print(f"telegram HTTP {exc.code} "
+                  f"retry-after={exc.retry_after}", file=sys.stderr)
+        else:
+            print(f"telegram HTTP {exc.code}", file=sys.stderr)
+        return 3
     except DynamicCredentialError as exc:
         print(f"credential unavailable: {exc}", file=sys.stderr)
         return 1

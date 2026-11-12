@@ -574,9 +574,12 @@ class ReplyUnknownSendTests(ReplyTestBase):
         calls = self.call_log()
         self.assertEqual(calls.count("stdin="), 1)
         # The primary went to "sending" for reconciliation; the
-        # sibling stays claimed; neither is recorded as replied.
+        # sibling was reserved "sending" with it before the send
+        # (B2 atomic reservation), so it stays "sending" too —
+        # the whole batch's outcome is unknown, not just the
+        # primary's. Neither is recorded as replied.
         self.assertEqual(self.item(2)["status"], "sending")
-        self.assertEqual(self.item(1)["status"], "claimed")
+        self.assertEqual(self.item(1)["status"], "sending")
         for item in self.items():
             self.assertIsNone(item["replied_at"])
             self.assertIsNone(item.get("reply_message_id"))

@@ -8,11 +8,15 @@
 # wake an agent so the stuck intake gets looked at. Also verifies
 # the install on every sweep — the intake hook definition (valid
 # and enabled), the checkout, the venv, and the sender — and wakes
-# an agent when a check fails, once per episode. Silent on
-# health and on successful repair (recovery is logged to
-# watchdog_recoveries.log for the supervisor to report). Wakes an
-# agent ONLY when the sweep itself fails, the intake is stale, or
-# a health check fails.
+# an agent when a check fails, once per episode. Also surfaces
+# items stuck in "sending" past the 1h horizon (reported by the
+# sweep as stuck_sending) and wakes an agent to reconcile them
+# against the send evidence. Silent on health and on successful
+# repair (recovery is logged to watchdog_recoveries.log for the
+# supervisor to report). Wakes an agent ONLY when the sweep
+# itself fails (at most once per 600s — a file-based cooldown,
+# so a failing sweep does not wake on every 60s poll), the
+# intake is stale, a health check fails, or a send is stuck.
 # Never sends a Telegram message, never closes work, never touches
 # "sending" items (their send outcome is unknown — only an operator
 # reconciles those), never touches a live-heartbeat claim.
@@ -64,7 +68,23 @@ if [ "$sweep_rc" -ne 0 ]; then
   err_msg=$(tr '\n' ' ' < "$sweep_out" | head -c 300)
   printf '%s FAILED sweep_rc=%s %s\n' "$ts_now" "$sweep_rc" "$err_msg" >> "$REC_LOG"
   rm -f "$sweep_out"
-  wake "telegram bridge watchdog sweep FAILED - queue may be stuck" "{\"at\":\"$ts_now\",\"detail\":\"$err_msg\"}"
+  # Sweep-failure wake cooldown (600s, file-based): a failing
+  # sweep would otherwise wake an agent on every 60s poll. Only
+  # wake if more than 600s have passed since the last
+  # sweep-failure wake; otherwise log and stay silent.
+  last_wake_file="$STATE_DIR/last-sweep-failure-wake"
+  last_wake=0
+  if [ -f "$last_wake_file" ]; then
+    last_wake=$(cat "$last_wake_file" 2>/dev/null || echo 0)
+    case "$last_wake" in ''|*[!0-9]*) last_wake=0 ;; esac
+  fi
+  now_epoch=$(date +%s)
+  if [ $((now_epoch - last_wake)) -gt 600 ]; then
+    printf '%s' "$now_epoch" > "$last_wake_file"
+    wake "telegram bridge watchdog sweep FAILED - queue may be stuck" "{\"at\":\"$ts_now\",\"detail\":\"$err_msg\"}"
+  else
+    silent "sweep FAILED (wake cooldown)" "{\"detail\":\"$err_msg\"}"
+  fi
 fi
 
 recycled=$(python3 -c "import json,sys; print(len(json.load(open('$sweep_out')).get('recycled', [])))" 2>/dev/null || echo 0)
@@ -75,6 +95,7 @@ health_wake=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).g
 health_failed=$(python3 -c "import json,sys; d=json.load(open('$sweep_out')).get('health') or {}; print(','.join(n for n,c in d.get('checks', {}).items() if not c.get('ok')))" 2>/dev/null || echo "")
 health_recovered=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('health_recovered', False))" 2>/dev/null || echo False)
 intake_recovered=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('intake_recovered', False))" 2>/dev/null || echo False)
+stuck_sending=$(python3 -c "import json,sys; print(','.join(str(i) for i in json.load(open('$sweep_out')).get('stuck_sending', [])))" 2>/dev/null || echo "")
 rm -f "$sweep_out"
 
 # Stale intake: wake once per episode (the sweep enforces the
@@ -93,6 +114,17 @@ fi
 if [ "$health_wake" = "True" ]; then
   printf '%s health failed checks=%s recycled=%s pending=%s\n' "$ts_now" "$health_failed" "$recycled" "$pending" >> "$REC_LOG"
   wake "telegram bridge health check failed - $health_failed" "{\"at\":\"$ts_now\",\"failed_checks\":\"$health_failed\",\"recycled\":$recycled,\"pending\":$pending}"
+fi
+
+# Stuck send: an item sat in "sending" past the 1h horizon, so its
+# send outcome is unknown and no later step can close it. Wake an
+# agent to reconcile it against the send evidence (the watchdog
+# prompt's (D) branch): --replied + --done if it went out,
+# --send-failed if it provably never did, nothing if still
+# unknown. The script never marks it itself.
+if [ -n "$stuck_sending" ]; then
+  printf '%s stuck-sending ids=%s\n' "$ts_now" "$stuck_sending" >> "$REC_LOG"
+  wake "telegram bridge send stuck in sending - $stuck_sending" "{\"at\":\"$ts_now\",\"stuck_sending\":\"$stuck_sending\"}"
 fi
 
 # A recovery is only counted once fresh output is seen (the sweep

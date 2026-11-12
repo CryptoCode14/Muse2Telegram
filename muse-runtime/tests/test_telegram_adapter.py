@@ -450,9 +450,14 @@ class SendFenceTests(unittest.TestCase):
         self.assertEqual(self.call_count(), 1)
 
     def test_fence_nonzero_exit_is_unknown(self):
-        """An arbitrary nonzero exit does not establish non-delivery."""
+        """An arbitrary nonzero exit does not establish non-delivery.
+
+        Exits 2 and 3 are contract codes (rejected / retryable), so
+        the arbitrary exit here is 5: no contract meaning, outcome
+        unknown, never auto-resent.
+        """
         token = self.claim_dm()
-        cmd = self.write_send_cmd("sys.exit(3)\n")
+        cmd = self.write_send_cmd("sys.exit(5)\n")
         result = self.fenced(cmd, 1, token)
         self.assertEqual(result, {"ok": False, "stage": "unknown"})
         self.assert_unknown_reservation(cmd, token)
@@ -487,13 +492,14 @@ class SendFenceTests(unittest.TestCase):
         self.accepted_then_failed("sys.stdout.buffer.write(b'\\xff')\n")
 
     def test_verified_no_send_requires_explicit_operator_transition(self):
-        """No sender exit code authorizes retry, even a pre-send failure.
+        """No non-contract exit code authorizes retry, even a pre-send failure.
 
-        Here the fixture verifiably stops before sending. Only the separate
-        token-checked operator transition may make it retryable.
+        Here the fixture verifiably stops before sending (exit 5,
+        outside the 0/2/3 contract). Only the separate token-checked
+        operator transition may make it retryable.
         """
         token = self.claim_dm()
-        cmd = self.write_send_cmd("sys.exit(3)\n")
+        cmd = self.write_send_cmd("sys.exit(5)\n")
         self.assertEqual(self.fenced(cmd, 1, token), {"ok": False, "stage": "unknown"})
         self.assertEqual(run_cli(self.path, ["--send-failed", "1", "wrong"]), {"ok": False})
         self.assertEqual(self.item(1)["status"], "sending")

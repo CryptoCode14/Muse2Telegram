@@ -105,7 +105,10 @@ and the host list are what the helper and the egress layer key on.
 `custom.telegram-muse-bot` exists. Do not proceed until it does.
 Verify it by running the intake once in Step 6: a missing or
 mis-registered credential fails there, loudly, before any message
-is answered.
+is answered. If the secure registration page fails or is
+unavailable, STOP and ask the user — never paste the token anywhere
+as a workaround (not in chat, not in a file, not in a command);
+there is no fallback that types the token by hand.
 
 ## Step 3 — Get the bridge code
 
@@ -132,11 +135,6 @@ muse-runtime/
     telegram.py       intake, queueing, send fence, group modes
     queue.py          the queue core
     store.py          the JSON state store
-    delivery_ledger.py  delivery ledger (send outcomes, no black hole)
-    memory_recall.py  keyword recall with bounded summaries
-    message_cache.py  disk-backed message cache with reply chains
-    prompt_assembly.py  prompt assembly helpers
-    prompt_pin.py     byte-stable prompt pin
     __init__.py
   tests/              offline tests (local fixtures, fake responses)
   bin/telegram-sender the send executable (sendMessage / sendPhoto /
@@ -157,7 +155,7 @@ muse-runtime/
                                 the superseded files below)
   prompts/
     unified.md        the hook-definition prompt (one static prompt
-                      for every wake; 13266 chars, ~3316 modelled
+                      for every wake; 13262 chars, ~3316 modelled
                       tokens)
     router.md, tier-quick.md, tier-standard.md, tier-deep.md
                       superseded in v2; kept for history only,
@@ -194,7 +192,7 @@ mkdir -p ~/workspace/custom-skills/telegram-collab-protocol
   (e.g. `~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender`).
   Make it executable (`chmod +x`).
 - Bridge: the `muse-runtime/` directory is the bridge checkout. Note
-  its path (e.g. `~/workspace/muse-agent-bridge-fork/muse-runtime`);
+  its path (e.g. `~/workspace/muse2telegram/muse-runtime`);
   every bridge command runs from there (`cd` into it first).
 - Hook script and decider: copy `muse-runtime/hooks/telegram-bridge-intake.sh`
   and `muse-runtime/hooks/telegram-bridge-decide.py` to the hooks scripts
@@ -204,19 +202,25 @@ mkdir -p ~/workspace/custom-skills/telegram-collab-protocol
   checkout path you noted above (e.g. `BRIDGE_HOME="$HOME/workspace/muse2telegram/muse-runtime"`),
   or they fail with a clear message telling you to set it.
 - Watchdog: copy `muse-runtime/hooks/telegram-bridge-watchdog.sh` to the
-  hooks scripts folder and make it executable, and copy
-  `muse-runtime/hooks/telegram-bridge-watchdog.json` to the hooks
-  definitions folder (e.g. `~/hooks/definitions/`). It polls every
+  hooks scripts folder and make it executable. Do NOT copy
+  `muse-runtime/hooks/telegram-bridge-watchdog.json` anywhere: it is
+  a reference for the hook-tool settings (see Step 10), not a file to
+  drop into the definitions folder — it carries no
+  `created_at_ms` / `updated_at_ms`, so a verbatim copy never parses
+  and never runs. Create the watchdog hook through the hook tool
+  instead. It polls every
   60 seconds and recycles claimed items whose heartbeat went stale
   (a turn that died mid-work) back to pending, so the intake's next
   poll re-claims and re-wakes them. It also watches intake liveness:
   if the intake has not polled successfully in over 120 seconds it
   wakes an agent (once per stale episode) so the stuck intake gets
-  looked at. It never sends a Telegram
+  looked at. It also surfaces items stuck in "sending" past the 1h
+  horizon and wakes an agent to reconcile them against the send
+  evidence. It never sends a Telegram
   message, never closes work, and never touches "sending" items. It
   is silent on health and on successful repair, and wakes an agent
-  only when the sweep itself fails, the intake is stale, or a
-  health check fails. It also verifies the install on every
+  only when the sweep itself fails, the intake is stale, a
+  health check fails, or a send is stuck. It also verifies the install on every
   sweep — the intake hook definition (valid and enabled), the
   checkout, the venv, and the sender — and wakes an agent when
   a check fails, once per episode. A recovery is reported when
@@ -278,6 +282,8 @@ mkdir -p ~/workspace/custom-skills/telegram-collab-protocol
   ```text
   # Context for [YOUR MUSE NAME]
 
+  Owner's Telegram user id: [YOUR TELEGRAM USER ID]
+
   [USER] is the owner. [Describe them in a sentence or two: what
   they do, what they care about.]
 
@@ -304,7 +310,6 @@ TELEGRAM_BRIDGE_SEND_CMD=<path to telegram-sender>
 TELEGRAM_BRIDGE_BOT_USERNAME=<your bot username, no @>
 TELEGRAM_BRIDGE_BOT_ALIASES=<optional comma-separated short names, no @>
 TELEGRAM_BRIDGE_PAUSED_PATH=~/workspace/telegram-bridge/PAUSED
-TELEGRAM_BRIDGE_HELD_PATH=~/workspace/telegram-bridge/held.jsonl
 TELEGRAM_BRIDGE_SETTLE_SECONDS=2
 ```
 
@@ -405,11 +410,37 @@ Telegram itself, which means the token was rejected (wrong or
 revoked token), not that the registration is missing: re-check the
 token in Step 2, never the registration alone.
 
+## Owner step — Set the owner (name + Telegram id)
+
+**ASK THE USER.** Ask what to call them — their name, in their own
+words — and write it into `~/workspace/telegram-bridge/context.md`,
+replacing the `[USER]` placeholder everywhere in that file (and in
+the hook definition prompt at Step 10). If the user will not give a
+name, keep the `[USER]` placeholder: never guess a name, never use
+a name from anywhere else. The owner's Telegram user id goes on the
+"Owner's Telegram user id:" line of the context.md template (Step
+4) — fill it in when you learn it in Step 7; until then the line
+stays as the `[YOUR TELEGRAM USER ID]` placeholder.
+
+The id is adopted in Step 7 with `--adopt <id> <mode>`, where `<id>`
+is the numeric Telegram user id only. Never type a name into any
+`--adopt` argument, hook script, or prompt: the bridge identifies
+the owner by id, and a name in one of those places is either ignored
+or breaks the run. Owner identity comes from setup and context.md,
+never from a hardcoded name in the repo — the shipped prompts and
+hooks carry `owner` / `[USER]` and no person's name.
+
+**Done looks like:** context.md names the user (or keeps `[USER]`),
+and its "Owner's Telegram user id:" line holds the numeric id from
+Step 7.
+
 ## Step 7 — Adopt the owner
 
 Inspect the state file, find the candidate id, and confirm it belongs
 to the user (ask them to confirm the number if you are unsure). Then
-adopt it, passing the mode from Step 5:
+adopt it, passing the mode from Step 5. Write the id into
+context.md's "Owner's Telegram user id:" line (Owner step above) —
+`--adopt` takes the numeric id only, never a name:
 
 ```text
 cd <bridge checkout> && TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json .venv/bin/python -m bridge_core.telegram --adopt [YOUR TELEGRAM USER ID] <trusted|guarded>
@@ -510,10 +541,24 @@ shipped JSON files in this repo do not carry those fields, so a
 definition copied verbatim from the repo never parses and never
 runs. Create both hooks below through the hook tool, never by
 copying a JSON file into the definitions folder and never by editing
-a definition file by hand. This repo does not document the hook
-tool's UI path or command — where you run it depends on your Muse
-runtime, so use the runtime's own hook tool and ask the user if you
-cannot find it.
+a definition file by hand.
+
+Example — create the two hooks with these settings (taken from the
+repo's own files, so they stay in sync with the code):
+
+- Intake hook: id `telegram-bridge-intake`, script
+  `~/hooks/scripts/telegram-bridge-intake.sh`, poll every 5 seconds,
+  prompt = the unified prompt in `muse-runtime/prompts/unified.md`
+  verbatim (placeholders replaced, see below), enabled.
+- Watchdog hook: id `telegram-bridge-watchdog`, script
+  `~/hooks/scripts/telegram-bridge-watchdog.sh`, poll every 60
+  seconds, prompt = the `prompt` field of
+  `muse-runtime/hooks/telegram-bridge-watchdog.json`, enabled.
+
+The hook tool's UI path or command depends on your Muse runtime —
+use the runtime's own hook tool and ask the user if you cannot find
+it. The hook tool stamps the record with its own created and
+updated times when it creates the hook.
 
 Create a hook that runs `telegram-bridge-intake.sh` on a **5 second**
 poll interval. The hook script polls Telegram (long-poll 30s), feeds the
@@ -525,7 +570,7 @@ The hook definition prompt is the unified prompt in
 definition prompt (replacing the placeholders), following the exact
 install steps in `muse-runtime/hooks/hook-definition-unified-prompt.md`.
 It is the woken agent's full instruction for the turn: one static text
-for every wake (13266 chars, ~3316 modelled tokens). There is no
+for every wake (13262 chars, ~3316 modelled tokens). There is no
 per-batch prompt selection any more: the decider prints only `wake` /
 `hold` / `done` / `empty`, and the intake hook pre-loads the agent's
 context into the wake payload as `context_md` (the bounded contents of
@@ -543,11 +588,12 @@ has no timestamps and will not parse. It recycles claimed items
 whose heartbeat went stale — a
 turn that died mid-work — back to pending, so the intake's next poll
 re-claims and re-wakes them. It also wakes an agent if the intake
-has not polled successfully in over 120 seconds, or if a health
+has not polled successfully in over 120 seconds, if a health
 check fails (intake definition invalid or disabled, or checkout,
-venv, or sender missing). It never sends a Telegram message and
+venv, or sender missing), or if a send is stuck in "sending" past
+the 1h horizon. It never sends a Telegram message and
 wakes an agent only when the sweep itself fails, the intake is
-stale, or a health check fails. **Done looks like:**
+stale, a health check fails, or a send is stuck. **Done looks like:**
 the hook is enabled, polling every 60s, and a dry run exits silently
 with a healthy sweep report.
 
@@ -594,6 +640,10 @@ Verify all of these before telling the user it is ready:
 - [ ] Mode asked and recorded (`state.json` `default_group_mode` is the
   answer from Step 5; the first group adopted gets it, later groups
   start guarded).
+- [ ] Owner set (Owner step): name written into context.md (or
+  `[USER]` kept if they would not give one); Telegram user id on
+  context.md's "Owner's Telegram user id:" line and adopted in
+  Step 7.
 - [ ] Owner adopted (`--adopt` printed the owner id and the mode).
 - [ ] Group Privacy set as the user chose (OFF for the free-for-all); Bot-to-Bot Communication Mode ON if the group has more than one bot.
 - [ ] Command menu registered (scoped to the owner's DM).

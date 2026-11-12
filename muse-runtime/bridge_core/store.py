@@ -85,6 +85,21 @@ class JsonStateStore:
             )
         return {}
 
+    def _fsync_dir(self, directory: Path) -> None:
+        """Fsync a directory so a rename into it is durable.
+
+        Best-effort by design at the call site: unlike the file
+        fsync (a failed save), a failed directory fsync only
+        degrades durability — the save itself succeeded — so the
+        caller swallows OSError. Raises OSError here so the caller
+        decides.
+        """
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
     def _write_atomic(self, target: Path, raw: str) -> None:
         # The queue and .good snapshot contain private conversations. Creating
         # temp files with open(..., "w") inherits the process umask and can
@@ -100,6 +115,14 @@ class JsonStateStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, target)
+            # The rename itself is durable only once the directory
+            # entry is synced. A failure here degrades durability,
+            # not the save: swallow it, unlike the file fsync
+            # above, which is part of the save contract.
+            try:
+                self._fsync_dir(target.parent)
+            except OSError:
+                pass
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)

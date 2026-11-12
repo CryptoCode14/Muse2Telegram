@@ -57,9 +57,9 @@ QUICK_WORK_S = 2.0
 DEEP_WORK_S = 30.0
 REWAKE_LATENCY_S = 0.5
 
-V2_HEARTBEAT_TARGET_S = 180.0   # v2 hang recycle target (baseline: 600)
-V2_WARM_RECYCLE_TARGET_S = 30.0  # v2 warm-claim baton recycle target
-V2_DROPPED_WAKE_TARGET_S = 180.0  # v2 fast re-wake target
+V2_HEARTBEAT_TARGET_S = 600.0   # v2 hang recycle target: one heartbeat horizon
+V2_WARM_RECYCLE_TARGET_S = 120.0  # v2 warm-claim baton recycle target
+V2_DROPPED_WAKE_TARGET_S = 600.0  # v2 fast re-wake target: one heartbeat horizon
 
 
 def tokens_for(text):
@@ -129,15 +129,15 @@ def _warm_hits(turn, chat_id):
 
 
 def _probe_two_phase():
-    """Would the two-phase 180 s rule recycle a never-started claim?
+    """Would the two-phase 600 s rule recycle a never-started claim?
 
     Separate lightweight turn: inject, wake (claim, no heartbeat),
-    advance the fake clock 181 s, then ask the REAL
-    ``queue.stale_claims`` with active_heartbeat_stale=180 whether
+    advance the fake clock 601 s, then ask the REAL
+    ``queue.stale_claims`` with active_heartbeat_stale=600 whether
     the claim is recyclable. This probes the machinery, not the
-    wired path — the wired intake/watchdog may not pass the
-    parameter yet. Returns True/False, or None when the machinery
-    is absent.
+    wired path — the wired intake/watchdog pass the parameter
+    (M4 wired the 600 s horizon everywhere). Returns True/False,
+    or None when the machinery is absent.
     """
     if not FEATURES["two_phase_machinery"]:
         return None
@@ -151,7 +151,7 @@ def _probe_two_phase():
         payload = turn.wake_once()
         if payload is None:
             return False
-        clock.advance(181.0)
+        clock.advance(601.0)
         stale = turn.stale_claims_probe(
             now=clock.now(),
             active_heartbeat_stale=FEATURES["two_phase_seconds"])
@@ -323,7 +323,7 @@ def sc_dropped_wake(mode):
         assert payload is not None, "wake claimed nothing"
         # The wake fired but the turn never started.
         turn.run("drop-wake", payload, "unused", now=clock.now())
-        recovered_after, recycled = _measure_recycle(turn)
+        recovered_after, recycled = _measure_recycle(turn, step=10.0)
         assert recovered_after is not None, "claim never recycled"
         # After recycle the lane frees; the intake re-wakes and replies.
         clock.advance(REWAKE_LATENCY_S)
@@ -338,12 +338,13 @@ def sc_dropped_wake(mode):
             "two-phase probe: machinery absent."
             if probe is None else
             f"two-phase probe: a never-started claim IS recyclable at "
-            f"181s under active_heartbeat_stale=180 (machinery works) "
-            f"but the wired intake/watchdog do not pass it yet."
+            f"601s under active_heartbeat_stale=600 (machinery works; "
+            f"the wired intake/watchdog pass it — M4 wired 600 "
+            f"everywhere)."
             if probe else
-            "two-phase probe: claim NOT recyclable at 181s even with "
-            "active_heartbeat_stale=180.")
-        if mode == "v2" and recovered_after > V2_DROPPED_WAKE_TARGET_S:
+            "two-phase probe: claim NOT recyclable at 601s even with "
+            "active_heartbeat_stale=600.")
+        if mode == "v2" and recovered_after > V2_DROPPED_WAKE_TARGET_S + 10:
             status = "not-implemented"
             note = (f"no fast re-wake yet: claim recycled only after "
                     f"{recovered_after:.0f}s (heartbeat stale {stale:.0f}s, "
@@ -378,7 +379,7 @@ def sc_hang_no_heartbeat(mode):
         payload = turn.wake_once()
         assert payload is not None, "wake claimed nothing"
         turn.run("hang-no-heartbeat", payload, "unused", now=clock.now())
-        recovered_after, _ = _measure_recycle(turn)
+        recovered_after, _ = _measure_recycle(turn, step=10.0)
         assert recovered_after is not None, "hang never recycled"
         stale = FEATURES["heartbeat_stale_seconds"] or 600.0
         probe = _probe_two_phase()
@@ -386,12 +387,13 @@ def sc_hang_no_heartbeat(mode):
             "two-phase probe: machinery absent."
             if probe is None else
             f"two-phase probe: a never-started claim IS recyclable at "
-            f"181s under active_heartbeat_stale=180 (machinery works) "
-            f"but the wired intake/watchdog do not pass it yet."
+            f"601s under active_heartbeat_stale=600 (machinery works; "
+            f"the wired intake/watchdog pass it — M4 wired 600 "
+            f"everywhere)."
             if probe else
-            "two-phase probe: claim NOT recyclable at 181s even with "
-            "active_heartbeat_stale=180.")
-        if mode == "v2" and recovered_after > V2_HEARTBEAT_TARGET_S:
+            "two-phase probe: claim NOT recyclable at 601s even with "
+            "active_heartbeat_stale=600.")
+        if mode == "v2" and recovered_after > V2_HEARTBEAT_TARGET_S + 10:
             status = "not-implemented"
             note = (f"hang recycled after {recovered_after:.0f}s, but v2 "
                     f"target is ~{V2_HEARTBEAT_TARGET_S:.0f}s "

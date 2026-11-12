@@ -77,8 +77,8 @@ Keeps the operational interface the wake hook drives:
                            Prints {"ok": true, "message_id": ...} on
                            success, {"ok": false, "stage":
                            "already-acked"} when an ack is already
-                           recorded, or the fence/config/unknown
-                           failure result.
+                           recorded, or the fence/config/rejected/
+                           retryable/unknown failure result.
   --claim-more CHAT_ID TOKEN [BATCH_SIZE]
                            pull messages that arrived during the turn
                            into this turn's batch (same lane, same
@@ -215,6 +215,25 @@ Keeps the operational interface the wake hook drives:
   --send-failed ID TOKEN   return a "sending" item to pending — ONLY
                            when the Bot API definitively rejected the
                            send (the reply provably did not go out)
+  --held                   list the held items (the resume turn's
+                           list): items the paused bridge held in the
+                           queue itself, with wake_after +24h
+  --hold ID TOKEN          hold one claimed item for the resume turn:
+                           wake_after = now + 24h, in the queue
+                           itself (the intake hook calls this per
+                           item of a held batch). The claim is left
+                           intact; it recycles on the normal 600s
+                           horizon, and the wake_after keeps the
+                           recycled item unclaimable until --unhold
+                           or the 24h bound
+  --unhold ID [ID ...]     release held items and re-claim them in
+                           the same transaction, printing a fresh
+                           claim payload for the resume turn to
+                           answer with --reply. Never --reply with a
+                           held token: the old token is dead once
+                           the 600s heartbeat horizon passes. Items
+                           in another lane, or in a busy lane, stay
+                           pending for the intake's next poll
   --purge-expired [--older-than SECONDS] [--dry-run]
                            operator purge: run the pending-expiry
                            sweep on demand (the same sweep claiming
@@ -434,6 +453,17 @@ HOOK_DEFINITIONS_ENV = "TELEGRAM_BRIDGE_HOOK_DEFINITIONS_DIR"
 #: in a second or two); the ceiling only bounds a hung sender.
 SEND_TIMEOUT_SECONDS = 200.0
 
+#: Retryable-send delay (seconds): after a retryable failure
+#: (429/5xx) the item returns to pending with ``wake_after`` =
+#: now + this delay, so the next poll does not re-send into the
+#: same throttle. The delay is min(Retry-After, 300) when the
+#: sender reported a Retry-After header, and this 60 s default
+#: when it did not (a 5xx carries no Retry-After). The sender's
+#: own in-process 429 retry (one sleep of at most 60 s) is what
+#: keeps the whole send inside the 200 s budget above.
+RETRYABLE_DEFAULT_DELAY_SECONDS = 60.0
+RETRYABLE_MAX_DELAY_SECONDS = 300.0
+
 #: Fixed acknowledgement text for long work. A turn that will take
 #: 10+ minutes sends this first, so the owner knows the turn is
 #: working instead of wondering whether it errored. The text is
@@ -525,8 +555,13 @@ BOT_ALIASES_ENV = "TELEGRAM_BRIDGE_BOT_ALIASES"
 #: signal for the intake classifier: a message that addresses
 #: someone is work for a specific reader, not room chatter. The
 #: pattern also matches the local part of an address-like string;
-#: over-protecting is the safe direction here.
-MENTION_RE = re.compile(r"@[A-Za-z0-9_]{3,}")
+#: over-protecting is the safe direction here. No length floor:
+#: the decider's MENTION_ME_RE has none either, so a 2-character
+#: alias mention is visible to both layers — a floor here would
+#: silently drop a short configured alias from the preclaim
+#: filter while the decider still wakes on it. Short aliases are
+#: never rejected; a short unaliased name is still noise.
+MENTION_RE = re.compile(r"@[A-Za-z0-9_]+")
 
 #: Question / request markers for the intake classifier. A text
 #: carrying any of these is protected ("request" class): a
@@ -714,13 +749,21 @@ def _bridge_health():
 #: the two-phase rule (queue._recycle_stale): a claimed item whose
 #: turn started is recycled once its heartbeat is older than this,
 #: and a never-started claim once its claim is older than this.
-#: Default 600 s (Argon, corrected). When unset/negative the
-#: legacy 600 s rule applies (active_heartbeat_stale None).
+#: Default 600 s (Argon, corrected) — the ONE heartbeat horizon:
+#: the legacy heartbeat rule (HEARTBEAT_STALE_SECONDS) is 600 s
+#: too, so the horizon is 600 s whichever rule applies. A negative
+#: value disables the two-phase rule (returns None, and the legacy
+#: rule applies); unset means the 600 s default, NOT None.
 ACTIVE_HEARTBEAT_STALE_ENV = "TELEGRAM_BRIDGE_ACTIVE_HEARTBEAT_STALE_SECONDS"
 
 
 def _active_heartbeat_stale():
-    """The active (two-phase) heartbeat horizon, or None."""
+    """The active (two-phase) heartbeat horizon, in seconds.
+
+    Default 600 s; None only when the env value is negative
+    (two-phase rule disabled — the legacy heartbeat rule, also
+    600 s, applies instead). Unset is the default, not None.
+    """
     return _env_seconds(
         ACTIVE_HEARTBEAT_STALE_ENV,
         queue_core.NEVER_STARTED_RECYCLE_SECONDS,
@@ -732,7 +775,7 @@ WARM_BATON_TIMEOUT_ENV = "TELEGRAM_BRIDGE_WARM_BATON_TIMEOUT_SECONDS"
 
 
 def _warm_baton_timeout():
-    """Warm-baton timeout from the environment (default 30 s)."""
+    """Warm-baton timeout from the environment (default 120 s)."""
     return _env_seconds(
         WARM_BATON_TIMEOUT_ENV, queue_core.WARM_BATON_TIMEOUT_SECONDS
     )
@@ -955,15 +998,48 @@ def _load_rate_state() -> dict:
 
 
 def _save_rate_state(state: dict) -> None:
-    """Atomic replace; a failure disables throttling, never routing."""
+    """Atomic replace; a failure disables throttling, never routing.
+
+    Mirrors ``store._write_atomic``: a unique mkstemp file (mode
+    0600 regardless of umask — the rate file holds sender ids and
+    wake timestamps), file fsync before the atomic replace, and a
+    directory fsync after it, so the rename itself is durable.
+    Best-effort throughout: any failure is swallowed, and the
+    intake degrades to "no throttling", never a broken intake.
+
+    No file locking here, deliberately: run_once is the only
+    writer and its per-credential poll lock already serializes
+    whole runs; load/save straddle the long poll, so a rate lock
+    would mean restructuring run_once. A torn rate file only
+    degrades to "no throttling", never a broken intake.
+    """
     try:
         path = _rate_path()
         if path.parent:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(state, fh)
-        os.replace(tmp, path)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, tmp = tempfile.mkstemp(
+            dir=path.parent, prefix=f"{path.name}.tmp."
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(state, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            try:
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(dir_fd)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
     except OSError:
         pass
 
@@ -2275,6 +2351,23 @@ def _handle_edited_message(state: dict, edited: dict) -> bool:
 #: -- never silently dropped.
 INTAKE_UNANSWERED_MAX = 20
 
+#: Poison-update handling: an update that can neither be processed
+#: nor held minimally is re-delivered on every poll and recorded as
+#: unanswered each time. After this many consecutive failures the
+#: offset advances past it anyway and a receipt is recorded, so a
+#: later re-delivery is deduped instead of re-processed. The
+#: unanswered records stay visible. A poison update pins the
+#: offset only when it is the newest — an older poison update is
+#: already passed by newer updates advancing the offset. An update
+#: with NO update_id at all still cannot be skipped (there is
+#: nothing to key the receipt on) and keeps being recorded loudly:
+#: that is a deliberate limit, not an oversight.
+INTAKE_POISON_SKIP_AFTER = 3
+#: Bound on the poison counter dict (one counter per update id):
+#: the oldest counters are dropped past this, so a stream of
+#: distinct poison updates cannot grow state without bound.
+INTAKE_POISON_MAX = 100
+
 
 def _record_unanswered(state: dict, update_id, error, text, now: float) -> None:
     """Record a message that could not be enqueued at all.
@@ -2609,7 +2702,11 @@ def ingest(state: dict, result: dict, now: float | None = None, api_call=api) ->
     impossible (the update has no usable id, chat, or sender) is it
     recorded as unanswered, loudly, with its update id and text --
     never silently dropped. In that last case the offset does NOT
-    advance, so the update is re-delivered and retried.
+    advance, so the update is re-delivered and retried — until the
+    3rd consecutive failure (see INTAKE_POISON_SKIP_AFTER), when
+    the offset advances past it and a receipt is recorded, so a
+    later re-delivery is deduped. The unanswered records stay
+    visible either way.
     """
     if not result.get("ok"):
         raise RuntimeError(f"getUpdates failed: {result.get('description')}")
@@ -2658,11 +2755,36 @@ def ingest(state: dict, result: dict, now: float | None = None, api_call=api) ->
                 _record_unanswered(
                     state, update_id, exc, _update_text(update), now
                 )
+                # Poison update: unprocessable, so it would be
+                # re-delivered and re-recorded on every poll
+                # forever. Count consecutive failures per update
+                # id; on the 3rd, advance the offset and record
+                # the receipt, so a later re-delivery is deduped
+                # instead of re-processed. The unanswered records
+                # stay visible — skipping is not silencing.
+                poison = state.setdefault("intake_poison", {})
+                try:
+                    failures = int(poison.get(str(update_id)) or 0) + 1
+                except (TypeError, ValueError):
+                    failures = 1
+                poison[str(update_id)] = failures
+                while len(poison) > INTAKE_POISON_MAX:
+                    poison.pop(next(iter(poison)))
+                if failures >= INTAKE_POISON_SKIP_AFTER:
+                    poison.pop(str(update_id), None)
+                    receipts[key] = {"received_at": now}
+                    state["offset"] = max(state["offset"], update_id + 1)
             continue
         # Success: enqueued, or deliberately closed as not-for-me
         # (see _ingest_update's "closed:<reason>" outcomes). Only
         # now — in the same transaction as the enqueue/close —
         # does the offset advance, with the receipt recorded.
+        # Success also clears a stale poison counter for this
+        # update id: an earlier failure that later succeeded was
+        # transient, so a later failure (if any) counts from 1.
+        poison = state.get("intake_poison")
+        if isinstance(poison, dict):
+            poison.pop(str(update_id), None)
         receipts[key] = {"received_at": now}
         state["offset"] = max(state["offset"], update_id + 1)
 
@@ -3203,23 +3325,72 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
         lock_handle.close()
 
 
+#: Sender exit codes (see bin/telegram-sender): 0 = sent (message
+#: id on stdout), 2 = definitive rejection (400/403/404 — provably
+#: not delivered), 3 = retryable (429/5xx — not delivered, may
+#: succeed later). Any other nonzero exit, a timeout, or exit 0
+#: without a message id stays "unknown": the send may or may not
+#: have gone out, so it is never resent blindly.
+SENDER_EXIT_REJECTED = 2
+SENDER_EXIT_RETRYABLE = 3
+
+#: Retry-After value the sender prints to stderr on a retryable
+#: exit (``telegram HTTP 429 retry-after=N``), in seconds. The
+#: bridge clamps it to 300 s when it sets wake_after (see
+#: send_fenced); a missing value means the sender had no header
+#: (5xx), and the bridge uses its own default delay instead.
+_RETRY_AFTER_RE = re.compile(r"retry-after=(\d+)")
+
+
+class _SendResult(tuple):
+    """The ``(outcome, message_id)`` pair _run_send_command
+    returns, plus ``.retry_after`` (seconds, or None) for a
+    retryable outcome. A tuple subclass so existing two-value
+    unpacking keeps working; callers that need the delay read
+    the attribute (``getattr(result, "retry_after", None)`` is
+    safe for plain tuples from mocked senders)."""
+
+    def __new__(cls, outcome, message_id, retry_after=None):
+        self = super().__new__(cls, (outcome, message_id))
+        self.retry_after = retry_after
+        return self
+
+
 def _run_send_command(send_cmd: str, chat_id, text: str, reply_to=None, keyboard: bool = False, media=None):
     """Invoke the deployment's send executable once.
 
-    Returns ``(outcome, message_id)``:
+    Returns ``(outcome, message_id)`` (a ``_SendResult``; see
+    above for ``.retry_after``):
 
     - ``("sent", id)`` — exit 0 and a message id as the last
       non-empty stdout line.
+    - ``("rejected", None)`` — exit 2: the sender's definitive
+      rejection (400/403/404), so the send provably did not go
+      out. The caller returns the item to pending with
+      ``mark_send_failed``; it may be re-claimed and sent again.
+    - ``("retryable", None)`` — exit 3: the sender was throttled
+      or Telegram errored (429/5xx), so the send did not go out
+      but may succeed later. ``.retry_after`` carries the
+      sender's Retry-After seconds when it had one; the caller
+      returns the item to pending with a ``wake_after`` delay
+      (see ``send_fenced``).
     - ``("unknown", None)`` — the runner timed out or could not be
-      started, exited nonzero (including a signal), produced undecodable
-      output, or exited 0 without a message id: the send
-      may or may not have been delivered, so the item must stay in
-      "sending" for reconciliation and never be resent blindly.
+      started, exited nonzero with any other code (including a
+      signal), produced undecodable output, or exited 0 without a
+      message id: the send may or may not have been delivered, so
+      the item must stay in "sending" for reconciliation and never
+      be resent blindly.
 
-    The executable contract has no verifiable no-send result. An exit
-    code alone cannot prove rejection: remote acceptance may precede a
-    lost response or a local crash. Confirmed non-delivery uses the
-    separate operator --send-failed path after reconciliation.
+    The executable contract has no verifiable no-send result
+    beyond exits 2 and 3: an exit code alone cannot prove
+    rejection in general (remote acceptance may precede a lost
+    response or a local crash), but the sender only exits 2 for
+    HTTP 400/403/404 responses it received — Telegram answered,
+    and the answer was no — and only exits 3 for 429/5xx. A
+    timeout or a lost response after server acceptance usually
+    means the message went out. Confirmed non-delivery after an
+    "unknown" still uses the separate operator --send-failed path
+    after reconciliation.
 
     reply_to threads the reply under that Telegram message id.
     keyboard attaches the inline command keyboard to the reply.
@@ -3248,10 +3419,30 @@ def _run_send_command(send_cmd: str, chat_id, text: str, reply_to=None, keyboard
             f"send-unknown: sender timed out after {SEND_TIMEOUT_SECONDS}s",
             file=sys.stderr,
         )
-        return "unknown", None
+        return _SendResult("unknown", None)
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
         print(f"send-unknown: sender failed to run: {exc}", file=sys.stderr)
-        return "unknown", None
+        return _SendResult("unknown", None)
+    if proc.returncode == SENDER_EXIT_REJECTED:
+        # Definitive rejection: Telegram answered 400/403/404, so
+        # the send provably did not go out.
+        err = (proc.stderr or "").strip()
+        print(
+            f"send-rejected: sender exit 2: {err[:500]}",
+            file=sys.stderr,
+        )
+        return _SendResult("rejected", None)
+    if proc.returncode == SENDER_EXIT_RETRYABLE:
+        # Retryable: 429/5xx, not delivered. Carry the Retry-After
+        # the sender printed (if any) for the wake_after delay.
+        err = (proc.stderr or "").strip()
+        match = _RETRY_AFTER_RE.search(err)
+        retry_after = int(match.group(1)) if match else None
+        print(
+            f"send-retryable: sender exit 3: {err[:500]}",
+            file=sys.stderr,
+        )
+        return _SendResult("retryable", None, retry_after)
     if proc.returncode != 0:
         # The sender prints its own diagnostic to stderr (HTTP code,
         # transport error, or "all attempts rejected"). Log it so an
@@ -3264,7 +3455,7 @@ def _run_send_command(send_cmd: str, chat_id, text: str, reply_to=None, keyboard
             f"send-unknown: sender exit {proc.returncode}: {err[:500]}",
             file=sys.stderr,
         )
-        return "unknown", None
+        return _SendResult("unknown", None)
     lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     if not lines:
         err = (proc.stderr or "").strip()
@@ -3272,8 +3463,8 @@ def _run_send_command(send_cmd: str, chat_id, text: str, reply_to=None, keyboard
             f"send-unknown: sender exit 0 without message_id: {err[:500]}",
             file=sys.stderr,
         )
-        return "unknown", None
-    return "sent", lines[-1]
+        return _SendResult("unknown", None)
+    return _SendResult("sent", lines[-1])
 
 
 def _is_command_text(text) -> bool:
@@ -3285,6 +3476,15 @@ def _is_command_text(text) -> bool:
     return isinstance(text, str) and text.lstrip().startswith("/")
 
 
+def _retryable_delay_seconds(retry_after) -> float:
+    """Delay (seconds) for a retryable send: min(Retry-After, 300)
+    when the sender reported a Retry-After header, or the 60 s
+    default when it did not (a 5xx carries no Retry-After)."""
+    if retry_after is None:
+        return RETRYABLE_DEFAULT_DELAY_SECONDS
+    return min(float(retry_after), RETRYABLE_MAX_DELAY_SECONDS)
+
+
 def send_fenced(
     store: JsonStateStore,
     target: int,
@@ -3294,6 +3494,7 @@ def send_fenced(
     *,
     reply_to=None,
     keyboard: bool = False,
+    extra_targets=(),
     max_reply_age: float | None = DEFAULT_MAX_REPLY_AGE,
     now: float | None = None,
 ) -> dict:
@@ -3308,6 +3509,15 @@ def send_fenced(
 
     - sent → the item stays in "sending"; the caller records the
       reply with --replied and closes with --done, as usual.
+    - rejected → the send provably did not go out (sender exit 2:
+      400/403/404). The item returns to pending with
+      ``mark_send_failed`` and may be re-claimed and sent again.
+    - retryable → the send was throttled or Telegram errored
+      (sender exit 3: 429/5xx) and did not go out. The item
+      returns to pending with a ``wake_after`` delay of
+      min(Retry-After, 300 s) — 60 s when the sender had no
+      Retry-After header — so the next poll does not re-send
+      into the same throttle.
     - unknown → the item stays in "sending" (send-unknown) for
       operator reconciliation; it is never resent automatically.
       Only independently verified non-delivery permits an operator
@@ -3327,6 +3537,17 @@ def send_fenced(
     - keyboard → --keyboard was requested for a reply that does not
       answer a command: the keyboard goes only on command replies
       (and /menu). Nothing is sent; the caller retries without it.
+
+    ``extra_targets`` are the other batch items this one reply
+    covers (see ``send_batch_and_close``): they are reserved —
+    moved to "sending" — atomically with the primary in the same
+    transaction, BEFORE the network send, so a turn that dies
+    mid-send never leaves covered siblings claimed while the
+    primary is sending. One message per item is rejected: a batch
+    costs one send, and the extras are recorded against that
+    send by ``_finish_send``. On rejected / retryable the extras
+    return to pending with the primary (with the same wake_after
+    on retryable).
 
     Reply threading is fenced too: ``reply_to`` must be None or the
     target item's own ``message_id``. A button tap's item carries
@@ -3350,20 +3571,53 @@ def send_fenced(
     send_cmd = os.environ.get(SEND_CMD_ENV)
     if not send_cmd:
         return {"ok": False, "stage": "config"}
+    extras = list(dict.fromkeys(int(t) for t in extra_targets))
+    if target in extras:
+        extras.remove(target)
     error, queued_chat_id = _reserve_send(
         store, target, token, chat_id,
         reply_to=reply_to, keyboard=keyboard,
+        extra_targets=extras,
         max_reply_age=max_reply_age, now=now,
     )
     if error is not None:
         return error
     # Never trust the caller's destination, even after comparison. Only
     # the queue's persisted chat ID may reach the sender subprocess.
-    outcome, message_id = _run_send_command(
+    send_result = _run_send_command(
         send_cmd, queued_chat_id, text, reply_to=reply_to, keyboard=keyboard
     )
+    outcome, message_id = send_result
     if outcome == "sent":
         return {"ok": True, "message_id": message_id}
+    if outcome == "rejected":
+        # Definitive: the send provably did not go out. Return
+        # every reserved item to pending so it can be re-claimed
+        # and sent again.
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            for external_id in [target] + extras:
+                queue_core.mark_send_failed(
+                    state, PLATFORM, external_id, token
+                )
+        return {"ok": False, "stage": "rejected"}
+    if outcome == "retryable":
+        # Throttled / errored, not delivered: return every
+        # reserved item to pending with a delay, so the next poll
+        # does not re-send into the same throttle.
+        retry_after = getattr(send_result, "retry_after", None)
+        send_now = time.time() if now is None else now
+        delay = _retryable_delay_seconds(retry_after)
+        wake_after = send_now + delay
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            for external_id in [target] + extras:
+                queue_core.mark_send_retryable(
+                    state, PLATFORM, external_id, token, wake_after
+                )
+        return {
+            "ok": False, "stage": "retryable", "retry_after": delay,
+        }
     return {"ok": False, "stage": "unknown"}
 
 
@@ -3375,6 +3629,7 @@ def _reserve_send(
     *,
     reply_to=None,
     keyboard: bool = False,
+    extra_targets=(),
     max_reply_age: float | None = DEFAULT_MAX_REPLY_AGE,
     now: float | None = None,
 ) -> tuple:
@@ -3390,10 +3645,43 @@ def _reserve_send(
     the item left claimed and nothing sent. The text and media
     send paths both reserve through here, so neither can bypass
     the fence.
+
+    ``extra_targets`` are the other batch items the one reply
+    covers: each must be claimed under the same token with no
+    reply recorded (and not stale), and all of them — primary
+    plus extras — are moved to "sending" in this same
+    transaction, BEFORE the network send. Every check runs
+    before any item is marked, so a refused extra leaves the
+    primary claimed too: the reservation is all-or-nothing.
     """
     send_cmd = os.environ.get(SEND_CMD_ENV)
     if not send_cmd:
         return {"ok": False, "stage": "config"}, None
+    extras = list(dict.fromkeys(int(t) for t in extra_targets))
+    if target in extras:
+        extras.remove(target)
+    check_now = time.time() if now is None else now
+
+    def _stale_owned(it):
+        # The stale verdict belongs to the claim's owner alone: it
+        # requires the item claimed, the token matching, and no
+        # reply recorded — the same ownership the fence itself
+        # checks. A caller that does not own the claim falls
+        # through to mark_sending and gets the plain fence refusal.
+        # The age limit is per item: work a turn already claimed
+        # gets the longer claimed limit (see _reply_age_limit), so
+        # a recovery after an outage is never refused as stale.
+        limit = _reply_age_limit(it, max_reply_age) if it is not None else None
+        return (
+            limit is not None
+            and it is not None
+            and it["status"] == queue_core.CLAIMED
+            and token is not None
+            and it["claim_token"] == token
+            and it["replied_at"] is None
+            and check_now - it["received_at"] > limit
+        )
+
     with store.transaction() as state:
         _ensure_adapter_state(state)
         item = queue_core.find_item(state, PLATFORM, target)
@@ -3417,31 +3705,36 @@ def _reserve_send(
         # before anything is sent; the caller retries without it.
         if keyboard and not _is_command_text(item.get("text")):
             return {"ok": False, "stage": "keyboard"}, None
-        # The stale verdict belongs to the claim's owner alone: it
-        # requires the item claimed, the token matching, and no
-        # reply recorded — the same ownership the fence itself
-        # checks. A caller that does not own the claim falls
-        # through to mark_sending and gets the plain fence refusal.
-        # The age limit is per item: work a turn already claimed
-        # gets the longer claimed limit (see _reply_age_limit), so
-        # a recovery after an outage is never refused as stale.
-        limit = _reply_age_limit(item, max_reply_age) if item is not None else None
-        stale_owned = (
-            limit is not None
-            and item is not None
-            and item["status"] == queue_core.CLAIMED
-            and token is not None
-            and item["claim_token"] == token
-            and item["replied_at"] is None
-            and (time.time() if now is None else now) - item["received_at"]
-            > limit
-        )
-        if stale_owned:
+        if _stale_owned(item):
             # Stale: refuse the send, preserve the work. No state
             # changes in this transaction — the item stays claimed
             # under the caller's own token for reassessment.
             return {"ok": False, "stage": "stale"}, None
+        # Extras: same ownership, reply and staleness rules as the
+        # primary, checked BEFORE anything is marked — a refused
+        # extra refuses the whole reservation.
+        extra_items = []
+        for external_id in extras:
+            extra = queue_core.find_item(state, PLATFORM, external_id)
+            if (
+                extra is None
+                or extra["status"] != queue_core.CLAIMED
+                or token is None
+                or extra["claim_token"] != token
+                or extra["replied_at"] is not None
+            ):
+                return {"ok": False, "stage": "fence"}, None
+            if _stale_owned(extra):
+                return {"ok": False, "stage": "stale"}, None
+            extra_items.append(extra)
         fenced = queue_core.mark_sending(state, PLATFORM, target, token)
+        if fenced:
+            for external_id in extras:
+                if not queue_core.mark_sending(
+                    state, PLATFORM, external_id, token
+                ):
+                    fenced = False
+                    break
         if not fenced:
             # Ownership lost (2026-11-12 turns-dying bug): the item
             # exists but this token no longer owns it. Report the
@@ -3598,7 +3891,9 @@ def send_media_fenced(
     per-kind cap (see _validate_media_path). Reservation goes
     through the same fence as a text send (destination, reply
     target, keyboard, stale), and the outcome rules are the same:
-    sent leaves the item in "sending" for --replied/--done, and
+    sent leaves the item in "sending" for --replied/--done,
+    rejected returns it to pending (definitive non-delivery),
+    retryable returns it to pending with a wake_after delay, and
     unknown stays in "sending" for reconciliation, never resent.
     """
     if not isinstance(caption, str) or len(caption) > MAX_MEDIA_CAPTION_CHARS:
@@ -3618,13 +3913,31 @@ def send_media_fenced(
     )
     if error is not None:
         return error
-    outcome, message_id = _run_send_command(
+    send_result = _run_send_command(
         send_cmd, queued_chat_id, caption,
         reply_to=reply_to, keyboard=keyboard,
         media=(media_kind, str(resolved)),
     )
+    outcome, message_id = send_result
     if outcome == "sent":
         return {"ok": True, "message_id": message_id}
+    if outcome == "rejected":
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            queue_core.mark_send_failed(state, PLATFORM, target, token)
+        return {"ok": False, "stage": "rejected"}
+    if outcome == "retryable":
+        retry_after = getattr(send_result, "retry_after", None)
+        send_now = time.time() if now is None else now
+        delay = _retryable_delay_seconds(retry_after)
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            queue_core.mark_send_retryable(
+                state, PLATFORM, target, token, send_now + delay
+            )
+        return {
+            "ok": False, "stage": "retryable", "retry_after": delay,
+        }
     return {"ok": False, "stage": "unknown"}
 
 
@@ -3737,17 +4050,31 @@ def send_ack(
     the item to "sending": the item stays claimed so the full reply
     can still close it with --send-and-close as usual.
 
+    The ack is RESERVED before sending: the first transaction sets
+    ``ack_sent_at`` with no message id, so a second concurrent ack
+    sees the reservation and returns "already-acked" without
+    sending — two threads can never send the ack twice. The
+    reservation is completed by ``mark_ack`` after a successful
+    send, and cleared on rejected / retryable / unknown, so a
+    retry after a failed send is safe.
+
     Returns {"ok": true, "message_id": ...} on success,
     {"ok": false, "stage": "already-acked"} when an ack is already
-    recorded, {"ok": false, "stage": "fence"} when the item is not
-    claimed under the token or the destination/threading does not
-    match, {"ok": false, "stage": "config"} when no send command is
-    configured, and {"ok": false, "stage": "unknown"} when the send
-    outcome is unknown. On "unknown" nothing is recorded — the item
-    stays claimed and the ack may be tried again, or the turn may
-    simply proceed to the full reply (a duplicate short ack is
-    harmless, a lost ack just means no ack). The ack is never resent
-    blindly after a recorded success.
+    recorded (or reserved by a concurrent ack), {"ok": false,
+    "stage": "fence"} when the item is not claimed under the token
+    or the destination/threading does not match, {"ok": false,
+    "stage": "config"} when no send command is configured,
+    {"ok": false, "stage": "rejected"} when the send was
+    definitively rejected (provably not delivered — a retry is
+    safe), {"ok": false, "stage": "retryable"} when the send was
+    throttled or Telegram errored (not delivered — a retry is
+    safe, after the reported delay), and {"ok": false, "stage":
+    "unknown"} when the send outcome is unknown. On "unknown"
+    nothing is recorded — the item stays claimed and the ack may
+    be tried again, or the turn may simply proceed to the full
+    reply (a duplicate short ack is harmless, a lost ack just
+    means no ack). The ack is never resent blindly after a
+    recorded success.
     """
     send_cmd = os.environ.get(SEND_CMD_ENV)
     if not send_cmd:
@@ -3766,16 +4093,39 @@ def send_ack(
             or item["replied_at"] is not None
         ):
             return {"ok": False, "stage": "fence"}
-        if item.get("ack_sent_at") is not None:
-            return {"ok": False, "stage": "already-acked"}
         if reply_to is not None:
             queued_message_id = item.get("message_id")
             if queued_message_id is None or str(reply_to) != str(queued_message_id):
                 return {"ok": False, "stage": "fence"}
-    outcome, message_id = _run_send_command(
+        # Reserve the ack inside this transaction, before sending:
+        # ack_sent_at is set with no message id yet, so a second
+        # concurrent ack is refused as already-acked without
+        # sending. (The reply_to check above runs before the
+        # reservation, so a bad thread target never reserves.)
+        if not queue_core.reserve_ack(state, PLATFORM, target, token, now=now):
+            return {"ok": False, "stage": "already-acked"}
+    send_result = _run_send_command(
         send_cmd, queued_chat_id, ACK_TEXT, reply_to=reply_to
     )
+    outcome, message_id = send_result
     if outcome != "sent":
+        # The ack did not go out (rejected / retryable / unknown):
+        # clear the reservation so a retry is safe. A completed
+        # ack would refuse the clear, but none can exist yet —
+        # this turn holds the only reservation.
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            queue_core.clear_ack(state, PLATFORM, target, token)
+        if outcome == "rejected":
+            return {"ok": False, "stage": "rejected"}
+        if outcome == "retryable":
+            return {
+                "ok": False,
+                "stage": "retryable",
+                "retry_after": _retryable_delay_seconds(
+                    getattr(send_result, "retry_after", None)
+                ),
+            }
         return {"ok": False, "stage": "unknown"}
     with store.transaction() as state:
         _ensure_adapter_state(state)
@@ -3829,6 +4179,7 @@ def watchdog_sweep(store: JsonStateStore, *, now: float | None = None) -> dict:
         return queue_core.watchdog_sweep(
             state,
             heartbeat_stale=_heartbeat_stale(),
+            active_heartbeat_stale=_active_heartbeat_stale(),
             health=_bridge_health(),
             now=now,
         )
@@ -3854,7 +4205,11 @@ def send_batch_and_close(
     reply against every extra target and closes them all with
     done_reason "covered-by-batch-reply". The batch therefore
     costs one Telegram send and one agent reply instead of one
-    send per message. The fence rules still apply end to end:
+    send per message. The primary AND the extras are reserved
+    (moved to "sending") atomically in the fence, before the
+    network call — a turn that dies mid-send never leaves covered
+    siblings claimed while the primary is sending. The fence rules
+    still apply end to end:
 
     - reply_to must be None or the message_id of the primary or
       one of the extra items — never the bot's own message.
@@ -3915,6 +4270,7 @@ def send_batch_and_close(
         text,
         reply_to=reply_to,
         keyboard=keyboard,
+        extra_targets=extras,
         max_reply_age=max_reply_age,
         now=now,
     )
@@ -4022,7 +4378,7 @@ def _warm_hold(
 
     The baton guard lives in queue_core: a warm claim whose turn
     never started (turn_started_at None) is recycled only once
-    its heartbeat is older than the 30 s warm-baton timeout, so a
+    its heartbeat is older than the 120 s warm-baton timeout, so a
     warm agent reading MEMORY before its first heartbeat is never
     recycled while thinking.
 
@@ -4211,7 +4567,14 @@ def send_reply(
         batch any more — the claim was recycled while the turn was
         working — so that case reports the distinct stage
         "stale-token" instead of the generic "fence", and the
-        split-batch case keeps "fence".
+        split-batch case keeps "fence". Any item under the token
+        that is SENDING with no recorded reply also fails closed
+        with "fence": a previous send under this token went out
+        (or did not) and its outcome is unknown, so silently
+        replying for only the still-claimed siblings would drop
+        it. A SENDING item WITH a reply recorded is not a fence:
+        its answer went out, so it falls through to the existing
+        stale-token path like any other replied item.
     (b) Heartbeat the whole batch first (proof the turn is alive).
     (c) Fire typing in the chat (best-effort, never blocks the
         send).
@@ -4305,6 +4668,21 @@ def send_reply(
             and item.get("claim_token") == token
             and item.get("replied_at") is None
         ]
+        # A SENDING sibling with no recorded reply fails closed:
+        # its send outcome is unknown, so replying for only the
+        # still-claimed items would silently drop it. A SENDING
+        # item WITH a reply recorded is not fenced here — its
+        # answer went out, so it falls through below.
+        sending_siblings = [
+            item
+            for item in state.get("queue", [])
+            if item.get("platform") == PLATFORM
+            and item.get("status") == queue_core.SENDING
+            and item.get("claim_token") == token
+            and item.get("replied_at") is None
+        ]
+    if sending_siblings:
+        return _result(False, "fence")
     if not items:
         return _result(False, "stale-token")
     chat_ids = {item.get("chat_id") for item in items}
@@ -5253,6 +5631,109 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
             else:
                 ok = queue_core.mark_send_failed(state, PLATFORM, target, token)
         print(json.dumps({"ok": ok}))
+        return 0
+
+    if args[:1] == ["--held"]:
+        # --held: read-only list of the held items (the resume
+        # turn's list). Held items live in the queue itself
+        # (wake_after +24h); there is no held.jsonl any more.
+        if len(args) != 1:
+            print(json.dumps({
+                "ok": False, "error": "usage: --held",
+            }))
+            return 2
+        state = _ensure_adapter_state(store.load())
+        held = queue_core.held_items(state, platform=PLATFORM)
+        print(json.dumps({
+            "ok": True,
+            "held": [
+                {
+                    "update_id": int(item["external_id"]),
+                    "chat_id": item.get("chat_id"),
+                    "chat_type": item.get("chat_type"),
+                    "sender_name": item.get("sender_name"),
+                    "text": item.get("text"),
+                    "status": item.get("status"),
+                }
+                for item in held
+            ],
+        }))
+        return 0
+
+    if args[:1] == ["--hold"]:
+        # --hold UPDATE_ID CLAIM_TOKEN: hold one claimed item for
+        # the resume turn — wake_after = now + 24h, in the queue
+        # itself. The intake hook calls this per item of a held
+        # batch, with the payload's claim token. The claim is left
+        # intact (it recycles on the normal 600s heartbeat
+        # horizon); the wake_after keeps the recycled item
+        # unclaimable until --unhold or the 24h bound.
+        if len(args) != 3:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --hold UPDATE_ID CLAIM_TOKEN",
+            }))
+            return 2
+        try:
+            target = int(args[1])
+        except ValueError:
+            print(json.dumps({"ok": False, "error": "invalid-update-id"}))
+            return 2
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            ok = queue_core.hold_item(state, PLATFORM, target, args[2])
+        print(json.dumps({"ok": ok}))
+        return 0
+
+    if args[:1] == ["--unhold"]:
+        # --unhold UPDATE_ID [UPDATE_ID ...]: release held items
+        # and re-claim them in the same transaction, so the intake
+        # hook cannot claim them first. Prints a fresh claim
+        # payload for the resume turn to answer with --reply —
+        # never with a held token (the old token is dead once the
+        # 600s heartbeat horizon passes). Items in another lane,
+        # or in a busy lane, stay pending for the intake's next
+        # poll.
+        if len(args) < 2:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: --unhold UPDATE_ID [UPDATE_ID ...]",
+            }))
+            return 2
+        try:
+            ids = [int(a) for a in args[1:]]
+        except ValueError:
+            print(json.dumps({"ok": False, "error": "invalid-update-id"}))
+            return 2
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            unheld = []
+            for external_id in ids:
+                if queue_core.unhold_item(state, PLATFORM, external_id):
+                    unheld.append(external_id)
+            batch = queue_core.claim_ids(
+                state,
+                platform=PLATFORM,
+                external_ids=unheld,
+                batch_size=BATCH_MAX_MESSAGES,
+            )
+            if batch is not None:
+                expired_ids = _expired_external_ids(state)
+                claimed = {
+                    "claim_token": batch["claim_token"],
+                    "items": [
+                        _payload_item(state, item, expired_ids)
+                        for item in batch["items"]
+                    ],
+                }
+            else:
+                claimed = None
+        print(json.dumps({
+            "ok": True,
+            "unheld": unheld,
+            "claim_token": claimed["claim_token"] if claimed else None,
+            "items": claimed["items"] if claimed else [],
+        }))
         return 0
 
     if args and args[0].startswith("-"):

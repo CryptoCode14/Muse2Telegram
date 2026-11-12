@@ -124,8 +124,9 @@ so Telegram rejects the call with a 404.
   its lane for minutes, not the full 30-minute stale TTL. A queue
   watchdog hook polls every 60s and recycles dead claims the same
   way, silently; it never sends a Telegram message and wakes an
-  agent only when the sweep itself fails or the intake goes stale
-  (no successful poll for over 120 seconds). It also verifies the
+  agent only when the sweep itself fails, the intake goes stale
+  (no successful poll for over 120 seconds), a health check fails,
+  or a send is stuck in "sending" past the 1h horizon. It also verifies the
   install on every sweep — the intake hook definition (valid and
   enabled), the checkout, the venv, and the sender — and wakes an
   agent when a check fails, once per episode. A recovery is
@@ -196,8 +197,9 @@ so Telegram rejects the call with a 404.
 - Commands the woken agent handles: /pause, /resume, /status, /help,
   /who. /pause creates `~/workspace/telegram-bridge/PAUSED`; while paused
   the hook still polls and wakes only for commands, holding other batches
-  in `~/workspace/telegram-bridge/held.jsonl` for the resume turn.
-  /resume deletes the flag, processes the held file, and replies.
+  in the queue itself (wake_after +24h) for the resume turn.
+  /resume deletes the flag, re-claims the held items with `--unhold`,
+  and replies.
 - Groups: the bridge serves EVERY group the owner adds it to — it
   adopts a group when the owner speaks (or taps a button) there, and
   ignores messages from groups that are not adopted. Each adopted

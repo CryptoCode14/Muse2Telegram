@@ -375,6 +375,42 @@ class PreclaimAliasTests(unittest.TestCase):
                 self._state("@SomeOtherBot check this"))
         self.assertEqual(closed, [1])
 
+    def test_short_alias_mention_from_another_bot_is_not_noise(self):
+        # m5: the mention regex has no length floor any more, so a
+        # 2-char alias mention is visible to preclaim — a message
+        # from another bot that @mentions this bot's short alias
+        # is addressed to us, not noise. With the old {3,} floor
+        # "@jo" was invisible and this closed as noise.
+        state = {"queue": [{
+            "status": "pending", "chat_type": "group",
+            "text": "@jo check this", "is_bot": True,
+            "sender_name": "SomeOtherBot",
+            "sender_id": 222, "external_id": 1, "replied_at": None,
+        }]}
+        with mock.patch.dict(os.environ, {
+            "TELEGRAM_BRIDGE_BOT_USERNAME": BOT_USERNAME,
+            "TELEGRAM_BRIDGE_BOT_ALIASES": "jo",
+        }):
+            closed = telegram.preclaim_filter(state)
+        self.assertEqual(closed, [])
+
+    def test_short_unaliased_name_is_still_noise(self):
+        # m5: a short name that is NOT a configured alias is still
+        # noise — the floor removal must not let every short
+        # @mention through, only this bot's own aliases.
+        state = {"queue": [{
+            "status": "pending", "chat_type": "group",
+            "text": "@jo check this", "is_bot": False,
+            "sender_name": "Example",
+            "sender_id": OWNER, "external_id": 1, "replied_at": None,
+        }]}
+        with mock.patch.dict(os.environ, {
+            "TELEGRAM_BRIDGE_BOT_USERNAME": BOT_USERNAME,
+        }, clear=False):
+            os.environ.pop("TELEGRAM_BRIDGE_BOT_ALIASES", None)
+            closed = telegram.preclaim_filter(state)
+        self.assertEqual(closed, [1])
+
 
 if __name__ == "__main__":
     unittest.main()

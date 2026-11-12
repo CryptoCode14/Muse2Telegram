@@ -24,7 +24,6 @@ with test values.
   - `~/workspace/telegram-bridge-test/context.md` (write this by hand
     before the first wake; see below)
   - `~/workspace/telegram-bridge-test/PAUSED`
-  - `~/workspace/telegram-bridge-test/held.jsonl`
   - `~/workspace/telegram-bridge-test/intake-errors.log`
 - Test bridge checkout: this repo's `muse-runtime/` directory, e.g.
   `~/workspace/muse2telegram/muse-runtime` (run every bridge
@@ -58,7 +57,7 @@ cd ~/workspace/muse2telegram/muse-runtime && python3 -m venv .venv
 .venv/bin/python -m unittest discover -s tests
 ```
 
-**Done looks like:** the suite runs with no failures (437 tests, the
+**Done looks like:** the suite runs with no failures (469 tests, the
 current baseline — zero failures). Do not proceed on a failing suite
 you cannot explain.
 
@@ -71,10 +70,11 @@ you cannot explain.
   `muse-runtime/hooks/telegram-bridge-decide.py` to
   `~/hooks-test/scripts/` and make them executable.
 - Watchdog: copy `muse-runtime/hooks/telegram-bridge-watchdog.sh`
-  to `~/hooks-test/scripts/` and
-  `muse-runtime/hooks/telegram-bridge-watchdog.json` to
-  `~/hooks-test/definitions/` (poll every 60 seconds, as in
-  `SETUP.md` Step 10).
+  to `~/hooks-test/scripts/` and create the watchdog hook through
+  the hook tool using the settings in
+  `muse-runtime/hooks/telegram-bridge-watchdog.json` (poll every 60
+  seconds, as in `SETUP.md` Step 10) — do not copy the JSON file
+  into the definitions folder.
 - Prompts: do NOT copy `router.md` or any `tier-*.md` file. The
   unified prompt is installed as the hook definition prompt itself
   (Step 6 below).
@@ -100,14 +100,13 @@ TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge-test/state.json
 TELEGRAM_BRIDGE_SEND_CMD=<path to the test telegram-sender>
 TELEGRAM_BRIDGE_BOT_USERNAME=<test bot username, no @>
 TELEGRAM_BRIDGE_PAUSED_PATH=~/workspace/telegram-bridge-test/PAUSED
-TELEGRAM_BRIDGE_HELD_PATH=~/workspace/telegram-bridge-test/held.jsonl
 TELEGRAM_BRIDGE_SETTLE_SECONDS=2
 ```
 
 In the hook script (`telegram-bridge-intake.sh`), set
 `TELEGRAM_BRIDGE_BOT_USERNAME` to the test bot's username, and set
 `TELEGRAM_BRIDGE_STATE_PATH` / `TELEGRAM_BRIDGE_SEND_CMD` /
-`TELEGRAM_BRIDGE_PAUSED_PATH` / `TELEGRAM_BRIDGE_HELD_PATH` to the
+`TELEGRAM_BRIDGE_PAUSED_PATH` to the
 test paths above. Do NOT point any of them at the live
 `~/workspace/telegram-bridge/` paths.
 
@@ -123,9 +122,9 @@ following the exact install steps in
 `muse-runtime/hooks/hook-definition-unified-prompt.md`. Do NOT use
 the old router text and do NOT install any `tier-*.md` file.
 
-Also install the queue watchdog hook from
-`muse-runtime/hooks/telegram-bridge-watchdog.json` (poll every
-**60 seconds**).
+Also install the queue watchdog hook through the hook tool, using
+the settings in `muse-runtime/hooks/telegram-bridge-watchdog.json`
+(poll every **60 seconds**) — do not copy the JSON file verbatim.
 
 **Done looks like:** both hooks are enabled and a dry run (no
 messages waiting) exits silently.
