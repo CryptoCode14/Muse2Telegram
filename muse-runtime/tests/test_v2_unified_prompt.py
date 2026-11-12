@@ -213,6 +213,21 @@ class UnifiedPromptTests(unittest.TestCase):
         self.assertIn(prompt, doc)
         self.assertIn("hook-definition-unified-prompt.md", doc)
 
+    def test_work_from_line_names_all_three_env_vars(self):
+        # Gus's 7e8121d gap: the prompt made TELEGRAM_BRIDGE_BOT_USERNAME
+        # required (fail loud when unset) but the Work-from line named
+        # only STATE_PATH and SEND_CMD, so a fresh install following the
+        # template broke on --reply. The line must name all three vars,
+        # in both prompt files.
+        for path in (PROMPT, HOOK_DEFINITION):
+            lines = [ln for ln in path.read_text().splitlines()
+                     if ln.startswith("Work from")]
+            self.assertEqual(len(lines), 1, f"{path}: one Work-from line")
+            for var in ("TELEGRAM_BRIDGE_STATE_PATH",
+                        "TELEGRAM_BRIDGE_SEND_CMD",
+                        "TELEGRAM_BRIDGE_BOT_USERNAME"):
+                self.assertIn(var, lines[0], f"{path}: {var} missing")
+
 
 class WatchdogDefinitionTests(unittest.TestCase):
     def test_watchdog_json_is_a_reference_not_a_drop_in(self):

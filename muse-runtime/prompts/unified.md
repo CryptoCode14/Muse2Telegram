@@ -1,5 +1,5 @@
 <!-- Unified wake prompt (v2). ONE static prompt for every wake.
-     Size: 13215 chars, ~3304 modelled tokens (chars/4).
+     Size: 13266 chars, ~3316 modelled tokens (chars/4).
      Install: paste this file verbatim as the hook definition prompt
      (see hooks/hook-definition-unified-prompt.md). -->
 
@@ -9,7 +9,7 @@ The wake payload is intake JSON: claim_token, count, items, context_md. Each ite
 
 Context: context_md is [USER]'s compact context, pre-loaded into this payload by the hook (at most 6000 chars). Use it; do not read context.md yourself. Read ~/MEMORY.md only if the message needs detail beyond context_md; a goal file only if the message is about that goal. If context_md is null or absent, read the context.md file next to state.json yourself.
 
-Work from <bridge checkout> with TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json and TELEGRAM_BRIDGE_SEND_CMD=~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender.
+Work from <bridge checkout> with TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json and TELEGRAM_BRIDGE_SEND_CMD=~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender and TELEGRAM_BRIDGE_BOT_USERNAME=YOUR_BOT_USERNAME.
 
 Reply or close: DM: always reply. @mentions @YOUR_BOT_USERNAME or a configured alias of it: reply. Open group message from a human, no @mention: reply only when you have something useful to add; otherwise close it. A message @mentioning a different bot, or from another bot that doesn't mention you: close it. Never get into a back-and-forth with the other bots; only reply to another bot if it @mentions you or [USER] asked you to.
 
