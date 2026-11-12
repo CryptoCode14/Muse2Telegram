@@ -636,15 +636,32 @@ def _env_seconds(name: str, default):
     return None if value < 0 else value
 
 
-def _bot_username() -> str:
+def _bot_username(state: dict | None = None) -> str:
+    """This bot's Telegram username (lowercase, no "@").
+
+    The environment wins: TELEGRAM_BRIDGE_BOT_USERNAME, exported
+    by the intake hook script at install time, is the authority.
+    When it is unset, fall back to the username cached in state
+    (``state["bot_username"]``, written by the intake the first
+    time it runs with the variable set) — so a later process that
+    runs without the install-time export, such as the watchdog
+    sweep after a plain re-copy of the repo scripts, still
+    resolves the bot instead of dying. When both are absent the
+    bridge still refuses to run instead of silently identifying
+    as some other bot.
+    """
     raw = os.environ.get(BOT_USERNAME_ENV, "")
-    if not raw.strip():
-        raise RuntimeError(
-            "TELEGRAM_BRIDGE_BOT_USERNAME is not set: set it to this "
-            "bot's Telegram username (without '@') before running "
-            "the bridge."
-        )
-    return raw.strip().lstrip("@").lower()
+    if raw.strip():
+        return raw.strip().lstrip("@").lower()
+    if state is not None:
+        cached = state.get("bot_username")
+        if isinstance(cached, str) and cached.strip():
+            return cached.strip().lstrip("@").lower()
+    raise RuntimeError(
+        "TELEGRAM_BRIDGE_BOT_USERNAME is not set: set it to this "
+        "bot's Telegram username (without '@') before running "
+        "the bridge."
+    )
 
 
 def _bot_aliases() -> list:
@@ -652,11 +669,11 @@ def _bot_aliases() -> list:
     return [a.strip().lstrip("@").lower() for a in raw.split(",") if a.strip()]
 
 
-def _bot_names() -> set:
+def _bot_names(state: dict | None = None) -> set:
     """This bot's username plus every configured alias, all
     lowercased, no "@". Used wherever a message is checked for
     addressing this bot."""
-    names = {_bot_username()}
+    names = {_bot_username(state)}
     names.update(_bot_aliases())
     return {n for n in names if n}
 
@@ -2168,6 +2185,23 @@ def _migrate_legacy_group_state(state: dict) -> None:
         state.pop(key, None)
 
 
+def _remember_bot_username(state: dict) -> None:
+    """Cache this bot's username in state when the env var is set.
+
+    The intake runs with TELEGRAM_BRIDGE_BOT_USERNAME exported by
+    its hook script, so the first intake persists the name; later
+    processes that run without the export (the watchdog sweep
+    after a plain re-copy of the repo scripts) resolve it from
+    the cache instead of failing. Env wins: a present variable
+    overwrites a stale cache. When the variable is unset nothing
+    is written, so a truly fresh install keeps no username until
+    one is configured.
+    """
+    raw = os.environ.get(BOT_USERNAME_ENV, "")
+    if raw.strip():
+        state["bot_username"] = raw.strip().lstrip("@").lower()
+
+
 def _ensure_adapter_state(state: dict) -> dict:
     queue_core.ensure_state(state)
     state.setdefault("offset", 0)
@@ -2187,11 +2221,16 @@ def _ensure_adapter_state(state: dict) -> dict:
     # the FIRST group adopted gets this mode; every group after
     # that starts guarded until Muse sets its mode.
     state.setdefault("default_group_mode", GROUP_MODE_GUARDED)
+    # This bot's own username, cached in state (see
+    # _remember_bot_username): the intake persists it, so the
+    # watchdog sweep and every later process resolve it even
+    # without the install-time export.
+    _remember_bot_username(state)
     # Bot usernames the owner trusts in the group (his own Muse
     # bots). Seeded with this bot itself; the owner adds work /
     # business bots when they exist, via Muse (--set-trusted-bots),
     # never from Telegram.
-    state.setdefault("trusted_bots", [_bot_username()])
+    state.setdefault("trusted_bots", [_bot_username(state)])
     # Group chat ids on the private-channel allowlist: a listed
     # group is always trusted and the safety trips never apply
     # there, no matter who joins. Set only by Muse, on the owner's
@@ -2322,7 +2361,7 @@ def _handle_edited_message(state: dict, edited: dict) -> bool:
     new_class = classify_message(
         new_text,
         sender_is_owner=sender_id == state.get("owner_id"),
-        bot_username=_bot_username(),
+        bot_username=_bot_username(state),
         is_reply=bool(
             edited.get("reply_to_message") or edited.get("reply_to_message_id")
         ),
@@ -2562,7 +2601,7 @@ def _ingest_update(state: dict, update: dict, now: float, api_call=api) -> str:
     item_class = classify_message(
         text,
         sender_is_owner=sender_id == state["owner_id"],
-        bot_username=_bot_username(),
+        bot_username=_bot_username(state),
         # Even a greeting can be a follow-up when work is unfinished.
         # Legacy/unclassified records are work too. Completed records
         # and never-claimed ordinary talk do not make a lane active.
@@ -2712,7 +2751,7 @@ def ingest(state: dict, result: dict, now: float | None = None, api_call=api) ->
         raise RuntimeError(f"getUpdates failed: {result.get('description')}")
     _ensure_adapter_state(state)
     now = time.time() if now is None else now
-    bot_id = state.get("bot_id") or _bot_username()
+    bot_id = state.get("bot_id") or _bot_username(state)
     queue_core.prune_receipts(state, now)
     receipts = state.setdefault("receipts", {})
     for update in result.get("result", []):
@@ -3079,7 +3118,7 @@ def preclaim_filter(state: dict, now: float | None = None) -> list:
     (external_ids), in queue order.
     """
     now = time.time() if now is None else now
-    names = _bot_names()
+    names = _bot_names(state)
     closed = []
     for item in state.get("queue", []):
         if item.get("status") != queue_core.PENDING:
@@ -5414,9 +5453,9 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
             entry = entry.strip().lstrip("@").lower()
             if entry:
                 names.add(entry)
-        names.add(_bot_username())
         with store.transaction() as state:
             _ensure_adapter_state(state)
+            names.add(_bot_username(state))
             state["trusted_bots"] = sorted(names)
         print(json.dumps({"ok": True, "trusted_bots": sorted(names)}))
         return 0

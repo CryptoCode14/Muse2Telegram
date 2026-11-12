@@ -2087,3 +2087,65 @@ class BotUsernameRequiredTests(unittest.TestCase):
                 RuntimeError, "TELEGRAM_BRIDGE_BOT_USERNAME"
             ):
                 telegram._bot_username()
+
+
+class BotUsernameStateCacheTests(unittest.TestCase):
+    """The bot username survives a plain script re-copy: the intake
+    caches it in state, and later processes (the watchdog sweep)
+    resolve it from the cache when the env var is unset. A truly
+    fresh install (no env, no cache) still fails loudly."""
+
+    def test_env_unset_falls_back_to_cached_state_username(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                telegram._bot_username({"bot_username": "ExampleBot"}),
+                "examplebot",
+            )
+
+    def test_env_wins_over_cached_state_username(self):
+        with mock.patch.dict(
+            os.environ, {telegram.BOT_USERNAME_ENV: "@OtherBot"}
+        ):
+            self.assertEqual(
+                telegram._bot_username({"bot_username": "examplebot"}),
+                "otherbot",
+            )
+
+    def test_unset_env_and_empty_cache_still_fails_loudly(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                RuntimeError, "TELEGRAM_BRIDGE_BOT_USERNAME"
+            ):
+                telegram._bot_username({})
+
+    def test_blank_cached_username_is_ignored(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                RuntimeError, "TELEGRAM_BRIDGE_BOT_USERNAME"
+            ):
+                telegram._bot_username({"bot_username": "   "})
+
+    def test_ensure_adapter_state_caches_username_from_env(self):
+        with mock.patch.dict(
+            os.environ, {telegram.BOT_USERNAME_ENV: "@ExampleBot"}
+        ):
+            state = telegram._ensure_adapter_state({})
+        self.assertEqual(state["bot_username"], "examplebot")
+        self.assertEqual(state["trusted_bots"], ["examplebot"])
+
+    def test_ensure_adapter_state_env_overwrites_stale_cache(self):
+        with mock.patch.dict(
+            os.environ, {telegram.BOT_USERNAME_ENV: "NewBot"}
+        ):
+            state = telegram._ensure_adapter_state(
+                {"bot_username": "oldbot", "trusted_bots": ["oldbot"]}
+            )
+        self.assertEqual(state["bot_username"], "newbot")
+
+    def test_ensure_adapter_state_without_env_keeps_cache(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            state = telegram._ensure_adapter_state(
+                {"bot_username": "cachedbot", "trusted_bots": ["cachedbot"]}
+            )
+        self.assertEqual(state["bot_username"], "cachedbot")
+        self.assertEqual(state["trusted_bots"], ["cachedbot"])

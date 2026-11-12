@@ -435,6 +435,46 @@ class WatchdogSweepTests(unittest.TestCase):
         self.assertFalse(report["intake_recovered"])
 
 
+class WatchdogSweepBotUsernameTests(unittest.TestCase):
+    """The watchdog sweep resolves the bot username from the state
+    cache when TELEGRAM_BRIDGE_BOT_USERNAME is unset (Gus's
+    install: 13 failed sweeps after a re-copy wiped the export).
+    A truly fresh install still fails loudly."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "state.json"
+
+    def _env_without_bot_username(self):
+        env = dict(os.environ)
+        env.pop(telegram.BOT_USERNAME_ENV, None)
+        return env
+
+    def test_sweep_recycles_from_cached_username_without_env(self):
+        store, _token = _state_with_claimed(self.path, at=1000.0)
+        with store.transaction() as state:
+            state["bot_username"] = "ExampleBot"
+        with mock.patch.dict(
+            os.environ, self._env_without_bot_username(), clear=True
+        ):
+            report = telegram.watchdog_sweep(store, now=1700.0)
+        self.assertEqual(report["recycled"], ["100"])
+        self.assertEqual(store.load()["queue"][0]["status"], "pending")
+        # The cache survives the sweep untouched.
+        self.assertEqual(store.load()["bot_username"], "ExampleBot")
+
+    def test_sweep_without_env_or_cache_fails_loudly(self):
+        store, _token = _state_with_claimed(self.path, at=1000.0)
+        with mock.patch.dict(
+            os.environ, self._env_without_bot_username(), clear=True
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "TELEGRAM_BRIDGE_BOT_USERNAME"
+            ):
+                telegram.watchdog_sweep(store, now=1700.0)
+
+
 class WatchdogHealthTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

@@ -43,6 +43,10 @@ fi
 cd "$BRIDGE_HOME"
 export TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json
 export TELEGRAM_BRIDGE_SEND_CMD=~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender
+# No TELEGRAM_BRIDGE_BOT_USERNAME export here on purpose: the sweep
+# resolves the bot username from state.json, where the intake cached
+# it (see bridge_core.telegram._bot_username). A plain re-copy of
+# this script over an install must not break the sweep.
 export TELEGRAM_BRIDGE_HOOK_DEFINITIONS_DIR=~/hooks/definitions
 PAUSE_FILE=~/workspace/telegram-bridge/WATCHDOG_PAUSE
 REC_LOG=~/workspace/telegram-bridge/watchdog_recoveries.log
