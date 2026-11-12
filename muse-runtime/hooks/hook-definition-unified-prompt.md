@@ -7,8 +7,8 @@ telegram-bridge intake hook. It replaces the old router prompt
 `prompts/tier-deep.md` — kept in the repo for history only, do not
 install them).
 
-The prompt is ONE static text for every wake. It is 13043 chars,
-~3261 modelled tokens (chars/4). There is no per-batch
+The prompt is ONE static text for every wake. It is 13071 chars,
+~3268 modelled tokens (chars/4). There is no per-batch
 prompt selection any more: the decider prints only `wake` / `hold` /
 `done <ids>` / `empty`, and the intake hook pre-loads the agent's
 context into the payload as `context_md` (see `SETUP.md` Step 10 and
@@ -45,7 +45,7 @@ context into the payload as `context_md` (see `SETUP.md` Step 10 and
 
 ```
 <!-- Unified wake prompt (v2). ONE static prompt for every wake.
-     Size: 13043 chars, ~3261 modelled tokens (chars/4). Old standard prompt:
+     Size: 13071 chars, ~3268 modelled tokens (chars/4). Old standard prompt:
      13283 chars (~3321). Install: paste this whole file verbatim as the hook
      definition prompt (see hooks/hook-definition-unified-prompt.md). -->
 
@@ -57,7 +57,7 @@ Context: context_md is [USER]'s compact context, pre-loaded into this payload by
 
 Work from ~/workspace/muse-agent-bridge-eval with TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json and TELEGRAM_BRIDGE_SEND_CMD=~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender.
 
-Reply or close: DM: always reply. @mentions @YOUR_BOT_USERNAME: reply. Open group message from a human, no @mention: reply only when you have something useful to add; otherwise close it. A message @mentioning a different bot, or from another bot that doesn't mention you: close it. Never get into a back-and-forth with the other bots; only reply to another bot if it @mentions you or [USER] asked you to. Group routing: see the install-time routing note in SETUP.md.
+Reply or close: DM: always reply. @mentions @YOUR_BOT_USERNAME or a configured alias of it: reply. Open group message from a human, no @mention: reply only when you have something useful to add; otherwise close it. A message @mentioning a different bot, or from another bot that doesn't mention you: close it. Never get into a back-and-forth with the other bots; only reply to another bot if it @mentions you or [USER] asked you to. Group routing: see the install-time routing note in SETUP.md.
 
 Collab protocol (trusted multi-bot groups only): if group_mode_effective is trusted, this group has more than one Muse bot, and the telegram-collab-protocol skill is installed, read COLLAB_PROTOCOL.md in that skill folder and follow it instead of the silence rules below — say what you are doing, ask and answer by @mention, hand work to one named owner, one owner per task. An ack is still terminal and ack-only text stays a reaction. In any other group, the silence rules below apply.
 

@@ -15,6 +15,7 @@ cd ~/workspace/muse-agent-bridge-eval
 export TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json
 export TELEGRAM_BRIDGE_SEND_CMD=~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender
 export TELEGRAM_BRIDGE_BOT_USERNAME="YOUR_BOT_USERNAME"  # <-- set to your bot username
+# export TELEGRAM_BRIDGE_BOT_ALIASES=""  # <-- optional: short names that also @mention this bot, comma-separated, no @ (e.g. "Dorian")
 export TELEGRAM_BRIDGE_PAUSED_PATH=~/workspace/telegram-bridge/PAUSED
 export TELEGRAM_BRIDGE_HELD_PATH=~/workspace/telegram-bridge/held.jsonl
 # Settle window (seconds): when a message lands, intake waits out

@@ -323,5 +323,55 @@ class BotSenderTests(unittest.TestCase):
         self.assertEqual(result, "done 1")
 
 
+class PreclaimAliasTests(unittest.TestCase):
+    """preclaim_filter treats a configured alias like the bot's own
+    username: "@<alias>" is not noise, "@<someone else>" still is.
+    This is the layer that runs before the decider, so an alias
+    has to pass here too or the item never reaches the decider."""
+
+    def _state(self, text):
+        return {"queue": [{
+            "status": "pending", "chat_type": "group",
+            "text": text, "is_bot": False, "sender_name": "Westin",
+            "sender_id": OWNER, "external_id": 1, "replied_at": None,
+        }]}
+
+    def test_alias_mention_is_not_noise(self):
+        with mock.patch.dict(os.environ, {
+            "TELEGRAM_BRIDGE_BOT_USERNAME": BOT_USERNAME,
+            "TELEGRAM_BRIDGE_BOT_ALIASES": "Westin",
+        }):
+            closed = telegram.preclaim_filter(
+                self._state("@Westin check this"))
+        self.assertEqual(closed, [])
+
+    def test_alias_mention_is_case_insensitive(self):
+        with mock.patch.dict(os.environ, {
+            "TELEGRAM_BRIDGE_BOT_USERNAME": BOT_USERNAME,
+            "TELEGRAM_BRIDGE_BOT_ALIASES": "westin",
+        }):
+            closed = telegram.preclaim_filter(
+                self._state("@WESTIN check this"))
+        self.assertEqual(closed, [])
+
+    def test_unaliased_short_name_is_still_noise(self):
+        with mock.patch.dict(os.environ, {
+            "TELEGRAM_BRIDGE_BOT_USERNAME": BOT_USERNAME,
+        }, clear=False):
+            os.environ.pop("TELEGRAM_BRIDGE_BOT_ALIASES", None)
+            closed = telegram.preclaim_filter(
+                self._state("@Westin check this"))
+        self.assertEqual(closed, [1])
+
+    def test_other_bot_mention_is_still_noise_with_alias_set(self):
+        with mock.patch.dict(os.environ, {
+            "TELEGRAM_BRIDGE_BOT_USERNAME": BOT_USERNAME,
+            "TELEGRAM_BRIDGE_BOT_ALIASES": "Westin",
+        }):
+            closed = telegram.preclaim_filter(
+                self._state("@SomeOtherBot check this"))
+        self.assertEqual(closed, [1])
+
+
 if __name__ == "__main__":
     unittest.main()

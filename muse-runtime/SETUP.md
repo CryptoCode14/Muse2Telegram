@@ -222,6 +222,7 @@ Set these env vars for every bridge command and in the hook script:
 TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json
 TELEGRAM_BRIDGE_SEND_CMD=<path to telegram-sender>
 TELEGRAM_BRIDGE_BOT_USERNAME=<your bot username, no @>
+TELEGRAM_BRIDGE_BOT_ALIASES=<optional comma-separated short names, no @>
 TELEGRAM_BRIDGE_PAUSED_PATH=~/workspace/telegram-bridge/PAUSED
 TELEGRAM_BRIDGE_HELD_PATH=~/workspace/telegram-bridge/held.jsonl
 TELEGRAM_BRIDGE_SETTLE_SECONDS=2
@@ -230,6 +231,16 @@ TELEGRAM_BRIDGE_SETTLE_SECONDS=2
 In the hook script, set `TELEGRAM_BRIDGE_BOT_USERNAME` to your bot's
 username. The decider falls back to a default when the env var is unset
 — do not rely on the fallback; set it.
+
+`TELEGRAM_BRIDGE_BOT_ALIASES` is optional: comma-separated short
+names (no "@", e.g. `Dorian` for a bot whose username is
+`DorianCodingBot`). An `@<alias>` @mention wakes this bot just like
+`@<username>`, in the decider, the adapter's preclaim filter, and
+the typing indicator, and the unified prompt says so. This is
+per-bot: every bot that installs the repo sets its own aliases, and
+each bot only wakes for its own username and aliases — `@Dorian`
+wakes Dorian, `@Gus` wakes Gus, and so on. Unset, only the username
+counts.
 
 ## Step 5 — Ask the mode question (trusted or guarded)
 
@@ -391,7 +402,7 @@ The hook definition prompt is the unified prompt in
 definition prompt (replacing the placeholders), following the exact
 install steps in `muse-runtime/hooks/hook-definition-unified-prompt.md`.
 It is the woken agent's full instruction for the turn: one static text
-for every wake (13043 chars, ~3261 modelled tokens). There is no
+for every wake (13071 chars, ~3268 modelled tokens). There is no
 per-batch prompt selection any more: the decider prints only `wake` /
 `hold` / `done` / `empty`, and the intake hook pre-loads the agent's
 context into the wake payload as `context_md` (the bounded contents of

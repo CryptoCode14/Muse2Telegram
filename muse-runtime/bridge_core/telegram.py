@@ -490,6 +490,15 @@ def poll_lock_path() -> Path:
 BOT_USERNAME_ENV = "TELEGRAM_BRIDGE_BOT_USERNAME"
 DEFAULT_BOT_USERNAME = "usedhonda_muse_bot"
 
+#: Optional comma-separated short names that also @mention this bot
+#: (e.g. "Dorian" for a bot whose username is DorianCodingBot).
+#: Set with TELEGRAM_BRIDGE_BOT_ALIASES, no "@", case-insensitive.
+#: Unset means only the bot's username counts as a mention of it.
+#: Aliases are read by the intake classifier, the preclaim filter,
+#: and the decider, so all three layers agree on what counts as
+#: addressing this bot.
+BOT_ALIASES_ENV = "TELEGRAM_BRIDGE_BOT_ALIASES"
+
 #: An "@username" mention anywhere in the text. ANY mention — of
 #: this bot, of another agent, of the owner — is a protection
 #: signal for the intake classifier: a message that addresses
@@ -574,6 +583,20 @@ def _env_seconds(name: str, default):
 def _bot_username() -> str:
     raw = os.environ.get(BOT_USERNAME_ENV, "") or DEFAULT_BOT_USERNAME
     return raw.strip().lstrip("@").lower()
+
+
+def _bot_aliases() -> list:
+    raw = os.environ.get(BOT_ALIASES_ENV, "") or ""
+    return [a.strip().lstrip("@").lower() for a in raw.split(",") if a.strip()]
+
+
+def _bot_names() -> set:
+    """This bot's username plus every configured alias, all
+    lowercased, no "@". Used wherever a message is checked for
+    addressing this bot."""
+    names = {_bot_username()}
+    names.update(_bot_aliases())
+    return {n for n in names if n}
 
 
 def classify_message(
@@ -2882,7 +2905,7 @@ def preclaim_filter(state: dict, now: float | None = None) -> list:
     (external_ids), in queue order.
     """
     now = time.time() if now is None else now
-    bot = _bot_username()
+    names = _bot_names()
     closed = []
     for item in state.get("queue", []):
         if item.get("status") != queue_core.PENDING:
@@ -2895,9 +2918,9 @@ def preclaim_filter(state: dict, now: float | None = None) -> list:
         mentions = {
             m.group(0)[1:].lower() for m in MENTION_RE.finditer(text)
         }
-        mentions_this_bot = bot in mentions
+        mentions_this_bot = bool(mentions & names)
         sender_name = (item.get("sender_name") or "").strip().lstrip("@").lower()
-        is_this_bot = bool(sender_name) and sender_name == bot
+        is_this_bot = bool(sender_name) and sender_name in names
         noise = False
         if item.get("is_bot") and not is_this_bot and not mentions_this_bot:
             # Another bot talking, not to us.

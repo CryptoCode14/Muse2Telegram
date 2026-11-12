@@ -21,6 +21,11 @@ Routing (free-for-all + mention):
     worth adding.
   - A message @mentioning someone else, or a message from another bot
     that does not mention this bot, is not for it.
+  - A configured alias also counts as a mention of this bot:
+    TELEGRAM_BRIDGE_BOT_ALIASES is a comma-separated list of short
+    names (no "@", e.g. "Dorian" for a bot whose username is
+    DorianCodingBot), and "@<alias>" wakes it just like
+    "@<username>". Unset, only the username counts.
 While paused, only owner/admin commands wake the agent; everything
 else is held for the resume turn to answer or close.
 
@@ -43,6 +48,20 @@ import sys
 from pathlib import Path
 
 MY_BOT = os.environ.get("TELEGRAM_BRIDGE_BOT_USERNAME", "Westinmusebot").lower()
+
+#: Optional comma-separated short names that also @mention this bot
+#: (e.g. "Dorian" for a bot whose username is DorianCodingBot).
+#: Set with TELEGRAM_BRIDGE_BOT_ALIASES, no "@", case-insensitive.
+#: Unset means only the bot's username counts as a mention of it.
+BOT_ALIASES_ENV = "TELEGRAM_BRIDGE_BOT_ALIASES"
+
+
+def _bot_aliases():
+    raw = os.environ.get(BOT_ALIASES_ENV, "") or ""
+    return [a.strip().lstrip("@").lower() for a in raw.split(",") if a.strip()]
+
+
+ALIASES = _bot_aliases()
 PAUSED_PATH = os.environ.get(
     "TELEGRAM_BRIDGE_PAUSED_PATH", os.path.expanduser("~/workspace/telegram-bridge/PAUSED")
 )
@@ -60,11 +79,13 @@ COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: This bot's @mention as a standalone token. The lookarounds keep
-#: "@westinmusebot2", email-like "user@westinmusebot.com", and
+#: This bot's @mention as a standalone token — its username or any
+#: configured alias. The lookarounds keep "@westinmusebot2",
+#: email-like "user@westinmusebot.com", and
 #: "https://example.com/@westinmusebot" from matching.
 MENTION_ME_RE = re.compile(
-    r"(?<![A-Za-z0-9_/.])@" + re.escape(MY_BOT) + r"(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_/.])@(?:" + "|".join(
+        re.escape(n) for n in [MY_BOT] + ALIASES) + r")(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 
@@ -171,12 +192,14 @@ def hydrate_payload(payload, state_path=None):
 
 def _mentions_bot(text, bot_username):
     """True when the text @mentions this bot as a standalone token
-    (same lookarounds as MENTION_ME_RE)."""
+    (same lookarounds as MENTION_ME_RE): its username or any
+    configured alias."""
     if not bot_username:
         return False
+    names = [bot_username.lower()] + ALIASES
     rx = re.compile(
-        r"(?<![A-Za-z0-9_/.])@" + re.escape(bot_username.lower())
-        + r"(?![A-Za-z0-9_])",
+        r"(?<![A-Za-z0-9_/.])@(?:" + "|".join(
+            re.escape(n) for n in names) + r")(?![A-Za-z0-9_])",
         re.IGNORECASE,
     )
     return rx.search(text or "") is not None

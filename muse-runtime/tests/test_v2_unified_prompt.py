@@ -31,6 +31,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve()
 RUNTIME = HERE.parent.parent  # muse-runtime/
@@ -57,11 +58,15 @@ def load_decider():
     return module
 
 
-def run_decider(payload, paused=False):
+def run_decider(payload, paused=False, aliases=None):
     """Run the decider as a script (its real entry point) and return
     its stdout stripped."""
     env = dict(os.environ)
     env["TELEGRAM_BRIDGE_BOT_USERNAME"] = BOT_USERNAME
+    if aliases is None:
+        env.pop("TELEGRAM_BRIDGE_BOT_ALIASES", None)
+    else:
+        env["TELEGRAM_BRIDGE_BOT_ALIASES"] = aliases
     # Paused is a file's EXISTENCE, so the path must not exist at
     # all when the test is not paused.
     tmpdir = tempfile.mkdtemp()
@@ -147,6 +152,7 @@ class UnifiedPromptTests(unittest.TestCase):
             "carries no @mention",
             "Once a question is answered",
             "unless a new question comes up",
+            "or a configured alias of it",
         ):
             self.assertIn(phrase, text)
 
@@ -315,6 +321,22 @@ class DeciderOutputTests(unittest.TestCase):
             paused=True)
         self.assertEqual(out, "wake")
 
+    def test_at_alias_wakes(self):
+        # "@Westin" is a configured alias of the test bot
+        # (Westinmusebot): it wakes just like @Westinmusebot.
+        out = run_decider({"items": [
+            self._item(1, "@Westin check this", chat_type="group",
+                       sender_id=222)]}, aliases="Westin")
+        self.assertEqual(out, "wake")
+
+    def test_at_unaliased_short_name_still_closes(self):
+        # No aliases configured: "@Westin" mentions someone else,
+        # so the decider closes it with no wake.
+        out = run_decider({"items": [
+            self._item(1, "@Westin check this", chat_type="group",
+                       sender_id=222)]})
+        self.assertEqual(out, "done 1")
+
     def test_bot_message_without_mention_prints_done(self):
         out = run_decider({"items": [
             self._item(1, "beep boop", chat_type="group", sender_id=333,
@@ -377,6 +399,18 @@ class TypingPreWakeTests(unittest.TestCase):
                        is_bot=True, sender_name="@SomeOtherBot")),
             bot_username=BOT_USERNAME)
         self.assertIsNone(out)
+
+    def test_alias_fires_typing(self):
+        # "@Westin" is a configured alias here: typing fires for it
+        # just like for @Westinmusebot.
+        with mock.patch.dict(os.environ,
+                             {"TELEGRAM_BRIDGE_BOT_ALIASES": "Westin"}):
+            decider = load_decider()
+            out = decider.typing_chat_id(self._payload(
+                self._item(-777, "group", "@Westin what do you think?",
+                           sender_id=222)),
+                bot_username=BOT_USERNAME)
+            self.assertEqual(out, -777)
 
     def test_mention_of_another_bot_does_not_fire_typing(self):
         out = self.decider.typing_chat_id(self._payload(
