@@ -2,6 +2,9 @@
 
 Keeps the operational interface the wake hook drives:
 
+  --help, -h   print this usage and exit. Never polls, never touches
+               state: a probe must not become a second getUpdates
+               long-poll (Telegram answers that with HTTP 409).
   (no args)   fetch updates once, queue servable messages, claim one
               batch and print ONE wake payload JSON. Prints nothing
               when there is no work.
@@ -96,10 +99,10 @@ Keeps the operational interface the wake hook drives:
                            this first thing after waking and before
                            any step that may take over a minute; a
                            claim whose heartbeat goes stale for
-                           120s (TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS)
+                           600s (TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS)
                            is recycled on the next claim, so a turn
                            that died mid-work blocks its lane for
-                           minutes, not half an hour.
+                           about ten minutes, not half an hour.
   --watchdog               one watchdog pass: recycle claimed items
                            whose heartbeat went stale (a turn that
                            died mid-work) back to pending, and print
@@ -350,6 +353,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -420,8 +424,34 @@ DEFAULT_MAX_REPLY_AGE_CLAIMED = 86400.0
 #: Environment variable tuning the heartbeat horizon, in seconds:
 #: a claim whose heartbeat is older than this counts as abandoned
 #: and is recycled on the next claim (see
-#: queue_core.HEARTBEAT_STALE_SECONDS for why 120s).
+#: queue_core.HEARTBEAT_STALE_SECONDS for why 600s).
 HEARTBEAT_STALE_ENV = "TELEGRAM_BRIDGE_HEARTBEAT_STALE_SECONDS"
+
+#: Environment variable overriding the single-run poll lock path
+#: (tests point it at a temp file so the suite never shares the
+#: live lock — and never flakes against the live intake).
+POLL_LOCK_PATH_ENV = "TELEGRAM_BRIDGE_POLL_LOCK_PATH"
+
+
+def poll_lock_path() -> Path:
+    """Path of the single-run poll lock for this bot.
+
+    Keyed on the connector credential id, NOT on the state file:
+    the Bot API allows exactly one getUpdates long-poll per bot,
+    whatever state file the caller points at. A probe run from a
+    checkout without TELEGRAM_BRIDGE_STATE_PATH used the default
+    state path — and therefore a different lock file — and raced
+    the intake's long poll, which Telegram answers with HTTP 409.
+    One lock per credential id on this machine serializes every
+    poller for the bot, including manual probes.
+    """
+    override = os.environ.get(POLL_LOCK_PATH_ENV)
+    if override:
+        return Path(override)
+    return (
+        Path(tempfile.gettempdir())
+        / f"telegram-bridge-poll-{CREDENTIAL}.lock"
+    )
 
 #: Environment variable naming this deployment's bot username, used
 #: by the intake classifier to recognise messages addressed to the
@@ -2643,11 +2673,12 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
 
     Long-poll: fetch holds the request until a message arrives (see
     fetch_updates), so a message is picked up in ~0-1s. A single-run
-    lock (a flock on a lock file beside the state file, held for the
-    whole run) keeps overlapping harness ticks from running two long
-    polls at once: a second concurrent run returns None immediately
-    and the first one handles the poll. The lock is released when
-    this process exits, so a killed run never leaves a stale lock.
+    lock (a flock on a per-credential lock file, held for the whole
+    run — see poll_lock_path) keeps overlapping harness ticks from
+    running two long polls at once: a second concurrent run returns
+    None immediately and the first one handles the poll. The lock
+    is released when this process exits, so a killed run never
+    leaves a stale lock.
 
     Throttling is applied at claim time (apply_throttle): throttled
     items get a wake_after and stay pending instead of being dropped.
@@ -2656,7 +2687,11 @@ def run_once(store: JsonStateStore, fetch=fetch_updates, api_call=api) -> dict |
     after the transaction, best effort.
     """
     # Single-run lock: only one intake may long-poll at a time.
-    lock_path = store.path.with_name(store.path.name + ".poll.lock")
+    # The lock is per credential id (see poll_lock_path), not per
+    # state file, so a second poller for the same bot — whatever
+    # state path it was started with — bows out instead of racing
+    # the live long poll into a Telegram 409.
+    lock_path = poll_lock_path()
     lock_handle = open(lock_path, "a+")
     try:
         try:
@@ -3522,6 +3557,12 @@ def _group_mode_view(state: dict, chat_id) -> dict:
 
 def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=api) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] in (["--help"], ["-h"]):
+        # Help is read-only: print the module usage and exit before
+        # any state is opened, so a probe can never fall through
+        # to the poller and race the intake's long poll (HTTP 409).
+        print(__doc__.strip())
+        return 0
     store = JsonStateStore(path or state_path())
 
     if args[:1] == ["--adopt"] and len(args) in (2, 3):
@@ -4165,6 +4206,16 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
                 ok = queue_core.mark_send_failed(state, PLATFORM, target, token)
         print(json.dumps({"ok": ok}))
         return 0
+
+    if args and args[0].startswith("-"):
+        # No command matched: refuse instead of falling through to
+        # the poller. A mistyped flag used to silently start a
+        # second getUpdates long-poll (Telegram 409s the race).
+        print(json.dumps({
+            "ok": False,
+            "error": f"unknown command: {args[0]}",
+        }))
+        return 2
 
     payload = run_once(store, fetch=fetch, api_call=api_call)
     if payload:

@@ -1055,8 +1055,10 @@ class PendingExpiryTests(unittest.TestCase):
         self.assertFalse(by_id["r3"]["ever_claimed"])
         # Two later bounded polls (batch_size=1): each recycles the
         # stale claim and re-claims only the oldest item, leaving
-        # r1 behind in pending — recycled, but ever-claimed.
-        for poll_now in (1_200.0, 1_400.0):
+        # r1 behind in pending — recycled, but ever-claimed. The
+        # polls are spaced past the 600s heartbeat horizon, so each
+        # one finds the previous claim stale.
+        for poll_now in (1_700.0, 2_400.0):
             batch = queue_core.claim_batch(
                 state, platform="telegram", batch_size=1,
                 group_pending_ttl=None, stale_ttl=100.0, now=poll_now,

@@ -1,7 +1,7 @@
 """Tests for the claim heartbeat and the queue watchdog.
 
 A batch turn refreshes its heartbeat while it works; a claim whose
-heartbeat goes stale is recycled fast (about two minutes) instead of
+heartbeat goes stale is recycled (about ten minutes) instead of
 blocking its lane for the full stale TTL. A live turn that keeps
 heartbeating is never recycled for its age alone. The watchdog sweep
 recycles dead claims and never touches sending / replied / live ones.
@@ -60,9 +60,28 @@ class HeartbeatTests(unittest.TestCase):
             self.assertTrue(
                 queue_core.heartbeat(state, "telegram", 100, token, now=1100.0)
             )
-        # Heartbeat is 90s old at 1190: fresh, lane still busy.
+        # Heartbeat is 590s old at 1690: still fresh under the 600s
+        # horizon, lane still busy.
         with store.transaction() as state:
-            batch = queue_core.claim_batch(state, platform="telegram", now=1190.0)
+            batch = queue_core.claim_batch(state, platform="telegram", now=1690.0)
+        self.assertIsNone(batch)
+        self.assertEqual(self.items(store)[0]["status"], "claimed")
+
+    def test_late_wake_heartbeat_within_window(self):
+        # Regression: a turn that started ~8.5 minutes after its
+        # claim was polled used to find its claim already recycled
+        # (120s horizon) and its first heartbeat fenced out, so
+        # the intake re-woke a new turn and the cycle repeated
+        # without ever replying. With the 600s horizon the late
+        # first heartbeat still lands and the lane stays owned.
+        store, token = _state_with_claimed(self.path, at=1000.0)
+        with store.transaction() as state:
+            self.assertTrue(
+                queue_core.heartbeat(state, "telegram", 100, token, now=1510.0)
+            )
+        # Heartbeat is 10s old at 1520: fresh, lane still busy.
+        with store.transaction() as state:
+            batch = queue_core.claim_batch(state, platform="telegram", now=1520.0)
         self.assertIsNone(batch)
         self.assertEqual(self.items(store)[0]["status"], "claimed")
 
@@ -72,14 +91,14 @@ class HeartbeatTests(unittest.TestCase):
             self.assertTrue(
                 queue_core.heartbeat(state, "telegram", 100, token, now=1100.0)
             )
-        # Heartbeat is 130s old at 1230: stale, recycled and reclaimed.
+        # Heartbeat is 610s old at 1710: stale, recycled and reclaimed.
         with store.transaction() as state:
-            batch = queue_core.claim_batch(state, platform="telegram", now=1230.0)
+            batch = queue_core.claim_batch(state, platform="telegram", now=1710.0)
         self.assertIsNotNone(batch)
         self.assertNotEqual(batch["claim_token"], token)
         item = self.items(store)[0]
         self.assertEqual(item["status"], "claimed")
-        self.assertEqual(item["heartbeat_at"], 1230.0)
+        self.assertEqual(item["heartbeat_at"], 1710.0)
         self.assertTrue(item["ever_claimed"])
 
     def test_heartbeat_supersedes_claimed_at_ttl(self):
@@ -168,8 +187,10 @@ class WatchdogSweepTests(unittest.TestCase):
             queue_core.heartbeat(
                 state, "telegram", 200, live["claim_token"], now=1150.0
             )
+        # Sweep at 1700: the dead claim's heartbeat is 700s old
+        # (stale, recycled); the live turn's is 550s old (fresh).
         with store.transaction() as state:
-            report = queue_core.watchdog_sweep(state, now=1230.0)
+            report = queue_core.watchdog_sweep(state, now=1700.0)
         self.assertEqual(report["recycled"], ["100"])
         self.assertEqual(report["pending"], 1)
         self.assertEqual(report["claimed_live"], 1)

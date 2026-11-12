@@ -105,7 +105,13 @@ def run_cli(path, argv, fetch=None, stdin_text="", api_call=None, rate_path=None
     sys.stdin = io.StringIO(stdin_text)
     if rate_path is None:
         rate_path = Path(path).parent / "rate.json"
-    env = {telegram.RATE_PATH_ENV: str(rate_path)}
+    env = {
+        telegram.RATE_PATH_ENV: str(rate_path),
+        # Point the poll lock at a temp file so the suite never
+        # shares the live lock (and never flakes against the live
+        # intake holding it).
+        telegram.POLL_LOCK_PATH_ENV: str(Path(path).parent / "poll.lock"),
+    }
     try:
         with mock.patch.dict(os.environ, env):
             with redirect_stdout(out):
@@ -1470,7 +1476,9 @@ class LongPollTests(unittest.TestCase):
     def test_run_once_returns_none_when_poll_lock_held(self):
         import fcntl
 
-        lock_path = self.path.with_name(self.path.name + ".poll.lock")
+        # run_cli points the poll lock at this temp file (see
+        # POLL_LOCK_PATH_ENV): hold it, and the poll bows out.
+        lock_path = Path(self.path).parent / "poll.lock"
         fetch = FakeFetch([msg_update(1, OWNER, "private", OWNER, "hi")])
         with open(lock_path, "w", encoding="utf-8") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1479,6 +1487,45 @@ class LongPollTests(unittest.TestCase):
         state = JsonStateStore(self.path).load()
         self.assertEqual(state["offset"], 0)
         self.assertEqual(state["queue"], [])
+
+
+class HelpTests(unittest.TestCase):
+    """--help prints usage and exits without polling: a probe must
+    never become a second getUpdates long-poll (Telegram answers
+    the race with HTTP 409). An unknown flag is refused the same
+    way instead of silently falling through to the poller."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "state.json"
+        run_cli(self.path, ["--adopt", str(OWNER)])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_main(self, argv):
+        fetch = mock.Mock(side_effect=AssertionError("must not poll"))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = telegram.main(argv, fetch=fetch, path=self.path)
+        fetch.assert_not_called()
+        return rc, out.getvalue()
+
+    def test_help_prints_usage_and_exits_zero(self):
+        rc, text = self.run_main(["--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("--heartbeat", text)
+        self.assertIn("--watchdog", text)
+
+    def test_short_help_flag(self):
+        rc, text = self.run_main(["-h"])
+        self.assertEqual(rc, 0)
+        self.assertIn("--heartbeat", text)
+
+    def test_unknown_flag_refused_without_polling(self):
+        rc, text = self.run_main(["--bogus"])
+        self.assertEqual(rc, 2)
+        self.assertFalse(json.loads(text)["ok"])
 
 
 class MessageIdThreadingTests(unittest.TestCase):

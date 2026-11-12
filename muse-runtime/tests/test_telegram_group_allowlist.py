@@ -88,7 +88,13 @@ def run_cli(path, argv, fetch=None, stdin_text="", api_call=None, rate_path=None
     sys.stdin = io.StringIO(stdin_text)
     if rate_path is None:
         rate_path = Path(path).parent / "rate.json"
-    env = {telegram.RATE_PATH_ENV: str(rate_path)}
+    env = {
+        telegram.RATE_PATH_ENV: str(rate_path),
+        # Point the poll lock at a temp file so the suite never
+        # shares the live lock (and never flakes against the live
+        # intake holding it).
+        telegram.POLL_LOCK_PATH_ENV: str(Path(path).parent / "poll.lock"),
+    }
     try:
         with mock.patch.dict(os.environ, env):
             with redirect_stdout(out):

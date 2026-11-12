@@ -40,7 +40,7 @@ Claim discipline (the rules that keep wake turns from double-answering):
   heartbeat is stale (see ``HEARTBEAT_STALE_SECONDS``): a wake turn
   that died before sending must not block the queue forever, but a
   slow turn is never raced by a second claim. The heartbeat is the
-  fast path — a dead turn's claim recycles about two minutes after
+  fast path — a dead turn's claim recycles about ten minutes after
   its last heartbeat, not after the full stale TTL. The TTL
   (default 1800s) survives only as a backstop for items whose
   heartbeat was never recorded. After a recycle the old batch token
@@ -89,14 +89,16 @@ DEFAULT_STALE_TTL = 1800.0
 #: abandoned. The batch agent refreshes its heartbeat while it
 #: works (see ``heartbeat`` / ``heartbeat_batch``); a claim whose
 #: heartbeat is older than this is recycled on the next claim, so a
-#: turn that died mid-work blocks its lane for about two minutes
-#: instead of the full stale TTL. 120s: twice the worst observed
-#: wake latency (spawn + first action, ~60s), 24x the intake poll
-#: interval (5s), and short enough that the owner waits minutes,
-#: not half an hour, for a retry. A live turn heartbeats at least
-#: once a minute (wake prompt + automatic refresh on ack /
-#: claim-more), so it never trips this.
-HEARTBEAT_STALE_SECONDS = 120.0
+#: turn that died mid-work blocks its lane for about ten minutes
+#: instead of the full stale TTL. 600s: it covers the worst observed
+#: wake latency — a turn that started ~8.5 minutes after its claim
+#: was polled, whose first heartbeat hit the fence because the
+#: 120s horizon had already recycled the claim, so the intake
+#: re-woke a new turn and the cycle repeated without ever
+#: replying. A live turn heartbeats at least once a minute (wake
+#: prompt + automatic refresh on ack / claim-more), so it never
+#: trips this.
+HEARTBEAT_STALE_SECONDS = 600.0
 
 #: Default age (seconds since intake) after which an unclaimed
 #: group/supergroup item is expired by the claim-time sweep instead
