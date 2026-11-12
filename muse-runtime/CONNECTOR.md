@@ -125,7 +125,11 @@ so Telegram rejects the call with a 404.
   watchdog hook polls every 60s and recycles dead claims the same
   way, silently; it never sends a Telegram message and wakes an
   agent only when the sweep itself fails or the intake goes stale
-  (no successful poll for over 120 seconds).
+  (no successful poll for over 120 seconds). It also verifies the
+  install on every sweep — the intake hook definition (valid and
+  enabled), the checkout, the venv, and the sender — and wakes an
+  agent when a check fails, once per episode. A recovery is
+  reported when a stale intake or a failed health check clears.
 - Batching: when a batch holds several messages the agent sends ONE
   reply for all of them, not one per message. Before sending it
   re-checks with `--claim-more CHAT_ID CLAIM_TOKEN` (messages that

@@ -402,6 +402,17 @@ CONTEXT_TAIL = 8
 #: platform message id as the last stdout line on success.
 SEND_CMD_ENV = "TELEGRAM_BRIDGE_SEND_CMD"
 
+#: Environment variable naming the muse-runtime checkout the bridge
+#: runs from (the directory holding bridge_core/ and .venv). The
+#: hook scripts set it at install time; when unset, the health
+#: check derives it from this module's own location.
+BRIDGE_HOME_ENV = "BRIDGE_HOME"
+
+#: Environment variable naming the directory of hook definitions
+#: (default ~/hooks/definitions). The health check reads the
+#: intake hook definition from there.
+HOOK_DEFINITIONS_ENV = "TELEGRAM_BRIDGE_HOOK_DEFINITIONS_DIR"
+
 #: Seconds the fenced send waits for the send command before the
 #: outcome is recorded as unknown (the send may have gone out).
 #: Subprocess budget for one sender invocation. This must exceed the
@@ -655,6 +666,31 @@ def _heartbeat_stale():
     """The heartbeat horizon, from the environment."""
     return _env_seconds(
         HEARTBEAT_STALE_ENV, queue_core.HEARTBEAT_STALE_SECONDS
+    )
+
+
+def _bridge_health():
+    """The bridge-install health check for the watchdog sweep.
+
+    Paths come from the environment the hook scripts already set:
+    BRIDGE_HOME (the muse-runtime checkout),
+    TELEGRAM_BRIDGE_SEND_CMD, and
+    TELEGRAM_BRIDGE_HOOK_DEFINITIONS_DIR (default
+    ~/hooks/definitions). When BRIDGE_HOME is unset, derive the
+    checkout from this module's own location, so a bare CLI run
+    still checks the install it was imported from. See
+    ``queue_core.check_bridge_health`` for what is checked.
+    """
+    bridge_home = os.environ.get(BRIDGE_HOME_ENV)
+    if not bridge_home:
+        bridge_home = str(Path(__file__).resolve().parent.parent)
+    definitions_dir = os.environ.get(HOOK_DEFINITIONS_ENV)
+    if not definitions_dir:
+        definitions_dir = str(Path.home() / "hooks" / "definitions")
+    return queue_core.check_bridge_health(
+        definitions_dir=definitions_dir,
+        bridge_home=bridge_home,
+        send_cmd=os.environ.get(SEND_CMD_ENV),
     )
 
 
@@ -3725,14 +3761,17 @@ def watchdog_sweep(store: JsonStateStore, *, now: float | None = None) -> dict:
     died mid-work) back to pending, so the intake's next poll
     re-claims and re-wakes them. Never touches ``sending`` items,
     replied items, or live-heartbeat claims, and never sends
-    anything. Returns the sweep report (see
-    ``queue_core.watchdog_sweep``).
+    anything. Also verifies the bridge install (intake hook
+    definition, checkout, venv, sender — see
+    ``queue_core.check_bridge_health``). Returns the sweep report
+    (see ``queue_core.watchdog_sweep``).
     """
     with store.transaction() as state:
         _ensure_adapter_state(state)
         return queue_core.watchdog_sweep(
             state,
             heartbeat_stale=_heartbeat_stale(),
+            health=_bridge_health(),
             now=now,
         )
 
@@ -4576,8 +4615,10 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
     if args[:1] == ["--watchdog"]:
         # --watchdog: one watchdog pass — recycle claimed items
         # whose heartbeat went stale (a turn that died mid-work)
-        # back to pending, and report queue health. Never touches
-        # sending / replied / live claims, never sends anything.
+        # back to pending, verify the bridge install (intake hook
+        # definition, checkout, venv, sender), and report queue
+        # health. Never touches sending / replied / live claims,
+        # never sends anything.
         # Prints the sweep report JSON. The hook script calls this
         # every few minutes; the intake's next poll re-claims and
         # re-wakes anything recycled here.

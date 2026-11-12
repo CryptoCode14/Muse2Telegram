@@ -122,7 +122,8 @@ muse-runtime/
   hooks/
     telegram-bridge-intake.sh   the hook script (polls, decides, wakes)
     telegram-bridge-decide.py   the router (wake / hold / done)
-    telegram-bridge-watchdog.sh the queue watchdog (recycles dead claims)
+    telegram-bridge-watchdog.sh the queue watchdog (recycles dead claims,
+                                verifies the install)
     telegram-bridge-watchdog.json
                                 the watchdog hook definition (60s poll)
   prompts/
@@ -177,7 +178,12 @@ Copy the pieces to where they live on this host. Use these exact paths
   looked at. It never sends a Telegram
   message, never closes work, and never touches "sending" items. It
   is silent on health and on successful repair, and wakes an agent
-  only when the sweep itself fails or the intake is stale. To stop it sweeping by hand,
+  only when the sweep itself fails, the intake is stale, or a
+  health check fails. It also verifies the install on every
+  sweep — the intake hook definition (valid and enabled), the
+  checkout, the venv, and the sender — and wakes an agent when
+  a check fails, once per episode. A recovery is reported when
+  a stale intake or a failed health check clears. To stop it sweeping by hand,
   create `~/workspace/telegram-bridge/WATCHDOG_PAUSE`.
 - Prompts: the unified prompt is installed as the hook definition
   prompt itself (see Step 10); do NOT copy the superseded
@@ -431,8 +437,11 @@ has no timestamps and will not parse. It recycles claimed items
 whose heartbeat went stale — a
 turn that died mid-work — back to pending, so the intake's next poll
 re-claims and re-wakes them. It also wakes an agent if the intake
-has not polled successfully in over 120 seconds. It never sends a Telegram message and
-wakes an agent only when the sweep itself fails or the intake is stale. **Done looks like:**
+has not polled successfully in over 120 seconds, or if a health
+check fails (intake definition invalid or disabled, or checkout,
+venv, or sender missing). It never sends a Telegram message and
+wakes an agent only when the sweep itself fails, the intake is
+stale, or a health check fails. **Done looks like:**
 the hook is enabled, polling every 60s, and a dry run exits silently
 with a healthy sweep report.
 

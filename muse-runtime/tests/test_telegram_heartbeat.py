@@ -10,6 +10,7 @@ No Muse credentials, Telegram calls, or external sender are used.
 """
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -36,6 +37,42 @@ def _state_with_claimed(path, *, count=1, at=1000.0, chat_id=111):
             )
         batch = queue_core.claim_batch(state, platform="telegram", now=at)
     return store, batch["claim_token"]
+
+
+def _healthy_install(root):
+    """A tmp bridge install the health check can verify.
+
+    Returns {"definitions_dir": ..., "bridge_home": ...,
+    "send_cmd": ...} — a definitions dir with a valid intake
+    definition, a checkout with bridge_core + venv, and a sender."""
+    defs = root / "definitions"
+    defs.mkdir(parents=True, exist_ok=True)
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    intake_script = scripts / "telegram-bridge-intake.sh"
+    intake_script.write_text("#!/bin/sh\n")
+    (defs / "telegram-bridge.json").write_text(json.dumps({
+        "version": 1, "id": "telegram-bridge", "enabled": True,
+        "script_path": str(intake_script),
+        "poll_interval_secs": 5,
+        "created_at_ms": 1794471544542,
+    }))
+    home = root / "checkout"
+    (home / "bridge_core").mkdir(parents=True, exist_ok=True)
+    (home / "bridge_core" / "telegram.py").write_text("")
+    (home / "bridge_core" / "queue.py").write_text("")
+    venv_python = home / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True, exist_ok=True)
+    venv_python.write_text("")
+    venv_python.chmod(0o755)
+    sender = root / "telegram-sender"
+    sender.write_text("")
+    sender.chmod(0o755)
+    return {
+        "definitions_dir": defs,
+        "bridge_home": home,
+        "send_cmd": str(sender),
+    }
 
 
 class HeartbeatTests(unittest.TestCase):
@@ -256,6 +293,9 @@ class WatchdogSweepTests(unittest.TestCase):
             # No poll ever recorded: no age to judge, never stale.
             "intake_age_seconds": None, "intake_stale": False,
             "intake_wake": False,
+            # No health data supplied: not checked, never wakes.
+            "health": None, "health_ok": None, "health_wake": False,
+            "health_recovered": False, "intake_recovered": False,
         })
 
     def _intake_state(self, last_poll):
@@ -321,6 +361,175 @@ class WatchdogSweepTests(unittest.TestCase):
         self.assertIsNone(report["intake_age_seconds"])
         self.assertFalse(report["intake_stale"])
         self.assertFalse(report["intake_wake"])
+
+    def test_sweep_healthy_health_reports_ok(self):
+        store = JsonStateStore(self.path)
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(
+                state, health={"ok": True, "checks": {}}, now=2000.0
+            )
+        self.assertTrue(report["health_ok"])
+        self.assertFalse(report["health_wake"])
+        self.assertFalse(report["health_recovered"])
+        self.assertFalse(report["intake_recovered"])
+
+    def test_sweep_unhealthy_health_wakes_once_per_episode(self):
+        store = JsonStateStore(self.path)
+        bad = {"ok": False, "checks": {}}
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, health=bad, now=2000.0)
+        self.assertFalse(report["health_ok"])
+        self.assertTrue(report["health_wake"])
+        # Second unhealthy sweep a minute later: still broken,
+        # silent (cooldown, same episode).
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, health=bad, now=2060.0)
+        self.assertFalse(report["health_ok"])
+        self.assertFalse(report["health_wake"])
+        # After the 10-minute cooldown: wakes again.
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, health=bad, now=2601.0)
+        self.assertTrue(report["health_wake"])
+
+    def test_sweep_health_recovery_reports_recovered(self):
+        store = JsonStateStore(self.path)
+        bad = {"ok": False, "checks": {}}
+        good = {"ok": True, "checks": {}}
+        with store.transaction() as state:
+            queue_core.watchdog_sweep(state, health=bad, now=2000.0)
+        # The install recovers: the clearing sweep reports it, so
+        # the repair is only counted once fresh output is seen.
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, health=good, now=2060.0)
+        self.assertTrue(report["health_ok"])
+        self.assertFalse(report["health_wake"])
+        self.assertTrue(report["health_recovered"])
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, health=good, now=2120.0)
+        self.assertFalse(report["health_recovered"])
+
+    def test_sweep_without_health_reports_unchecked(self):
+        store = JsonStateStore(self.path)
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, now=2000.0)
+        self.assertIsNone(report["health_ok"])
+        self.assertIsNone(report["health"])
+        self.assertFalse(report["health_wake"])
+        self.assertFalse(report["health_recovered"])
+
+    def test_sweep_intake_recovery_reports_recovered(self):
+        store = self._intake_state(1800.0)
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, now=2000.0)
+        self.assertTrue(report["intake_wake"])
+        # The intake recovers: a fresh poll ends the episode, and
+        # the clearing sweep reports the recovery.
+        with store.transaction() as state:
+            state["last_successful_poll"] = 2090.0
+            report = queue_core.watchdog_sweep(state, now=2100.0)
+        self.assertFalse(report["intake_stale"])
+        self.assertTrue(report["intake_recovered"])
+        with store.transaction() as state:
+            report = queue_core.watchdog_sweep(state, now=2160.0)
+        self.assertFalse(report["intake_recovered"])
+
+
+class WatchdogHealthTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.install = _healthy_install(self.root)
+
+    def health(self, **overrides):
+        args = dict(self.install)
+        args.update(overrides)
+        return queue_core.check_bridge_health(**args)
+
+    def _definition(self):
+        path = self.install["definitions_dir"] / "telegram-bridge.json"
+        return path, json.loads(path.read_text())
+
+    def test_healthy_install_reports_ok(self):
+        report = self.health()
+        self.assertTrue(report["ok"])
+        self.assertEqual(
+            set(report["checks"]),
+            {"intake_definition", "checkout", "venv", "sender"},
+        )
+        for check in report["checks"].values():
+            self.assertTrue(check["ok"])
+
+    def test_missing_definition_file(self):
+        (self.install["definitions_dir"] / "telegram-bridge.json").unlink()
+        report = self.health()
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["checks"]["intake_definition"]["ok"])
+        self.assertTrue(report["checks"]["checkout"]["ok"])
+
+    def test_definition_not_json(self):
+        (self.install["definitions_dir"] / "telegram-bridge.json").write_text(
+            "not json {"
+        )
+        report = self.health()
+        self.assertFalse(report["checks"]["intake_definition"]["ok"])
+
+    def test_definition_missing_created_at_ms(self):
+        # The shipped template has no created_at_ms: a definition
+        # copied from it verbatim never runs. The check must catch
+        # exactly that.
+        path, data = self._definition()
+        del data["created_at_ms"]
+        path.write_text(json.dumps(data))
+        report = self.health()
+        self.assertFalse(report["checks"]["intake_definition"]["ok"])
+        self.assertIn(
+            "created_at_ms",
+            report["checks"]["intake_definition"]["detail"],
+        )
+
+    def test_definition_created_at_ms_wrong_type(self):
+        path, data = self._definition()
+        data["created_at_ms"] = "1794471544542"
+        path.write_text(json.dumps(data))
+        report = self.health()
+        self.assertFalse(report["checks"]["intake_definition"]["ok"])
+
+    def test_definition_disabled(self):
+        path, data = self._definition()
+        data["enabled"] = False
+        path.write_text(json.dumps(data))
+        report = self.health()
+        self.assertFalse(report["checks"]["intake_definition"]["ok"])
+
+    def test_definition_script_missing(self):
+        path, data = self._definition()
+        data["script_path"] = str(self.root / "scripts" / "no-such.sh")
+        path.write_text(json.dumps(data))
+        report = self.health()
+        self.assertFalse(report["checks"]["intake_definition"]["ok"])
+
+    def test_checkout_missing(self):
+        report = self.health(bridge_home=self.root / "no-checkout")
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["checks"]["checkout"]["ok"])
+
+    def test_venv_python_missing(self):
+        (self.install["bridge_home"] / ".venv" / "bin" / "python").unlink()
+        report = self.health()
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["checks"]["venv"]["ok"])
+        self.assertTrue(report["checks"]["checkout"]["ok"])
+
+    def test_sender_missing(self):
+        report = self.health(send_cmd=str(self.root / "no-sender"))
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["checks"]["sender"]["ok"])
+
+    def test_sender_not_configured(self):
+        report = self.health(send_cmd=None)
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["checks"]["sender"]["ok"])
 
 
 class HeartbeatCliTests(unittest.TestCase):
@@ -391,6 +600,41 @@ class HeartbeatCliTests(unittest.TestCase):
         self.assertEqual(result["intake_age_seconds"], 10.0)
         self.assertFalse(result["intake_stale"])
         self.assertFalse(result["intake_wake"])
+
+    def _env(self, **overrides):
+        install = _healthy_install(Path(self.temp.name) / "cli-install")
+        env = {
+            "BRIDGE_HOME": str(install["bridge_home"]),
+            "TELEGRAM_BRIDGE_SEND_CMD": install["send_cmd"],
+            "TELEGRAM_BRIDGE_HOOK_DEFINITIONS_DIR": str(
+                install["definitions_dir"]
+            ),
+        }
+        env.update(overrides)
+        return env, install
+
+    def test_cli_watchdog_reports_healthy_bridge(self):
+        env, _install = self._env()
+        with mock.patch.dict(os.environ, env):
+            code, result = self.run_cli(["--watchdog"])
+        self.assertEqual(code, 0)
+        self.assertTrue(result["health_ok"])
+        self.assertFalse(result["health_wake"])
+
+    def test_cli_watchdog_reports_unhealthy_bridge(self):
+        env, install = self._env()
+        path = install["definitions_dir"] / "telegram-bridge.json"
+        data = json.loads(path.read_text())
+        del data["created_at_ms"]
+        path.write_text(json.dumps(data))
+        with mock.patch.dict(os.environ, env):
+            code, result = self.run_cli(["--watchdog"])
+        self.assertEqual(code, 0)
+        self.assertFalse(result["health_ok"])
+        self.assertTrue(result["health_wake"])
+        self.assertFalse(
+            result["health"]["checks"]["intake_definition"]["ok"]
+        )
 
 
 if __name__ == "__main__":

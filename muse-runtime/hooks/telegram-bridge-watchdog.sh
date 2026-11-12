@@ -5,10 +5,14 @@
 # re-claims and re-wakes it. Also checks intake liveness: if the
 # intake has not polled successfully in over INTAKE_STALE_SECONDS
 # (reported by the sweep as intake_wake, once per stale episode),
-# wake an agent so the stuck intake gets looked at. Silent on
+# wake an agent so the stuck intake gets looked at. Also verifies
+# the install on every sweep — the intake hook definition (valid
+# and enabled), the checkout, the venv, and the sender — and wakes
+# an agent when a check fails, once per episode. Silent on
 # health and on successful repair (recovery is logged to
 # watchdog_recoveries.log for the supervisor to report). Wakes an
-# agent ONLY when the sweep itself fails or the intake is stale.
+# agent ONLY when the sweep itself fails, the intake is stale, or
+# a health check fails.
 # Never sends a Telegram message, never closes work, never touches
 # "sending" items (their send outcome is unknown — only an operator
 # reconciles those), never touches a live-heartbeat claim.
@@ -27,6 +31,8 @@ fi
 : "${BRIDGE_HOME:?set BRIDGE_HOME to the muse-runtime directory of the bridge checkout}"
 cd "$BRIDGE_HOME"
 export TELEGRAM_BRIDGE_STATE_PATH=~/workspace/telegram-bridge/state.json
+export TELEGRAM_BRIDGE_SEND_CMD=~/workspace/custom-connectors/custom.telegram-muse-bot/bin/telegram-sender
+export TELEGRAM_BRIDGE_HOOK_DEFINITIONS_DIR=~/hooks/definitions
 PAUSE_FILE=~/workspace/telegram-bridge/WATCHDOG_PAUSE
 REC_LOG=~/workspace/telegram-bridge/watchdog_recoveries.log
 STATE_DIR="$HOME/hooks/state/telegram-bridge-watchdog"
@@ -58,6 +64,10 @@ recycled=$(python3 -c "import json,sys; print(len(json.load(open('$sweep_out')).
 pending=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('pending', 0))" 2>/dev/null || echo 0)
 intake_wake=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('intake_wake', False))" 2>/dev/null || echo False)
 intake_age=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('intake_age_seconds'))" 2>/dev/null || echo null)
+health_wake=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('health_wake', False))" 2>/dev/null || echo False)
+health_failed=$(python3 -c "import json,sys; d=json.load(open('$sweep_out')).get('health') or {}; print(','.join(n for n,c in d.get('checks', {}).items() if not c.get('ok')))" 2>/dev/null || echo "")
+health_recovered=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('health_recovered', False))" 2>/dev/null || echo False)
+intake_recovered=$(python3 -c "import json,sys; print(json.load(open('$sweep_out')).get('intake_recovered', False))" 2>/dev/null || echo False)
 rm -f "$sweep_out"
 
 # Stale intake: wake once per episode (the sweep enforces the
@@ -66,6 +76,23 @@ rm -f "$sweep_out"
 if [ "$intake_wake" = "True" ]; then
   printf '%s intake-stale age=%s recycled=%s pending=%s\n' "$ts_now" "$intake_age" "$recycled" "$pending" >> "$REC_LOG"
   wake "telegram bridge intake stale - no successful poll for ${intake_age}s" "{\"at\":\"$ts_now\",\"intake_age_seconds\":$intake_age,\"recycled\":$recycled,\"pending\":$pending}"
+fi
+
+# Failed health check: wake once per episode (the sweep enforces
+# the cooldown and clears it when the install recovers). This exits
+# via wake, so a broken install is reported instead of "healthy".
+# The watchdog never repairs a definition, checkout, venv, or
+# sender itself — the wake is the repair path.
+if [ "$health_wake" = "True" ]; then
+  printf '%s health failed checks=%s recycled=%s pending=%s\n' "$ts_now" "$health_failed" "$recycled" "$pending" >> "$REC_LOG"
+  wake "telegram bridge health check failed - $health_failed" "{\"at\":\"$ts_now\",\"failed_checks\":\"$health_failed\",\"recycled\":$recycled,\"pending\":$pending}"
+fi
+
+# A recovery is only counted once fresh output is seen (the sweep
+# reports it on the clearing sweep): log it so the supervisor can
+# report that a stale intake or a failed health check cleared.
+if [ "$health_recovered" = "True" ] || [ "$intake_recovered" = "True" ]; then
+  printf '%s recovered health=%s intake=%s pending=%s\n' "$ts_now" "$health_recovered" "$intake_recovered" "$pending" >> "$REC_LOG"
 fi
 
 if [ "$recycled" -gt 0 ]; then

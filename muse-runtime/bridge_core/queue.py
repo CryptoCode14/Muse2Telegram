@@ -78,7 +78,9 @@ and ``replied_at`` so intake latency can be measured end to end.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import secrets
 import time
 
@@ -163,6 +165,17 @@ INTAKE_STALE_WAKE_COOLDOWN_SECONDS = 600.0
 #: State key recording the last intake-stale wake (epoch seconds),
 #: so the sweep can enforce the cooldown above.
 LAST_INTAKE_STALE_WAKE_KEY = "last_intake_stale_wake"
+
+#: Minimum gap (seconds) between bridge-health wakes while the
+#: install stays unhealthy: same one-wake-per-episode pattern as
+#: the intake-stale cooldown. A healthy sweep clears the episode.
+HEALTH_WAKE_COOLDOWN_SECONDS = 600.0
+
+#: State key recording the last bridge-health wake (epoch seconds).
+LAST_HEALTH_WAKE_KEY = "last_health_wake"
+
+#: The intake hook definition the health check verifies.
+INTAKE_DEFINITION_FILENAME = "telegram-bridge.json"
 
 #: Intake classifications stored on the queue record as
 #: ``item_class``. Only CLASS_CONVERSATION ("ordinary conversation")
@@ -952,6 +965,136 @@ def heartbeat_batch(state: dict, token, *, now: float | None = None) -> int:
     return refreshed
 
 
+def check_bridge_health(*, definitions_dir, bridge_home, send_cmd=None):
+    """Verify the bridge install the intake depends on.
+
+    Reads only; never repairs anything. Four checks, one per thing
+    the intake needs to poll and the turn needs to reply:
+
+    - ``intake_definition``: the intake hook definition at
+      ``definitions_dir/telegram-bridge.json`` parses, is enabled,
+      carries ``created_at_ms`` (the runtime stamps it when the
+      hook is created through the hook tool — a definition copied
+      from the shipped template has none and never runs), and
+      names an intake script that exists.
+    - ``checkout``: ``bridge_home`` holds ``bridge_core`` with the
+      modules the CLI imports.
+    - ``venv``: ``bridge_home/.venv/bin/python`` exists and is
+      executable — the interpreter the intake runs under.
+    - ``sender``: the send command exists and is executable; a
+      turn that cannot send can poll but never reply.
+
+    Returns ``{"ok": bool, "checks": {name: {"ok": bool,
+    "detail": str}}}``. ``ok`` is False when any single check
+    fails. The caller (the watchdog sweep) decides whether a
+    failure wakes an agent; this function only reports.
+    """
+    checks = {}
+
+    definition_path = os.path.join(
+        os.path.expanduser(str(definitions_dir)), INTAKE_DEFINITION_FILENAME
+    )
+    if not os.path.isfile(definition_path):
+        checks["intake_definition"] = {
+            "ok": False,
+            "detail": f"definition file missing: {definition_path}",
+        }
+    else:
+        try:
+            with open(definition_path, encoding="utf-8") as handle:
+                definition = json.load(handle)
+        except (OSError, ValueError) as exc:
+            checks["intake_definition"] = {
+                "ok": False,
+                "detail": f"definition file is not valid JSON: {exc}",
+            }
+        else:
+            checks["intake_definition"] = _check_definition(definition)
+
+    home = os.path.expanduser(str(bridge_home))
+    if not os.path.isdir(home):
+        checks["checkout"] = {
+            "ok": False,
+            "detail": f"checkout missing: {home}",
+        }
+        checks["venv"] = {
+            "ok": False,
+            "detail": f"checkout missing: {home}",
+        }
+    else:
+        missing = [
+            name
+            for name in ("bridge_core/telegram.py", "bridge_core/queue.py")
+            if not os.path.isfile(os.path.join(home, name))
+        ]
+        if missing:
+            checks["checkout"] = {
+                "ok": False,
+                "detail": f"checkout missing files: {', '.join(missing)}",
+            }
+        else:
+            checks["checkout"] = {"ok": True, "detail": "bridge_core present"}
+        venv_python = os.path.join(home, ".venv", "bin", "python")
+        if not os.path.isfile(venv_python) or not os.access(
+            venv_python, os.X_OK
+        ):
+            checks["venv"] = {
+                "ok": False,
+                "detail": f"venv python missing or not executable: {venv_python}",
+            }
+        else:
+            checks["venv"] = {"ok": True, "detail": "venv python present"}
+
+    if not send_cmd:
+        checks["sender"] = {
+            "ok": False,
+            "detail": "TELEGRAM_BRIDGE_SEND_CMD is not set",
+        }
+    else:
+        sender_path = os.path.expanduser(str(send_cmd))
+        if not os.path.isfile(sender_path) or not os.access(
+            sender_path, os.X_OK
+        ):
+            checks["sender"] = {
+                "ok": False,
+                "detail": f"sender missing or not executable: {sender_path}",
+            }
+        else:
+            checks["sender"] = {"ok": True, "detail": "sender present"}
+
+    return {"ok": all(check["ok"] for check in checks.values()), "checks": checks}
+
+
+def _check_definition(definition):
+    """Check one parsed intake hook definition (see
+    ``check_bridge_health``)."""
+    if not isinstance(definition, dict):
+        return {"ok": False, "detail": "definition is not an object"}
+    created = definition.get("created_at_ms")
+    if type(created) is not int:
+        return {
+            "ok": False,
+            "detail": "definition has no created_at_ms: it was copied "
+            "from the shipped template instead of created through the "
+            "hook tool, so the runtime never runs it — recreate it "
+            "through the hook tool",
+        }
+    if definition.get("enabled") is not True:
+        return {"ok": False, "detail": "definition is disabled"}
+    script_path = definition.get("script_path") or ""
+    script = os.path.expanduser(str(script_path))
+    if not script or not os.path.isfile(script):
+        return {
+            "ok": False,
+            "detail": f"intake script missing: {script or script_path}",
+        }
+    poll = definition.get("poll_interval_secs")
+    detail = "valid, enabled"
+    if isinstance(poll, (int, float)):
+        detail += f", poll {poll}s"
+    return {"ok": True, "detail": detail}
+
+
 def watchdog_sweep(
     state: dict,
     *,
@@ -959,6 +1102,7 @@ def watchdog_sweep(
     stale_ttl: float = DEFAULT_STALE_TTL,
     active_heartbeat_stale: float | None = None,
     warm_baton_timeout: float = WARM_BATON_TIMEOUT_SECONDS,
+    health: dict | None = None,
     now: float | None = None,
 ) -> dict:
     """One watchdog pass: recycle dead claims, report queue health
@@ -981,19 +1125,36 @@ def watchdog_sweep(
     is older than ``INTAKE_STALE_SECONDS``, and ``intake_wake``
     is True only on the first stale sweep of an episode (further
     sweeps stay silent for ``INTAKE_STALE_WAKE_COOLDOWN_SECONDS``,
-    and a fresh poll clears the episode). The sweep only reports:
-    the hook script reads ``intake_wake`` and wakes an agent.
-    This catches a stuck intake while the runtime is alive; it
-    cannot cover a dead runtime — if the runtime itself is down,
-    this sweep never runs either. A state with no recorded poll
-    yet (fresh install, intake never ran) reports no age and is
-    never stale: there is nothing to judge yet.
+    and a fresh poll clears the episode). ``intake_recovered``
+    is True on the one sweep where a stale episode clears, so a
+    repair is only counted once fresh output is actually seen.
+    The sweep only reports: the hook script reads ``intake_wake``
+    and wakes an agent. This catches a stuck intake while the
+    runtime is alive; it cannot cover a dead runtime — if the
+    runtime itself is down, this sweep never runs either. A state
+    with no recorded poll yet (fresh install, intake never ran)
+    reports no age and is never stale: there is nothing to judge
+    yet.
+
+    When the caller passes ``health`` (the report from
+    ``check_bridge_health``), the sweep reports it the same way:
+    ``health_ok`` is True when the install is healthy,
+    ``health_wake`` is True only on the first unhealthy sweep of
+    an episode (further sweeps stay silent for
+    ``HEALTH_WAKE_COOLDOWN_SECONDS``, and a healthy sweep clears
+    the episode), and ``health_recovered`` is True on the one
+    sweep where an unhealthy episode clears. When ``health`` is
+    None (the caller did not check), ``health_ok`` and ``health``
+    are None and nothing wakes: an unchecked install is reported
+    as unchecked, never as healthy.
 
     Returns ``{"recycled": [external_id, ...], "pending": n,
     "claimed_live": n, "sending": n, "intake_age_seconds": age
-    | None, "intake_stale": bool, "intake_wake": bool}`` — counts
-    taken after the recycle, so ``pending`` includes the items
-    just freed.
+    | None, "intake_stale": bool, "intake_wake": bool,
+    "intake_recovered": bool, "health": health | None,
+    "health_ok": bool | None, "health_wake": bool,
+    "health_recovered": bool}`` — counts taken after the recycle,
+    so ``pending`` includes the items just freed.
     """
     ensure_state(state)
     now = _now(now)
@@ -1010,15 +1171,21 @@ def watchdog_sweep(
         intake_age = None
         intake_stale = False
         intake_wake = False
+        intake_recovered = False
     else:
         intake_age = now - last_poll
         intake_stale = intake_age > INTAKE_STALE_SECONDS
         if not intake_stale:
             # Fresh poll ends the stale episode: clear the wake
-            # marker so the next episode wakes promptly.
-            state.pop(LAST_INTAKE_STALE_WAKE_KEY, None)
+            # marker so the next episode wakes promptly. Report
+            # the recovery on this one sweep, so the repair is
+            # only counted once fresh output is seen.
+            intake_recovered = (
+                state.pop(LAST_INTAKE_STALE_WAKE_KEY, None) is not None
+            )
             intake_wake = False
         else:
+            intake_recovered = False
             last_wake = state.get(LAST_INTAKE_STALE_WAKE_KEY)
             if (
                 not isinstance(last_wake, (int, float))
@@ -1028,6 +1195,31 @@ def watchdog_sweep(
                 intake_wake = True
             else:
                 intake_wake = False
+    if health is None:
+        health_ok = None
+        health_wake = False
+        health_recovered = False
+    else:
+        health_ok = bool(health.get("ok", False))
+        if health_ok:
+            # Healthy sweep ends the unhealthy episode: clear the
+            # wake marker so the next episode wakes promptly, and
+            # report the recovery on this one sweep.
+            health_recovered = (
+                state.pop(LAST_HEALTH_WAKE_KEY, None) is not None
+            )
+            health_wake = False
+        else:
+            health_recovered = False
+            last_wake = state.get(LAST_HEALTH_WAKE_KEY)
+            if (
+                not isinstance(last_wake, (int, float))
+                or now - last_wake > HEALTH_WAKE_COOLDOWN_SECONDS
+            ):
+                state[LAST_HEALTH_WAKE_KEY] = now
+                health_wake = True
+            else:
+                health_wake = False
     counts_now = counts(state)
     return {
         "recycled": [item["external_id"] for item in recycled],
@@ -1037,6 +1229,11 @@ def watchdog_sweep(
         "intake_age_seconds": intake_age,
         "intake_stale": intake_stale,
         "intake_wake": intake_wake,
+        "intake_recovered": intake_recovered,
+        "health": health,
+        "health_ok": health_ok,
+        "health_wake": health_wake,
+        "health_recovered": health_recovered,
     }
 
 
