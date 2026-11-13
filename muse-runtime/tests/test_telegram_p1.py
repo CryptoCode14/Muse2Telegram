@@ -776,6 +776,153 @@ class IntakeAckTests(unittest.TestCase):
         sender.assert_not_called()
         self.assertEqual(self.item()["ack_message_id"], "777")
 
+    def _incident_batch(self):
+        # Live incident 2026-11-13 08:28: old item 101 got its
+        # intake card 777, then its recorded text went stale
+        # (the sweeper's delayed text after a lease release);
+        # new item 102 arrived later with no card. Both are
+        # claimed in one batch, so the claim ack adopts 101's
+        # card instead of sending a new one.
+        self.enqueue_pending(external_id=101, at=1000.0, message_id=55)
+        result, _sender = self.intake_ack(external_id=101)
+        self.assertTrue(result["ok"])
+        self.enqueue_pending(external_id=102, at=1001.0, message_id=56)
+        with self.store.transaction() as state:
+            item = queue_core.find_item(state, "telegram", 101)
+            item["ack_card_text"] = telegram.CLAIM_ACK_DELAYED_TEXT
+            batch = queue_core.claim_batch(
+                state, platform="telegram", now=1002.0)
+        self.assertEqual(self.item(101)["status"], "claimed")
+        self.assertEqual(self.item(102)["status"], "claimed")
+        return batch["claim_token"]
+
+    def _adopt_env(self):
+        return mock.patch.dict(os.environ, {
+            telegram.SEND_CMD_ENV: "/fake/sender",
+            telegram.BOT_USERNAME_ENV: "ExampleBot"})
+
+    def test_claim_ack_adopts_intake_card_and_edits_it_for_new_item(self):
+        # The gap: the new item joined a batch whose old item
+        # already had a card, and the claim ack adopted it
+        # silently — Westin saw nothing at all for his new
+        # message. The adopted card must be edited immediately
+        # to the current batch text, and no second card sent.
+        token = self._incident_batch()
+        with self._adopt_env():
+            with mock.patch.object(
+                telegram, "edit_message", return_value=True
+            ) as editor:
+                with mock.patch.object(
+                    telegram, "_run_send_command",
+                    return_value=("sent", "778"),
+                ) as sender:
+                    result = telegram.send_claim_ack(self.store, token)
+        self.assertEqual(result, {
+            "ok": True, "stage": "adopted", "message_id": "777",
+            "queue_position": 1, "edited": 1,
+        })
+        editor.assert_called_once_with(
+            "/fake/sender", CHAT, "777", telegram.claim_ack_text(1))
+        sender.assert_not_called()
+        self.assertEqual(self.item(101)["ack_message_id"], "777")
+        self.assertEqual(
+            self.item(101)["ack_card_text"], telegram.claim_ack_text(1))
+        self.assertIsNone(self.item(102)["ack_message_id"])
+
+    def test_claim_ack_adoption_skips_edit_when_text_already_current(self):
+        # The adopted card already reads the current batch text
+        # (Telegram 400s an identical-text edit): no edit is
+        # attempted, no second card is sent, the batch is still
+        # adopted — the live card already acknowledges the new
+        # message correctly.
+        token = self._incident_batch()
+        with self.store.transaction() as state:
+            item = queue_core.find_item(state, "telegram", 101)
+            item["ack_card_text"] = telegram.claim_ack_text(1)
+        with self._adopt_env():
+            with mock.patch.object(
+                telegram, "edit_message", return_value=True
+            ) as editor:
+                with mock.patch.object(
+                    telegram, "_run_send_command",
+                    return_value=("sent", "778"),
+                ) as sender:
+                    result = telegram.send_claim_ack(self.store, token)
+        self.assertEqual(result, {
+            "ok": True, "stage": "adopted", "message_id": "777",
+            "queue_position": 1, "edited": 0,
+        })
+        editor.assert_not_called()
+        sender.assert_not_called()
+        self.assertEqual(
+            self.item(101)["ack_card_text"], telegram.claim_ack_text(1))
+
+    def test_claim_ack_adoption_edit_failure_sends_fresh_card_once(self):
+        # The adopted card cannot be edited (deleted, too old):
+        # fall back to one fresh card for the batch, threaded
+        # under the new message and recorded on it — exactly
+        # once, never a duplicate of the adopted card.
+        token = self._incident_batch()
+        with self._adopt_env():
+            with mock.patch.object(
+                telegram, "edit_message", return_value=False
+            ) as editor:
+                with mock.patch.object(
+                    telegram, "_run_send_command",
+                    return_value=("sent", "778"),
+                ) as sender:
+                    result = telegram.send_claim_ack(self.store, token)
+        self.assertEqual(result, {
+            "ok": True, "stage": "adopted-fallback",
+            "message_id": "778", "queue_position": 1, "edited": 0,
+        })
+        editor.assert_called_once_with(
+            "/fake/sender", CHAT, "777", telegram.claim_ack_text(1))
+        sender.assert_called_once_with(
+            "/fake/sender", CHAT, telegram.claim_ack_text(1), reply_to=56)
+        self.assertEqual(self.item(102)["ack_message_id"], "778")
+        self.assertEqual(
+            self.item(102)["ack_card_text"], telegram.claim_ack_text(1))
+        # The uneditable old card is untouched, not re-recorded.
+        self.assertEqual(self.item(101)["ack_message_id"], "777")
+        self.assertEqual(
+            self.item(101)["ack_card_text"],
+            telegram.CLAIM_ACK_DELAYED_TEXT)
+
+    def test_claim_ack_adoption_fallback_send_failure_clears_reservation(self):
+        # Edit fails AND the fallback send fails unknown: the
+        # reservation is cleared so a retry is safe, nothing is
+        # recorded on the new item, and the old card is left as
+        # it was for the sweeper to retry.
+        token = self._incident_batch()
+        with self._adopt_env():
+            with mock.patch.object(
+                telegram, "edit_message", return_value=False
+            ):
+                with mock.patch.object(
+                    telegram, "_run_send_command",
+                    return_value=("unknown", None),
+                ) as sender:
+                    result = telegram.send_claim_ack(self.store, token)
+        self.assertEqual(result, {"ok": False, "stage": "unknown"})
+        sender.assert_called_once()
+        self.assertIsNone(self.item(102)["ack_sent_at"])
+        self.assertIsNone(self.item(102)["ack_message_id"])
+        self.assertEqual(self.item(101)["ack_message_id"], "777")
+        # A retry is safe: the fresh card goes out on the second try.
+        with self._adopt_env():
+            with mock.patch.object(
+                telegram, "edit_message", return_value=False
+            ):
+                with mock.patch.object(
+                    telegram, "_run_send_command",
+                    return_value=("sent", "778"),
+                ):
+                    result = telegram.send_claim_ack(self.store, token)
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["stage"], "adopted-fallback")
+        self.assertEqual(self.item(102)["ack_message_id"], "778")
+
     def test_sweeper_edits_intake_card_when_lane_shortens(self):
         self.enqueue_pending(external_id=101, at=1000.0, message_id=55)
         self.enqueue_pending(external_id=102, at=1001.0, message_id=56)

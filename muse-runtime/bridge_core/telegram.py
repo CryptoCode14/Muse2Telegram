@@ -4626,17 +4626,38 @@ def send_claim_ack(
     the heartbeat alone — a carded batch whose turn never
     starts is still lease-released by the sweeper.
 
+    Adopting an intake card: when the batch already carries a
+    card but a newly arrived item in it does not, the adopted
+    card is EDITED immediately to the current batch text (see
+    ``_adopt_claim_ack``), so the new message is visibly
+    acknowledged within seconds instead of waiting for the
+    sweeper (up to 60 s) — a batch that only reuses an old
+    card hides the new message entirely (live incident
+    2026-11-13 08:28). When every item already carries a card
+    there is nothing new to acknowledge, so the adoption stays
+    a plain "already-acked" and the sweeper keeps owning the
+    card. If the edit fails, one fresh card is sent for the
+    batch instead, threaded under the newest message and
+    recorded on it — never a duplicate when the edit worked.
+
     Returns {"ok": true, "message_id": ..., "queue_position": n}
-    on success, {"ok": false, "stage": "already-acked"} when a
-    card is already recorded (or reserved), {"ok": false,
-    "stage": "stale-token"} when the token owns no live batch,
-    {"ok": false, "stage": "config"} when no send command is
-    configured, {"ok": false, "stage": "rejected"} /
-    "retryable" / "unknown" when the send did not go out (the
-    reservation is cleared on those, so a retry is safe).
-    Nothing is recorded on "unknown": the item stays claimed
-    and the wake proceeds anyway — a missing card never blocks
-    the wake, and the turn's own --send-ack still works.
+    on a fresh send, {"ok": true, "stage": "adopted",
+    "message_id": ..., "queue_position": n, "edited": n} when
+    an existing card was adopted (edited to the current batch
+    text, or already current), {"ok": true, "stage":
+    "adopted-fallback", "message_id": ..., "queue_position": n,
+    "edited": n} when the adopted card could not be edited and
+    a fresh card was sent instead, {"ok": false, "stage":
+    "already-acked"} when a card is already recorded (or
+    reserved) and there is no new item to acknowledge,
+    {"ok": false, "stage": "stale-token"} when the token owns
+    no live batch, {"ok": false, "stage": "config"} when no
+    send command is configured, {"ok": false, "stage":
+    "rejected"} / "retryable" / "unknown" when the send did not
+    go out (the reservation is cleared on those, so a retry is
+    safe). Nothing is recorded on "unknown": the item stays
+    claimed and the wake proceeds anyway — a missing card never
+    blocks the wake, and the turn's own --send-ack still works.
     """
     send_cmd = os.environ.get(SEND_CMD_ENV)
     if not send_cmd:
@@ -4653,25 +4674,69 @@ def send_claim_ack(
         if token is None or not items:
             return {"ok": False, "stage": "stale-token"}
         items.sort(key=lambda item: item.get("received_at") or 0)
-        # Adopt an intake card: if ANY item in the batch already
-        # carries a card (sent at intake while the lane was busy),
-        # the batch already has one — the sweeper owns it now,
-        # and no second card goes out. The anchor-only check in
-        # reserve_ack is not enough here: the card may sit on a
-        # later batch item, not the anchor.
-        if any(item.get("ack_message_id") is not None for item in items):
-            return {"ok": False, "stage": "already-acked"}
         anchor = items[0]
         chat_id = anchor.get("chat_id")
         if type(chat_id) is not int:
             return {"ok": False, "stage": "fence"}
         position = _queue_position(state, items)
-        text = claim_ack_text(position, _ack_bot_username(state))
-        reply_to = anchor.get("message_id")
-        if not queue_core.reserve_ack(
-            state, PLATFORM, anchor["external_id"], token, now=now
-        ):
+        voice = _ack_bot_username(state)
+        # Adopt an intake card: if ANY item in the batch already
+        # carries a card (sent at intake while the lane was
+        # busy), the batch already has one — but only a batch
+        # with NO new item keeps the plain "already-acked".
+        # When a newly arrived item joined the batch, the
+        # adopted card must be edited to the current batch text
+        # right now (see _adopt_claim_ack): adopting silently
+        # hides the new message entirely. The anchor-only check
+        # in reserve_ack is not enough here: the card may sit
+        # on a later batch item, not the anchor.
+        carded = [
+            item for item in items
+            if item.get("ack_message_id") is not None
+        ]
+        uncarded = [
+            item for item in items
+            if item.get("ack_message_id") is None
+        ]
+        if carded and not uncarded:
             return {"ok": False, "stage": "already-acked"}
+        adoption = None
+        if carded and uncarded:
+            # Capture the adoption inputs inside the
+            # transaction; the edit itself runs after it (the
+            # sender is a subprocess, never inside one).
+            desired = None
+            editable = []
+            for item in carded:
+                if item.get("ack_card_text") is None:
+                    continue  # a turn's own ack: not script-managed
+                editable.append({
+                    "external_id": item["external_id"],
+                    "ack_message_id": item["ack_message_id"],
+                    "ack_card_text": item["ack_card_text"],
+                })
+                if desired is None:
+                    desired = _desired_ack_card_text(state, item)
+            if desired is None:
+                desired = claim_ack_text(position, voice)
+            newest = uncarded[-1]
+            adoption = {
+                "chat_id": chat_id,
+                "position": position,
+                "text": desired,
+                "editable": editable,
+                "newest_external_id": newest["external_id"],
+                "newest_message_id": newest.get("message_id"),
+            }
+        else:
+            text = claim_ack_text(position, voice)
+            reply_to = anchor.get("message_id")
+            if not queue_core.reserve_ack(
+                state, PLATFORM, anchor["external_id"], token, now=now
+            ):
+                return {"ok": False, "stage": "already-acked"}
+    if adoption is not None:
+        return _adopt_claim_ack(store, send_cmd, token, adoption, now=now)
     send_result = _run_send_command(
         send_cmd, chat_id, text, reply_to=reply_to
     )
@@ -4698,6 +4763,118 @@ def send_claim_ack(
             card_text=text, now=now,
         )
     return {"ok": True, "message_id": message_id, "queue_position": position}
+
+
+def _adopt_claim_ack(store, send_cmd, token, adoption, *, now=None):
+    """Adopt the batch's existing card(s) for a newly arrived
+    item: edit each script card to the current batch text now,
+    so the new message is visibly acknowledged within seconds.
+
+    ``adoption`` carries what ``send_claim_ack`` captured
+    inside its transaction: the batch chat, the current queue
+    position, the desired card text (the claiming bot's voice,
+    the same text the sweeper would compute), the editable
+    cards (``external_id`` / ``ack_message_id`` / recorded
+    ``ack_card_text``), and the newest uncarded item (its
+    external id + message id, for the fallback).
+
+    A card whose recorded text already equals the desired text
+    is already current — no edit is attempted, because Telegram
+    answers an identical-text edit with 400. When at least one
+    card ends up current (edited or already current), the batch
+    is adopted: {"ok": true, "stage": "adopted", "message_id":
+    <first adopted card>, "queue_position": n, "edited": n}.
+    The sweeper keeps owning the card after adoption (its
+    refresh computes the same desired text, so it skips the
+    edit until the text changes again).
+
+    Only when NO card ends up current — every edit failed, or
+    there was no script card to edit — is one fresh card sent
+    for the batch, threaded under the newest message and
+    recorded on it: {"ok": true, "stage": "adopted-fallback",
+    ...}. The stale adopted card(s) stay recorded (the reply
+    deletes every recorded card in the batch), and the sweeper
+    keeps retrying their edits. A failed fallback send clears
+    its reservation and reports the send stage, so a retry is
+    safe — and the turn's own --send-ack still works.
+    """
+    chat_id = adoption["chat_id"]
+    desired = adoption["text"]
+    position = adoption["position"]
+    editable = adoption["editable"]
+    edited = 0
+    current = 0
+    for card in editable:
+        if card["ack_card_text"] == desired:
+            current += 1
+            continue
+        if edit_message(
+            send_cmd, chat_id, card["ack_message_id"], desired
+        ):
+            edited += 1
+            current += 1
+            with store.transaction() as state:
+                _ensure_adapter_state(state)
+                item = queue_core.find_item(
+                    state, PLATFORM, card["external_id"]
+                )
+                if (
+                    item is not None
+                    and item.get("ack_message_id")
+                    == card["ack_message_id"]
+                ):
+                    item["ack_card_text"] = desired
+    if current:
+        return {
+            "ok": True,
+            "stage": "adopted",
+            "message_id": editable[0]["ack_message_id"],
+            "queue_position": position,
+            "edited": edited,
+        }
+    # No live card shows the current text: send one fresh card
+    # for the batch, threaded under the newest (uncarded)
+    # message so it is visibly attached to it.
+    newest_id = adoption["newest_external_id"]
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        if not queue_core.reserve_ack(
+            state, PLATFORM, newest_id, token, now=now
+        ):
+            return {"ok": False, "stage": "already-acked"}
+    send_result = _run_send_command(
+        send_cmd, chat_id, desired,
+        reply_to=adoption["newest_message_id"],
+    )
+    outcome, message_id = send_result
+    if outcome != "sent":
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            queue_core.clear_ack(state, PLATFORM, newest_id, token)
+        if outcome == "rejected":
+            return {"ok": False, "stage": "rejected"}
+        if outcome == "retryable":
+            return {
+                "ok": False,
+                "stage": "retryable",
+                "retry_after": _retryable_delay_seconds(
+                    getattr(send_result, "retry_after", None)
+                ),
+            }
+        return {"ok": False, "stage": "unknown"}
+    with store.transaction() as state:
+        _ensure_adapter_state(state)
+        queue_core.mark_claim_ack(
+            state, PLATFORM, newest_id, message_id, token,
+            card_text=desired, now=now,
+        )
+    return {
+        "ok": True,
+        "stage": "adopted-fallback",
+        "message_id": message_id,
+        "queue_position": position,
+        "edited": edited,
+    }
 
 
 def _intake_queue_position(state: dict, item: dict) -> int:
