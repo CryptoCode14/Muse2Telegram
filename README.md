@@ -49,7 +49,7 @@ What changed:
 - **Offset advances only after durable commit, plus receipt dedupe.** Updates are no longer consumed before they are safely queued, and a 24 hour receipt record stops redelivery from ever double-answering.
 - **Pre-claim noise filter.** Messages that are not for this bot (open group chatter, commands to other bots, non-mentions) are closed before claiming, so they never occupy a lane.
 - **Delivery ledger, message cache, prompt pin, deterministic recall.** New modules under `bridge_core/`: a SQLite delivery ledger replacing the old sending black hole, a disk-backed message cache with reply chains, a byte-stable prompt pin, and keyword recall with bounded summaries.
-- **Simulation harness.** `simulation/` replays scripted Telegram scenarios against the real queue and claim code with a fake Telegram and a fake agent turn, and reports duplicate sends and silent drops. 578 tests in `muse-runtime/tests/`.
+- **Simulation harness.** `simulation/` replays scripted Telegram scenarios against the real queue and claim code with a fake Telegram and a fake agent turn, and reports duplicate sends and silent drops. 585 tests in `muse-runtime/tests/`.
 
 What v2 does not do: no webhooks, no Redis or Postgres, no parallel turns in one lane, no hardcoded conversational answers, and no script that answers `/status` or `/who` for the agent. Speed comes from plumbing, not from taking the agent out of the loop.
 

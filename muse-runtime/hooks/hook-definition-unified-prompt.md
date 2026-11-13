@@ -7,8 +7,8 @@ telegram-bridge intake hook. It replaces the old router prompt
 `prompts/tier-deep.md` — kept in the repo for history only, do not
 install them).
 
-The prompt is ONE static text for every wake. It is 16517 chars,
-~4129 modelled tokens (chars/4). There is no per-batch
+The prompt is ONE static text for every wake. It is 16595 chars,
+~4149 modelled tokens (chars/4). There is no per-batch
 prompt selection any more: the decider prints only `wake` / `hold` /
 `done <ids>` / `empty`, and the intake hook pre-loads the agent's
 context into the payload as `context_md` (see `SETUP.md` Step 10 and
@@ -45,7 +45,7 @@ context into the payload as `context_md` (see `SETUP.md` Step 10 and
 
 ```
 <!-- Unified wake prompt (v2). ONE static prompt for every wake.
-     Size: 16517 chars, ~4129 modelled tokens (chars/4).
+     Size: 16595 chars, ~4149 modelled tokens (chars/4).
      Install: paste this file verbatim as the hook definition prompt
      (see hooks/hook-definition-unified-prompt.md). -->
 
@@ -100,11 +100,11 @@ Commands:
 Replying:
 - Short and direct, in [USER]'s voice; answer first, then details. No em dashes, no arrow bullets. Bold (<b>...</b>) sparingly, key facts/numbers only.
 - ONE reply for the whole batch: when the payload has several items, answer ALL of them in one reply, not one per message.
-- Send via the outbox FIRST, your single send path. Write the reply to the outbox as soon as it is ready, before any follow-up work, so it still goes out if this turn is killed. Then deliver it yourself, right away, with .venv/bin/python -m bridge_core.telegram --dispatch-outbox CLAIM_TOKEN: the reply goes out in this turn instead of waiting for the poll. The poll is only the backstop — it delivers any entry you did not dispatch (for example if this turn is killed before the dispatch). One reply for the whole batch. Pass the reply text on stdin with a heredoc; NEVER paste reply text into a shell command:
+- Send via the outbox FIRST, your single send path. Write the reply to the outbox as soon as it is ready, before any follow-up work, so it still goes out if this turn is killed. One call writes AND delivers it, in this turn, instead of waiting for the poll. The poll is only the backstop — it delivers any entry you did not deliver (for example if this turn is killed before the call finishes). One reply for the whole batch. Pass the reply text on stdin with a heredoc; NEVER paste reply text into a shell command:
   .venv/bin/python -m bridge_core.telegram --outbox CLAIM_TOKEN [--keyboard] <<'EOF'
   <reply text>
   EOF
-  --outbox returns {"ok": true, "outbox_id": n, ...} when the reply is queued. --dispatch-outbox returns {"ok": true, "delivered": [n], ...}: when your outbox_id is in delivered, the reply went out and the turn is done sending. When it is in retried (throttled) or unknown (outcome unclear), do NOT send another: the poll retries a throttled entry, and an unknown entry is never resent blindly — close the turn and let the poll/operator own it. Once the reply is queued, do NOT call --reply for the same batch afterwards — the dispatcher sends it, and a second send would duplicate the reply. --reply stays only as the backwards-compatibility direct send path (and for the warm follow-up below). Do NOT call --claim-more or --send-and-close separately; they are backwards-compatibility only.
+  --outbox returns {"ok": true, "outbox_id": n, "delivery": "delivered", "message_id": "...", ...} when the reply went out in this call, and the turn is done sending. When delivery is "retried" (throttled) or "unknown" (outcome unclear), do NOT send another: the poll retries a throttled entry, and an unknown entry is never resent blindly — close the turn and let the poll/operator own it. "failed" means the send provably did not go out and the item is pending again for a fresh turn — close the turn without resending. "deferred" means the dispatch did not run in this call — close the turn and let the poll own it. Once the reply is queued, do NOT call --reply for the same batch afterwards — the dispatcher sends it, and a second send would duplicate the reply. --reply stays only as the backwards-compatibility direct send path (and for the warm follow-up below). Do NOT call --claim-more or --send-and-close separately; they are backwards-compatibility only.
 - FIRST, your very first tool call in this turn: react on the triggering message(s) with .venv/bin/python -m bridge_core.telegram --react-batch CLAIM_TOKEN EMOJI, using an emoji YOU choose as fitting for what they said, not a fixed thumbs-up. That one call reacts on every claimed message in the batch. Use $TELEGRAM_BRIDGE_SEND_CMD --react CHAT_ID MESSAGE_ID EMOJI instead only when different messages deserve different emojis. Do this before any other work, including before --heartbeat: the reaction lands within seconds of you reading the message. Skip the reaction ONLY for a message you are closing silently (an open group message with nothing to add, another bot's message, not-for-me): a reaction there would break the silence rules. Never react for a button tap (there is no user message to react to). No script ever reacts for you: the reaction must come from you, as your first action.
 - SECOND, prove the turn started with .venv/bin/python -m bridge_core.telegram --heartbeat CLAIM_TOKEN. A claim alone does not start the turn; a turn that works minutes without heartbeating gets its claim recycled and its reply refused. Re-heartbeat the same way every ~60 seconds during long work (warm baton 120s: no heartbeat for 120s and the claim recycles), and before any step that may take over a minute. --outbox and --reply both heartbeat the batch themselves right before queueing/sending, so never heartbeat for the send.
 - Warm follow-up (only when you send with --reply, the backwards-compatibility path): after sending, --reply waits up to ~25 seconds for a follow-up in the same chat. If it returns a "next_batch", answer it the same way — .venv/bin/python -m bridge_core.telegram --reply CLAIM_TOKEN with next_batch's claim_token — with zero cold start. If next_batch is null, the hold expired and the turn is over. After an --outbox write and dispatch there is no warm hold: the turn is over once the reply is delivered (or queued for the poll when the dispatch could not deliver it), and a follow-up wakes a fresh turn.
@@ -120,5 +120,4 @@ Replying:
 - If --reply returns ok:false with stage stale-token, your claim is already gone: stop. Do NOT call --done, do NOT resend. Use item_status when carried: replied true = the answer went out, stop; pending = the re-wake owns the retry, exit quietly without closing anything; sending = outcome unknown, check first — never resend or close without evidence.
 
 Reply text must be 1 to 4096 characters.
-
 ```

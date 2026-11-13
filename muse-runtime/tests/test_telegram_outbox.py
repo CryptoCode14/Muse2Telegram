@@ -270,6 +270,29 @@ class OutboxTestBase(unittest.TestCase):
                 stdin_text=text,
             )
 
+    def no_send_cmd(self):
+        """Environment with no send command configured (the
+        dispatcher defers): the --outbox write queues and the
+        immediate dispatch is skipped."""
+        env = dict(os.environ)
+        env.pop(telegram.SEND_CMD_ENV, None)
+        env[telegram.WARM_HOLD_SECONDS_ENV] = "0"
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def write_outbox_pending(self, token, text, extra_args=()):
+        """--outbox with no sender configured: the write queues
+        the reply and the immediate dispatch is deferred (no
+        send command), so the entry stays pending — the
+        killed-turn setup, and what the poll then delivers."""
+        with self.no_send_cmd():
+            result = run_cli(
+                self.path, ["--outbox", token, *extra_args],
+                stdin_text=text,
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "deferred", result)
+        return result
+
     def dispatch(self, cmd, token=None, **kwargs):
         argv = ["--dispatch-outbox"] + ([token] if token else [])
         with self.send_env(cmd):
@@ -277,9 +300,11 @@ class OutboxTestBase(unittest.TestCase):
 
 
 class OutboxWriteTests(OutboxTestBase):
-    """--outbox queues the reply and leaves the item claimed."""
+    """--outbox writes AND dispatches in one call."""
 
-    def test_write_queues_reply_and_leaves_item_claimed(self):
+    def test_write_delivers_in_the_same_call(self):
+        # The fold: one --outbox call writes the reply and sends
+        # it, with no poll tick and no second call in between.
         payload = self.claim([
             msg_update(1, OWNER, "private", OWNER, "hello",
                        message_id=9001),
@@ -293,12 +318,44 @@ class OutboxWriteTests(OutboxTestBase):
         self.assertEqual(result["target_update_id"], 1)
         self.assertEqual(result["covered_update_ids"], [1])
         self.assertEqual(result["chat_id"], OWNER)
-        # The item stays CLAIMED under the token: the dispatcher
-        # reserves it at delivery time.
+        self.assertEqual(result["delivery"], "delivered")
+        self.assertEqual(result["message_id"], "4242")
+        # Exactly one send, in this call: no dispatch was needed.
+        self.assertEqual(len(self.text_sends()), 1)
+        self.assertEqual(self.text_sends()[0][1], "hi there")
+        # The item is done, the entry delivered, the reply
+        # recorded before the item was closed.
+        item = self.item(1)
+        self.assertEqual(item["status"], "done")
+        self.assertEqual(item["reply_message_id"], "4242")
+        self.assertIsNotNone(item["replied_at"])
+        entry = self.outbox_entry(result["outbox_id"])
+        self.assertEqual(entry["status"], "delivered")
+        self.assertEqual(entry["text"], "hi there")
+        self.assertEqual(entry["chat_id"], OWNER)
+        self.assertEqual(entry["reply_to_message_id"], 9001)
+        self.assertEqual(entry["extra_update_ids"], [])
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(entry["reply_message_id"], "4242")
+
+    def test_write_without_sender_queues_and_defers(self):
+        # No send command configured: the write still succeeds,
+        # the entry stays pending, the item stays CLAIMED under
+        # the token — the poll is the backstop.
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        result = self.write_outbox_pending(
+            payload["claim_token"], "hi there",
+        )
+        self.assertIsInstance(result["outbox_id"], int)
+        self.assertEqual(result["target_update_id"], 1)
+        self.assertEqual(result["covered_update_ids"], [1])
+        self.assertEqual(result["chat_id"], OWNER)
         item = self.item(1)
         self.assertEqual(item["status"], "claimed")
         self.assertIsNone(item["replied_at"])
-        # The row carries the whole payload for the dispatcher.
         entry = self.outbox_entry(result["outbox_id"])
         self.assertEqual(entry["status"], "pending")
         self.assertEqual(entry["text"], "hi there")
@@ -307,7 +364,6 @@ class OutboxWriteTests(OutboxTestBase):
         self.assertEqual(entry["extra_update_ids"], [])
         self.assertEqual(entry["attempts"], 0)
         self.assertIsNone(entry["reply_message_id"])
-        # Nothing was sent yet: the write never sends.
         self.assertFalse(self.calls.exists())
 
     def test_write_batch_covers_all_items(self):
@@ -323,11 +379,15 @@ class OutboxWriteTests(OutboxTestBase):
             payload["claim_token"], "both answered", cmd,
         )
         self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "delivered")
         self.assertEqual(result["covered_update_ids"], [2, 1])
         entry = self.outbox_entry(result["outbox_id"])
         self.assertEqual(entry["target_update_id"], 2)
         self.assertEqual(entry["reply_to_message_id"], 9002)
         self.assertEqual(entry["extra_update_ids"], [1])
+        self.assertEqual(entry["status"], "delivered")
+        for external_id in (1, 2):
+            self.assertEqual(self.item(external_id)["status"], "done")
 
     def test_write_callback_batch_is_standalone(self):
         payload = self.claim([
@@ -338,6 +398,7 @@ class OutboxWriteTests(OutboxTestBase):
             payload["claim_token"], "status: on", cmd,
         )
         self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "delivered")
         entry = self.outbox_entry(result["outbox_id"])
         self.assertIsNone(entry["reply_to_message_id"])
 
@@ -387,16 +448,20 @@ class OutboxWriteTests(OutboxTestBase):
         self.assertEqual(self.outbox_entries(), [])
 
     def test_write_second_write_is_already_queued(self):
+        # Written with no sender, so the entry stays pending and
+        # the batch is still live: the second write refuses.
         payload = self.claim([
             msg_update(1, OWNER, "private", OWNER, "hello",
                        message_id=9001),
         ])
-        cmd = self.write_send_cmd()
-        first = self.write_outbox(payload["claim_token"], "hi", cmd)
-        self.assertTrue(first["ok"], first)
-        second = self.write_outbox(
-            payload["claim_token"], "hi again", cmd,
+        first = self.write_outbox_pending(
+            payload["claim_token"], "hi",
         )
+        with self.no_send_cmd():
+            second = run_cli(
+                self.path, ["--outbox", payload["claim_token"]],
+                stdin_text="hi again",
+            )
         self.assertEqual(second["ok"], False)
         self.assertEqual(second["stage"], "already-queued")
         self.assertEqual(second["target_update_id"], 1)
@@ -404,6 +469,29 @@ class OutboxWriteTests(OutboxTestBase):
         self.assertEqual(
             self.outbox_entries()[0]["text"], "hi",
         )
+        self.assertEqual(
+            self.outbox_entries()[0]["id"], first["outbox_id"],
+        )
+
+    def test_write_after_delivered_write_is_stale_token(self):
+        # The first write delivered in the same call, so the
+        # batch is done: a second write is a stale token, and
+        # nothing is sent twice.
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        first = self.write_outbox(payload["claim_token"], "hi", cmd)
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first["delivery"], "delivered")
+        second = self.write_outbox(
+            payload["claim_token"], "hi again", cmd,
+        )
+        self.assertEqual(second["ok"], False)
+        self.assertEqual(second["stage"], "stale-token")
+        self.assertEqual(len(self.outbox_entries()), 1)
+        self.assertEqual(len(self.text_sends()), 1)
 
     def test_write_keyboard_on_plain_chat_refused(self):
         payload = self.claim([
@@ -476,13 +564,16 @@ class OutboxDispatchTests(OutboxTestBase):
     """The dispatcher delivers, retries, and never double-sends."""
 
     def _queued(self, text="hi there", updates=None):
+        # The killed-turn setup: the reply is queued with no
+        # sender, so the entry stays pending for the dispatcher.
         payload = self.claim(updates or [
             msg_update(1, OWNER, "private", OWNER, "hello",
                        message_id=9001),
         ])
         cmd = self.write_send_cmd()
-        result = self.write_outbox(payload["claim_token"], text, cmd)
-        self.assertTrue(result["ok"], result)
+        result = self.write_outbox_pending(
+            payload["claim_token"], text,
+        )
         return cmd, result["outbox_id"]
 
     def test_dispatch_delivers_after_killed_turn(self):
@@ -522,10 +613,10 @@ class OutboxDispatchTests(OutboxTestBase):
         self.assertEqual(len(self.text_sends()), 1)
 
     def test_dispatch_token_scoped_delivers_only_that_token(self):
-        # Two batches in two lanes; a token-scoped dispatch (the
-        # agent's self-dispatch after an --outbox write) delivers
-        # only its own token's entry, leaving the other's pending
-        # for the poll (bare dispatch).
+        # Two batches in two lanes, both queued pending; a
+        # token-scoped dispatch delivers only its own token's
+        # entry, leaving the other's pending for the poll (bare
+        # dispatch).
         cmd = self.write_send_cmd()
         store = JsonStateStore(self.path)
         now = time.time()
@@ -547,10 +638,8 @@ class OutboxDispatchTests(OutboxTestBase):
         token_a = batch_a["claim_token"]
         token_b = batch_b["claim_token"]
         self.assertNotEqual(token_a, token_b)
-        result_a = self.write_outbox(token_a, "reply A", cmd)
-        result_b = self.write_outbox(token_b, "reply B", cmd)
-        self.assertTrue(result_a["ok"], result_a)
-        self.assertTrue(result_b["ok"], result_b)
+        result_a = self.write_outbox_pending(token_a, "reply A")
+        result_b = self.write_outbox_pending(token_b, "reply B")
         report = self.dispatch(cmd, token=token_a)
         self.assertEqual(report["delivered"], [result_a["outbox_id"]])
         self.assertEqual(report["checked"], 1)
@@ -561,10 +650,10 @@ class OutboxDispatchTests(OutboxTestBase):
         self.assertEqual(report["delivered"], [result_b["outbox_id"]])
         self.assertEqual(len(self.text_sends()), 2)
 
-    def test_agent_dispatch_then_poll_no_double_delivery(self):
-        # The agent's self-dispatch after an --outbox write
-        # delivers in the turn; a later poll pass (bare dispatch)
-        # finds nothing due and never sends twice.
+    def test_write_dispatch_then_poll_no_double_delivery(self):
+        # The fold: the --outbox call itself delivers in the
+        # turn; a later poll pass (bare dispatch) finds nothing
+        # due and never sends twice.
         payload = self.claim([
             msg_update(1, OWNER, "private", OWNER, "hello",
                        message_id=9001),
@@ -573,8 +662,8 @@ class OutboxDispatchTests(OutboxTestBase):
         result = self.write_outbox(
             payload["claim_token"], "hi there", cmd)
         entry_id = result["outbox_id"]
-        agent_pass = self.dispatch(cmd, token=payload["claim_token"])
-        self.assertEqual(agent_pass["delivered"], [entry_id])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "delivered")
         poll_pass = self.dispatch(cmd)
         self.assertEqual(poll_pass["checked"], 0)
         self.assertEqual(poll_pass["delivered"], [])
@@ -584,6 +673,145 @@ class OutboxDispatchTests(OutboxTestBase):
         self.assertEqual(len(self.text_sends()), 1)
         self.assertEqual(
             self.outbox_entry(entry_id)["status"], "delivered")
+
+    def test_write_definitive_returns_items_to_pending(self):
+        # The fold's definitive outcome: the send provably did
+        # not go out, so the entry fails and the item is back to
+        # pending for a fresh turn — all inside the one call.
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        self.set_send_mode("rejected")
+        result = self.write_outbox(
+            payload["claim_token"], "hi there", cmd,
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "failed")
+        self.assertNotIn("message_id", result)
+        entry = self.outbox_entry(result["outbox_id"])
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["attempts"], 1)
+        item = self.item(1)
+        self.assertEqual(item["status"], "pending")
+        self.assertIsNone(item["claim_token"])
+        self.assertIsNone(item["replied_at"])
+        # The send was attempted once, and never retried.
+        self.assertEqual(len(self.text_sends()), 1)
+        self.assertEqual(self.dispatch(cmd)["checked"], 0)
+
+    def test_write_retryable_requeues_with_capped_delay(self):
+        # The fold's retryable outcome: throttled, so the entry
+        # re-queues with next_attempt_at = now + min(Retry-After,
+        # 300) and the item stays SENDING — the entry owns the
+        # retry, and the caller must not send another.
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        self.set_send_mode("retryable", retry_after=120)
+        before = time.time()
+        result = self.write_outbox(
+            payload["claim_token"], "hi there", cmd,
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "retried")
+        entry = self.outbox_entry(result["outbox_id"])
+        self.assertEqual(entry["status"], "pending")
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(entry["retry_after"], 120)
+        self.assertGreaterEqual(entry["next_attempt_at"], before + 120)
+        self.assertLess(entry["next_attempt_at"], before + 121)
+        item = self.item(1)
+        self.assertEqual(item["status"], "sending")
+        self.assertIsNone(item["replied_at"])
+        self.assertEqual(len(self.text_sends()), 1)
+        # Not due yet: a poll pass before next_attempt_at does
+        # nothing; due again it delivers, exactly once more.
+        self.set_send_mode("ok")
+        with self.send_env(cmd):
+            late = telegram.dispatch_outbox(
+                JsonStateStore(self.path),
+                now=entry["next_attempt_at"],
+            )
+        self.assertEqual(late["delivered"], [result["outbox_id"]])
+        self.assertEqual(len(self.text_sends()), 2)
+
+    def test_write_retryable_default_delay_without_retry_after(self):
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        self.set_send_mode("retryable")
+        before = time.time()
+        result = self.write_outbox(
+            payload["claim_token"], "hi there", cmd,
+        )
+        self.assertEqual(result["delivery"], "retried")
+        entry = self.outbox_entry(result["outbox_id"])
+        self.assertIsNone(entry["retry_after"])
+        self.assertGreaterEqual(entry["next_attempt_at"], before + 60)
+        self.assertLess(entry["next_attempt_at"], before + 61)
+        self.assertEqual(self.item(1)["status"], "sending")
+
+    def test_write_unknown_never_resent(self):
+        # The fold's unknown outcome: the send's fate is unclear,
+        # so the entry is unknown, the item stays SENDING, and
+        # nothing is ever resent blindly — not by this call, not
+        # by a later poll pass.
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        self.set_send_mode("unknown")
+        result = self.write_outbox(
+            payload["claim_token"], "hi there", cmd,
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "unknown")
+        entry = self.outbox_entry(result["outbox_id"])
+        self.assertEqual(entry["status"], "unknown")
+        item = self.item(1)
+        self.assertEqual(item["status"], "sending")
+        self.assertIsNone(item["replied_at"])
+        again = self.dispatch(cmd)
+        self.assertEqual(again["checked"], 0)
+        self.assertEqual(len(self.text_sends()), 1)
+
+    def test_write_dispatch_race_with_poll_keeps_entry_pending(self):
+        # The poll wins the entry first: the write's dispatch
+        # finds nothing due, so the delivery is "pending", the
+        # entry stays queued and the item stays claimed — and the
+        # poll then delivers it exactly once. (Simulated by
+        # hiding the due entry from the write's dispatch pass;
+        # the status-guarded transitions are what make the real
+        # race safe.)
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        with mock.patch.object(
+            OutboxStore, "due_entries", return_value=[],
+        ):
+            result = self.write_outbox(
+                payload["claim_token"], "hi there", cmd,
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "pending")
+        self.assertNotIn("message_id", result)
+        entry = self.outbox_entry(result["outbox_id"])
+        self.assertEqual(entry["status"], "pending")
+        item = self.item(1)
+        self.assertEqual(item["status"], "claimed")
+        self.assertEqual(len(self.text_sends()), 0)
+        report = self.dispatch(cmd)
+        self.assertEqual(report["delivered"], [result["outbox_id"]])
+        self.assertEqual(len(self.text_sends()), 1)
 
     def test_dispatch_retryable_retries_with_retry_after(self):
         cmd, entry_id = self._queued()
@@ -679,18 +907,17 @@ class OutboxDispatchTests(OutboxTestBase):
         self.assertEqual(len(self.text_sends()), 1)
 
     def test_dispatch_supersedes_already_replied(self):
-        # The turn wrote the outbox entry and then (against the
-        # prompt) also sent with --reply: the dispatcher must not
-        # send the queued text a second time.
+        # The turn wrote the outbox entry (queued pending) and
+        # then (against the prompt) also sent with --reply: the
+        # dispatcher must not send the queued text a second time.
         payload = self.claim([
             msg_update(1, OWNER, "private", OWNER, "hello",
                        message_id=9001),
         ])
         cmd = self.write_send_cmd()
-        written = self.write_outbox(
-            payload["claim_token"], "hi there", cmd,
+        written = self.write_outbox_pending(
+            payload["claim_token"], "hi there",
         )
-        self.assertTrue(written["ok"], written)
         with self.send_env(cmd):
             replied = run_cli(
                 self.path, ["--reply", payload["claim_token"]],
@@ -713,10 +940,9 @@ class OutboxDispatchTests(OutboxTestBase):
                        message_id=9001),
         ])
         cmd = self.write_send_cmd()
-        written = self.write_outbox(
-            payload["claim_token"], "hi there", cmd,
+        written = self.write_outbox_pending(
+            payload["claim_token"], "hi there",
         )
-        self.assertTrue(written["ok"], written)
         run_cli(
             self.path,
             ["--release", "1", payload["claim_token"]],
@@ -751,10 +977,9 @@ class OutboxDispatchTests(OutboxTestBase):
             )
         self.assertTrue(acked["ok"], acked)
         card_id = acked["message_id"]
-        written = self.write_outbox(
-            payload["claim_token"], "hi there", cmd,
+        written = self.write_outbox_pending(
+            payload["claim_token"], "hi there",
         )
-        self.assertTrue(written["ok"], written)
         report = self.dispatch(cmd)
         self.assertEqual(report["delivered"], [written["outbox_id"]])
         self.assertIn(
@@ -815,10 +1040,9 @@ class OutboxRunOnceTests(OutboxTestBase):
                        message_id=9001),
         ])
         cmd = self.write_send_cmd()
-        written = self.write_outbox(
-            payload["claim_token"], "hi there", cmd,
+        written = self.write_outbox_pending(
+            payload["claim_token"], "hi there",
         )
-        self.assertTrue(written["ok"], written)
         # No new updates arrive; the poll still delivers the reply.
         with self.send_env(cmd):
             result = run_cli(self.path, [], fetch=FakeFetch([]))
@@ -949,6 +1173,7 @@ class OutboxOperatorTests(OutboxTestBase):
         written = self.write_outbox(
             payload["claim_token"], "hi there", cmd,
         )
+        self.assertEqual(written["delivery"], "delivered")
         result = run_cli(self.path, ["--outbox-status"])
         self.assertTrue(result["ok"])
         self.assertEqual(
@@ -958,8 +1183,9 @@ class OutboxOperatorTests(OutboxTestBase):
         self.assertEqual(len(result["entries"]), 1)
         entry = result["entries"][0]
         self.assertEqual(entry["id"], written["outbox_id"])
-        self.assertEqual(entry["status"], "pending")
+        self.assertEqual(entry["status"], "delivered")
         self.assertEqual(entry["text"], "hi there")
+        self.assertEqual(entry["reply_message_id"], "4242")
 
     def test_drop_marks_failed_and_blocks_delivery(self):
         payload = self.claim([
@@ -967,8 +1193,8 @@ class OutboxOperatorTests(OutboxTestBase):
                        message_id=9001),
         ])
         cmd = self.write_send_cmd()
-        written = self.write_outbox(
-            payload["claim_token"], "hi there", cmd,
+        written = self.write_outbox_pending(
+            payload["claim_token"], "hi there",
         )
         entry_id = written["outbox_id"]
         result = run_cli(self.path, ["--outbox-drop", str(entry_id)])

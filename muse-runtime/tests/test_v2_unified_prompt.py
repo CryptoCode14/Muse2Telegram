@@ -197,26 +197,27 @@ class UnifiedPromptTests(unittest.TestCase):
         ):
             self.assertIn(phrase, text)
 
-    def test_unified_prompt_orders_outbox_then_dispatch(self):
-        # Self-dispatch: the agent writes to the outbox, then
-        # delivers its own entry with --dispatch-outbox in the
-        # turn, so the reply does not wait for the next poll
-        # tick. The poll is only the backstop for entries the
-        # turn never dispatched.
+    def test_unified_prompt_send_is_single_outbox_call(self):
+        # The fold: one --outbox call writes AND delivers the
+        # reply in the turn, so there is no second call to be
+        # late. The send step must not send the agent to a
+        # separate --dispatch-outbox step; the poll is only the
+        # backstop for entries the turn never delivered.
         text = PROMPT.read_text()
         send_at = text.index("Send via the outbox FIRST")
-        write_at = text.index("Write the reply to the outbox", send_at)
-        dispatch_at = text.index("--dispatch-outbox CLAIM_TOKEN", send_at)
-        self.assertLess(write_at, dispatch_at)
-        self.assertLess(
-            dispatch_at,
-            text.index(
-                "do NOT call --reply for the same batch", send_at),
-        )
-        self.assertIn("The poll is only the backstop", text)
+        send_step = text[send_at:text.index(
+            "do NOT call --reply for the same batch", send_at)]
+        self.assertIn("One call writes AND delivers it", send_step)
+        self.assertIn("--outbox CLAIM_TOKEN", send_step)
+        self.assertNotIn("--dispatch-outbox", send_step)
+        self.assertIn("The poll is only the backstop", send_step)
         self.assertIn(
             "do NOT send another: the poll retries a throttled entry",
-            text,
+            send_step,
+        )
+        self.assertIn(
+            '"failed" means the send provably did not go out',
+            send_step,
         )
 
     def test_unified_prompt_ack_step_names_intake_card(self):

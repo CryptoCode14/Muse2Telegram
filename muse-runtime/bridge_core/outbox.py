@@ -1,11 +1,10 @@
 """SQLite outbox for the P1.5 dispatcher (OUTBOX-FIRST delivery).
 
-The agent writes its reply here, dispatches it itself with
-``--dispatch-outbox CLAIM_TOKEN`` so it goes out in the turn,
-and closes the turn; the poll script
-(``bridge_core.telegram.dispatch_outbox``, called from
-``run_once``) is the backstop that delivers any entry the
-turn never dispatched, retries, and records
+The agent writes its reply here, and the --outbox call
+dispatches it in the same call so it goes out in the turn;
+the poll script (``bridge_core.telegram.dispatch_outbox``,
+called from ``run_once``) is the backstop that delivers any
+entry the turn never delivered, retries, and records
 ``reply_message_id`` before marking the queue item done.
 Delivery never needs a turn.
 
@@ -218,9 +217,9 @@ class OutboxStore:
                     claim_token: str | None = None) -> list:
         """Pending entries due for delivery (``next_attempt_at``
         NULL or past), oldest first, at most ``limit``. With a
-        claim token, only that token's entries: the agent's
-        self-dispatch after an --outbox write delivers its own
-        reply in the turn, never another batch's."""
+        claim token, only that token's entries: the folded
+        --outbox call dispatches its own entry in the turn,
+        never another batch's."""
         conn = self._connect()
         try:
             if claim_token is None:

@@ -248,24 +248,29 @@ Keeps the operational interface the wake hook drives:
                            claimed batch in the SQLite outbox (text
                            on stdin; the batch, chat, reply target
                            and cover list are derived from the claim
-                           token, exactly like --reply) and return at
-                           once — then dispatch it yourself with
-                           --dispatch-outbox CLAIM_TOKEN, so it goes
-                           out in the turn instead of waiting for the
-                           poll (the poll stays the backstop for
-                           entries the turn never dispatched, so a
-                           turn killed after the write still
-                           delivers). The write is fenced by the
-                           same claim token rules as --reply, and a
-                           live entry already covering the batch
-                           refuses the write as "already-queued".
-                           Prints {"ok": true, "outbox_id": n,
-                           "target_update_id": ...,
+                           token, exactly like --reply) and dispatch
+                           it in the SAME call, through the B1
+                           three-way sender contract — one call
+                           writes AND delivers, so there is no second
+                           call to be late. The poll stays the
+                           backstop for entries the turn never
+                           delivered (a turn killed before or during
+                           the call), so a turn killed after the
+                           write still delivers. The write is fenced
+                           by the same claim token rules as --reply,
+                           and a live entry already covering the
+                           batch refuses the write as
+                           "already-queued". Prints {"ok": true,
+                           "outbox_id": n, "target_update_id": ...,
                            "covered_update_ids": [...], "chat_id":
-                           ...} on success, or {"ok": false,
-                           "stage": ...} ("input", "fence",
-                           "stale-token", "stale", "keyboard",
-                           "already-queued"). Once queued, do NOT
+                           ..., "delivery": "delivered",
+                           "message_id": ...} on success, or
+                           {"ok": false, "stage": ...} ("input",
+                           "fence", "stale-token", "stale",
+                           "keyboard", "already-queued"). A
+                           "delivery" of "retried" or "unknown"
+                           means the poll owns the entry now — do
+                           NOT send another. Once queued, do NOT
                            call --reply for the same batch — the
                            dispatcher sends it. The outbox lives next
                            to state.json
@@ -280,9 +285,11 @@ Keeps the operational interface the wake hook drives:
                            resent), recording reply_message_id before
                            marking the queue item done. With a claim
                            token, only that token's entries are
-                           dispatched (the agent's self-dispatch
-                           after an --outbox write); without one,
-                           every due entry is (operator / poll use).
+                           dispatched; without one, every due entry
+                           is. This is the poll / operator path — the
+                           agent no longer calls it after an
+                           --outbox write, because the write now
+                           dispatches in the same call.
                            Prints the dispatch report JSON.
   --outbox-status          read-only: list the outbox entries, newest
                            first, with status, attempts,
@@ -5882,13 +5889,17 @@ def write_outbox(
 ) -> dict:
     """OUTBOX-FIRST write path for a turn (v2, P1.5 --outbox).
 
-    Queues the reply for a claimed batch in the SQLite outbox and
-    returns at once — the poll script delivers it, retries it,
-    and closes the batch, so a turn killed after the write still
-    delivers. The agent writes the reply FIRST, before any
-    follow-up work, and then closes the turn WITHOUT calling
-    --reply for the same batch: the dispatcher sends it, and a
-    second send would duplicate the reply.
+    Queues the reply for a claimed batch in the SQLite outbox
+    and dispatches it in the SAME call, through the same B1
+    delivery path the poll uses — one call writes AND delivers,
+    so there is no second call to be late (the ~10s gap between
+    the --outbox write and a separate --dispatch-outbox call
+    in live re-test 2). The agent writes the reply FIRST,
+    before any follow-up work, and then closes the turn
+    WITHOUT calling --reply for the same batch: the dispatcher
+    sends it, and a second send would duplicate the reply. A
+    turn killed before or during the call still delivers: the
+    entry stays queued and the next poll tick dispatches it.
 
     The write is fenced by the same claim token rules as --reply
     (see send_reply (a)-(b)): the batch is derived from the token
@@ -5903,7 +5914,8 @@ def write_outbox(
     records the reply and closes them then.
 
     Returns {"ok": true, "outbox_id": n, "target_update_id": ...,
-    "covered_update_ids": [...], "chat_id": ...} on success, or
+    "covered_update_ids": [...], "chat_id": ...,
+    "delivery": "delivered", "message_id": ...} on success, or
     {"ok": false, "stage": ...} with stage "input" (empty /
     oversized text), "fence" (split batch or a send in flight),
     "stale-token" (the token owns no live batch — with
@@ -5911,9 +5923,20 @@ def write_outbox(
     like --reply), "stale" (the reply aged past the fence),
     "keyboard" (--keyboard on a reply that does not answer a
     command), or "already-queued" (a live entry already covers
-    the batch: stop, do not send another). The write never sends
-    anything itself, so there is no rejected / retryable /
-    unknown stage here — those belong to the dispatcher.
+    the batch: stop, do not send another). "delivery" is the
+    outcome of this call's dispatch: "delivered" (with
+    "message_id"), "failed" (definitive — the entry failed and
+    the items are back to pending for a fresh turn), "retried"
+    (throttled — the entry re-queued, the item stays SENDING),
+    "unknown" (outcome unclear — the entry is unknown, never
+    resent blindly), "superseded" (another turn already
+    answered the batch), "deferred" (the dispatch did not run
+    in this call — no sender configured, or the poll won the
+    entry first; the poll owns it now), "record_failed" (the
+    send went out but the local record failed), or "pending"
+    (queued but not reached by this pass). A "retried",
+    "unknown", "deferred" or "pending" outcome means the
+    caller must NOT send another: the poll owns the entry now.
     """
     if not isinstance(text, str) or not text.strip() or len(text) > 4096:
         return {"ok": False, "stage": "input"}
@@ -6028,13 +6051,78 @@ def write_outbox(
             "stage": "already-queued",
             "target_update_id": primary_id,
         }
-    return {
+    # The fold: dispatch the just-written entry in this same
+    # call, through the poll's own dispatcher pass (B1 contract,
+    # status-guarded transitions — at-most-once is preserved,
+    # and a poll sweeping the same entry concurrently cannot
+    # double-deliver). A dispatcher failure never fails the
+    # write: the entry stays queued and the poll is the backstop.
+    delivery, message_id = _dispatch_written_entry(
+        store, entry_id, token, check_now, max_reply_age=max_reply_age
+    )
+    result = {
         "ok": True,
         "outbox_id": entry_id,
         "target_update_id": primary_id,
         "covered_update_ids": [primary_id] + extras,
         "chat_id": chat_id,
+        "delivery": delivery,
     }
+    if message_id is not None:
+        result["message_id"] = message_id
+    return result
+
+
+def _outbox_delivery_status(report, entry_id):
+    """Status for one entry in a dispatch report.
+
+    The report lists entry ids under "delivered", "failed",
+    "retried", "unknown", "superseded", "deferred" and
+    "record_failed"; an entry in none of them was not reached
+    by the pass ("pending" — e.g. the per-pass limit filled
+    with older entries for the same token)."""
+    for status in (
+        "delivered",
+        "failed",
+        "retried",
+        "unknown",
+        "superseded",
+        "deferred",
+        "record_failed",
+    ):
+        if entry_id in report.get(status, []):
+            return status
+    return "pending"
+
+
+def _dispatch_written_entry(store, entry_id, token, now, max_reply_age=None):
+    """Attempt immediate delivery of one just-written outbox entry.
+
+    Runs the same dispatcher pass the poll uses, scoped to the
+    entry's claim token (an older due entry for the same token
+    rides along), and maps the report for this entry to
+    (delivery, message_id). The dispatch is best-effort: any
+    unexpected failure leaves the entry queued ("deferred") and
+    is noted on stderr — the write already succeeded, and the
+    poll is the backstop.
+    """
+    try:
+        report = dispatch_outbox(
+            store, now=now, claim_token=token, max_reply_age=max_reply_age
+        )
+    except Exception as exc:  # noqa: BLE001 — the poll is the backstop
+        print(
+            f"telegram: immediate outbox dispatch failed: {exc}",
+            file=sys.stderr,
+        )
+        return "deferred", None
+    status = _outbox_delivery_status(report, entry_id)
+    message_id = None
+    if status == "delivered":
+        entry = OutboxStore(outbox_path(store)).get(entry_id)
+        if entry is not None:
+            message_id = entry.get("reply_message_id")
+    return status, message_id
 
 
 def _outbox_item_disposition(item, entry) -> tuple:
@@ -6296,17 +6384,16 @@ def dispatch_outbox(
 
     Called from run_once before the long poll, so a reply the
     agent queued goes out within one poll cycle, and directly by
-    --dispatch-outbox for the operator. The agent also calls it
-    itself, right after an --outbox write, with its own claim
-    token (see --dispatch-outbox): the reply then goes out in
-    the turn instead of waiting for the next poll tick, and the
-    poll stays the backstop for entries the agent never
-    dispatched (a turn killed before dispatch). With a claim
-    token, only that token's entries are dispatched; without
-    one, every due entry is. Each due entry is delivered
-    through _dispatch_one_outbox_entry (B1 three-way sender
-    contract; definitive fails, retryable re-queues with
-    backoff honoring Retry-After, unknown is never resent).
+    --dispatch-outbox for the operator. The agent no longer calls
+    it itself: --outbox now dispatches in the same call (see
+    write_outbox), and the poll stays the backstop for entries
+    the agent never delivered (a turn killed before or during
+    the write). With a claim token, only that token's entries
+    are dispatched; without one, every due entry is. Each due
+    entry is delivered through _dispatch_one_outbox_entry (B1
+    three-way sender contract; definitive fails, retryable
+    re-queues with backoff honoring Retry-After, unknown is
+    never resent).
 
     Returns {"ok": true, "checked": n, "delivered": [ids],
     "failed": [ids], "retried": [ids], "unknown": [ids],
@@ -6769,17 +6856,16 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         # poll): deliver due outbox entries through the B1
         # three-way sender contract, and print the dispatch
         # report JSON. With a claim token, only that token's
-        # entries are dispatched: the agent calls this with its
-        # own token right after an --outbox write, so its reply
-        # goes out in the turn instead of waiting for the next
-        # poll tick (the poll stays the backstop). Without a
-        # token, every due entry is dispatched (operator / poll
-        # use). Prints {"ok": true, "checked": n, "delivered":
-        # [...], "failed": [...], "retried": [...], "unknown":
-        # [...], "superseded": [...], "deferred": [...],
-        # "record_failed": [...]} (outbox entry ids), or {"ok":
-        # false, "stage": "config"} when no send command is
-        # configured.
+        # entries are dispatched; without one, every due entry
+        # is (operator / poll use). The agent no longer calls
+        # this after an --outbox write — the write dispatches in
+        # the same call; this stays for the poll and the
+        # operator. Prints {"ok": true, "checked": n,
+        # "delivered": [...], "failed": [...], "retried": [...],
+        # "unknown": [...], "superseded": [...], "deferred":
+        # [...], "record_failed": [...]} (outbox entry ids), or
+        # {"ok": false, "stage": "config"} when no send command
+        # is configured.
         if len(args) not in (1, 2):
             print(json.dumps({
                 "ok": False,
@@ -6959,24 +7045,27 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         # --outbox CLAIM_TOKEN [--keyboard]: OUTBOX-FIRST send
         # path (v2, P1.5). Queue the reply for a claimed batch in
         # the SQLite outbox (text on stdin, heredoc, never pasted
-        # into a shell command) and return at once — the poll
-        # script delivers it, retries it, and closes the batch, so
-        # a turn killed after the write still delivers. The batch,
-        # chat, reply target and cover list are all derived from
-        # the claim token, exactly like --reply; the caller passes
-        # no update/chat/reply ids. Prints {"ok": true,
-        # "outbox_id": n, "target_update_id": ...,
-        # "covered_update_ids": [...], "chat_id": ...} on success,
+        # into a shell command) AND dispatch it in the same call,
+        # through the B1 three-way sender contract — one call
+        # writes and delivers, so there is no second call to be
+        # late. The batch, chat, reply target and cover list are
+        # all derived from the claim token, exactly like --reply;
+        # the caller passes no update/chat/reply ids. Prints
+        # {"ok": true, "outbox_id": n, "target_update_id": ...,
+        # "covered_update_ids": [...], "chat_id": ...,
+        # "delivery": "delivered", "message_id": ...} on success,
         # or {"ok": false, "stage": ...} ("input", "fence",
         # "stale-token", "stale", "keyboard", "already-queued").
-        # Once queued, do NOT call --reply for the same batch —
-        # the dispatcher sends it. --reply stays only as the
+        # A "delivery" of "retried" or "unknown" means the poll
+        # owns the entry now — do NOT send another. Once queued,
+        # do NOT call --reply for the same batch — the dispatcher
+        # sends it. --reply stays only as the
         # backwards-compatibility direct send path.
         _outbox_usage = (
             "usage: --outbox CLAIM_TOKEN [--keyboard] — reply text "
-            "on stdin; --outbox queues the reply for the dispatcher, "
-            "it does not send it. Do NOT call --reply for the same "
-            "batch afterwards."
+            "on stdin; --outbox writes and dispatches the reply "
+            "in one call. Do NOT call --reply for the same batch "
+            "afterwards."
         )
         if len(args) < 2:
             print(json.dumps({"ok": False, "error": _outbox_usage}))
