@@ -26,6 +26,34 @@ STRANGER = 222
 OTHER_BOT = 333
 BOT_USERNAME = "ExampleBot"
 
+LIVE_UNIFIED = Path.home() / "hooks" / "prompts" / "unified-live.md"
+
+
+def _live_unified_texts():
+    """The live unified wake prompt (v2), from every place it lives.
+
+    The hook definition prompt is what the agent actually sees; the
+    unified-live.md reference copy is the fallback. Returns a list of
+    (label, text) pairs; empty when no live unified prompt is present.
+    """
+    texts = []
+    for definition_name in (
+        "telegram-bridge-intake.json",
+        "telegram-bridge.json",
+    ):
+        hook_def = Path.home() / "hooks" / "definitions" / definition_name
+        if hook_def.is_file():
+            try:
+                texts.append((
+                    f"live {definition_name} prompt",
+                    json.loads(hook_def.read_text())["prompt"],
+                ))
+            except (KeyError, ValueError):
+                pass
+    if LIVE_UNIFIED.is_file():
+        texts.append(("live unified-live.md", LIVE_UNIFIED.read_text()))
+    return texts
+
 
 def msg_update(uid, chat_id, chat_type, sender_id, text, username=None,
                is_bot=False, message_id=None, date=None):
@@ -432,17 +460,21 @@ class GroupModeTests(unittest.TestCase):
     # -- prompt carries the mode rules ----------------------------------
 
     def test_prompt_contains_mode_rules(self):
-        prompts = Path.home() / "hooks" / "prompts"
-        standard = (prompts / "tier-standard.md").read_text()
-        self.assertIn("group_mode_effective", standard)
-        self.assertIn("TRUSTED", standard)
-        self.assertIn("GUARDED", standard)
-        self.assertIn("No fishing", standard)
-        self.assertIn("/trust", standard)
-        self.assertIn("group_mode_notice", standard)
-        quick = (prompts / "tier-quick.md").read_text()
-        self.assertIn("group_mode_effective", quick)
-        self.assertIn("/trust", quick)
+        # The live unified wake prompt (v2) carries the mode rules;
+        # the tier files it replaces are gone on a v2 install. The
+        # unified prompt is one prompt, so the quick tier's subset
+        # ("group_mode_effective", "/trust") is subsumed by the full
+        # set asserted here.
+        texts = _live_unified_texts()
+        if not texts:
+            self.skipTest("live unified prompt not present on this machine")
+        for where, text in texts:
+            self.assertIn("group_mode_effective", text, where)
+            self.assertIn("TRUSTED", text, where)
+            self.assertIn("GUARDED", text, where)
+            self.assertIn("No fishing", text, where)
+            self.assertIn("/trust", text, where)
+            self.assertIn("group_mode_notice", text, where)
 
 
 if __name__ == "__main__":

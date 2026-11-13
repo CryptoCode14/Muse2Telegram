@@ -27,6 +27,34 @@ STRANGER = 222
 OTHER_BOT = 333
 BOT_USERNAME = "ExampleBot"
 
+LIVE_UNIFIED = Path.home() / "hooks" / "prompts" / "unified-live.md"
+
+
+def _live_unified_texts():
+    """The live unified wake prompt (v2), from every place it lives.
+
+    The hook definition prompt is what the agent actually sees; the
+    unified-live.md reference copy is the fallback. Returns a list of
+    (label, text) pairs; empty when no live unified prompt is present.
+    """
+    texts = []
+    for definition_name in (
+        "telegram-bridge-intake.json",
+        "telegram-bridge.json",
+    ):
+        hook_def = Path.home() / "hooks" / "definitions" / definition_name
+        if hook_def.is_file():
+            try:
+                texts.append((
+                    f"live {definition_name} prompt",
+                    json.loads(hook_def.read_text())["prompt"],
+                ))
+            except (KeyError, ValueError):
+                pass
+    if LIVE_UNIFIED.is_file():
+        texts.append(("live unified-live.md", LIVE_UNIFIED.read_text()))
+    return texts
+
 
 def msg_update(uid, chat_id, chat_type, sender_id, text, username=None,
                is_bot=False, message_id=None, date=None):
@@ -361,11 +389,15 @@ class GroupAllowlistTests(unittest.TestCase):
     # -- prompt carries the allowlist rule ---------------------------------
 
     def test_prompt_contains_allowlist_rule(self):
-        prompts = Path.home() / "hooks" / "prompts"
-        standard = (prompts / "tier-standard.md").read_text()
-        self.assertIn("group_allowlisted", standard)
-        self.assertIn("ALLOWLISTED", standard)
-        self.assertIn("private channel", standard)
+        # The live unified wake prompt (v2) carries the allowlist
+        # rule; the tier files it replaces are gone on a v2 install.
+        texts = _live_unified_texts()
+        if not texts:
+            self.skipTest("live unified prompt not present on this machine")
+        for where, text in texts:
+            self.assertIn("group_allowlisted", text, where)
+            self.assertIn("ALLOWLISTED", text, where)
+            self.assertIn("private channel", text, where)
 
 
 if __name__ == "__main__":

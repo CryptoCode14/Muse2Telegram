@@ -10,14 +10,14 @@ Checks:
   default silence, the decision test, stay out of instructions to
   another bot, reaction instead of text, never acknowledge an
   acknowledgment, and the decision tree.
-- The live wake prompts (tier-standard.md, tier-quick.md) carry the
-  same key rules in short form.
+- The live unified wake prompt carries the same key rules in short form.
 - The banned wording (built from character codes, never written out
   literally, so a whole-repo scan finds zero hits) appears nowhere
   in CHAT_RULES.md or the prompts.
 
 No network or credentials are used.
 """
+import json
 import unittest
 from pathlib import Path
 
@@ -45,8 +45,33 @@ _BANNED = [
     _banned("100,111,32,110,111,116,32,102,111,108,108,111,119"),
 ]
 
-LIVE_STANDARD = Path.home() / "hooks" / "prompts" / "tier-standard.md"
-LIVE_QUICK = Path.home() / "hooks" / "prompts" / "tier-quick.md"
+LIVE_UNIFIED = Path.home() / "hooks" / "prompts" / "unified-live.md"
+
+
+def _live_unified_texts():
+    """The live unified wake prompt (v2), from every place it lives.
+
+    The hook definition prompt is what the agent actually sees; the
+    unified-live.md reference copy is the fallback. Returns a list of
+    (label, text) pairs; empty when no live unified prompt is present.
+    """
+    texts = []
+    for definition_name in (
+        "telegram-bridge-intake.json",
+        "telegram-bridge.json",
+    ):
+        hook_def = Path.home() / "hooks" / "definitions" / definition_name
+        if hook_def.is_file():
+            try:
+                texts.append((
+                    f"live {definition_name} prompt",
+                    json.loads(hook_def.read_text())["prompt"],
+                ))
+            except (KeyError, ValueError):
+                pass
+    if LIVE_UNIFIED.is_file():
+        texts.append(("live unified-live.md", LIVE_UNIFIED.read_text()))
+    return texts
 
 # The repo template prompts and CHAT_RULES.md. When this file runs
 # from the fork's muse-runtime/tests/, they are ../prompts/<tier>.md
@@ -98,6 +123,26 @@ def _assert_prompt_chat_rules(testcase, text, where):
     _assert_no_flagged_phrasing(testcase, text, where)
 
 
+def _assert_prompt_quick_chat_rules(testcase, text, where):
+    # The quick tier's substance in the unified wake prompt. The
+    # unified prompt has no separate quick tier, so the quick-tier
+    # phrasing ("default is silence", "never reply to another bot's",
+    # "close with no reply instead of sending text") is replaced by
+    # the unified wording for the same rules: the default is silence,
+    # an ack is terminal, and a silent close is "Close with no reply:"
+    # in the --done section; not engaging another bot is "Never get
+    # into a back-and-forth with the other bots".
+    testcase.assertIn("Default is silence", text, where)
+    testcase.assertIn("stay out entirely", text, where)
+    testcase.assertIn("Acknowledge once, then stop", text, where)
+    testcase.assertIn("An ack is terminal", text, where)
+    testcase.assertIn("Close with no reply:", text, where)
+    testcase.assertIn(
+        "Never get into a back-and-forth with the other bots", text, where
+    )
+    _assert_no_flagged_phrasing(testcase, text, where)
+
+
 class ChatRulesTests(unittest.TestCase):
     def test_chat_rules_file_exists_and_has_core_rules(self):
         path = _repo_path("CHAT_RULES.md")
@@ -105,10 +150,12 @@ class ChatRulesTests(unittest.TestCase):
             self.skipTest("CHAT_RULES.md not present on this machine")
         _assert_chat_rules(self, path.read_text(), str(path))
 
-    def test_live_standard_has_chat_rules(self):
-        _assert_prompt_chat_rules(
-            self, LIVE_STANDARD.read_text(), "live tier-standard.md",
-        )
+    def test_live_unified_has_chat_rules(self):
+        texts = _live_unified_texts()
+        if not texts:
+            self.skipTest("live unified prompt not present on this machine")
+        for where, text in texts:
+            _assert_prompt_chat_rules(self, text, where)
 
     def test_template_standard_has_chat_rules(self):
         template = _repo_path("prompts/tier-standard.md")
@@ -118,20 +165,12 @@ class ChatRulesTests(unittest.TestCase):
             self, template.read_text(), f"template {template}",
         )
 
-    def test_live_quick_has_chat_rules(self):
-        text = LIVE_QUICK.read_text()
-        # The quick tier is minimal and forbids reactions, so its
-        # short version says "close with no reply" instead of
-        # "reaction instead of text".
-        self.assertIn("default is silence", text, "live tier-quick.md")
-        self.assertIn("stay out entirely", text, "live tier-quick.md")
-        self.assertIn("Acknowledge once, then stop", text,
-                      "live tier-quick.md")
-        self.assertIn("never reply to another bot's", text,
-                      "live tier-quick.md")
-        self.assertIn("close with no reply instead of sending text",
-                      text, "live tier-quick.md")
-        _assert_no_flagged_phrasing(self, text, "live tier-quick.md")
+    def test_live_unified_has_quick_chat_rules(self):
+        texts = _live_unified_texts()
+        if not texts:
+            self.skipTest("live unified prompt not present on this machine")
+        for where, text in texts:
+            _assert_prompt_quick_chat_rules(self, text, where)
 
     def test_template_quick_has_chat_rules(self):
         template = _repo_path("prompts/tier-quick.md")
