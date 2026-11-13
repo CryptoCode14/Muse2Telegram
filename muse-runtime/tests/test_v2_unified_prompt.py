@@ -187,7 +187,7 @@ class UnifiedPromptTests(unittest.TestCase):
             "--done UPDATE_ID CLAIM_TOKEN REASON",
             "stage stale-token",
             "10 minutes or more",
-            "Got it, looking into this, will reply when ready.",
+            "Still working on this, replying here when ready.",
             "stage unknown",
             "do NOT resend blindly",
             "--send-failed",

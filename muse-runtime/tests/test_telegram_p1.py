@@ -441,7 +441,7 @@ class ClaimAckCardTests(unittest.TestCase):
                 state, platform="telegram", now=1001.0)
         result, _sender = self.claim_ack(token=batch_b["claim_token"])
         self.assertEqual(result["queue_position"], 2)
-        self.assertIn("#2 in the queue", telegram.claim_ack_text(2))
+        self.assertIn("#2 in queue", telegram.claim_ack_text(2))
 
     def test_claim_ack_cli(self):
         with mock.patch.dict(os.environ, {
@@ -708,7 +708,7 @@ class IntakeAckTests(unittest.TestCase):
                              message_id=66)
         result, _sender = self.intake_ack(external_id=102)
         self.assertEqual(result["queue_position"], 2)
-        self.assertIn("#2 in the queue", telegram.claim_ack_text(2))
+        self.assertIn("#2 in queue", telegram.claim_ack_text(2))
         result, _sender = self.intake_ack(external_id=101)
         self.assertEqual(result["queue_position"], 1)
         result, _sender = self.intake_ack(external_id=201)

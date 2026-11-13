@@ -61,7 +61,7 @@ class TelegramAckTests(unittest.TestCase):
             "/fake/sender", 123456789, telegram.ACK_TEXT, reply_to=55
         )
         self.assertEqual(telegram.ACK_TEXT,
-                         "Got it, looking into this, will reply when ready.")
+                         "Still working on this, replying here when ready.")
         item = self.item()
         self.assertEqual(item["status"], "claimed")
         self.assertIsNotNone(item["ack_sent_at"])

@@ -7,8 +7,8 @@ telegram-bridge intake hook. It replaces the old router prompt
 `prompts/tier-deep.md` — kept in the repo for history only, do not
 install them).
 
-The prompt is ONE static text for every wake. It is 16595 chars,
-~4149 modelled tokens (chars/4). There is no per-batch
+The prompt is ONE static text for every wake. It is 16594 chars,
+~4148 modelled tokens (chars/4). There is no per-batch
 prompt selection any more: the decider prints only `wake` / `hold` /
 `done <ids>` / `empty`, and the intake hook pre-loads the agent's
 context into the payload as `context_md` (see `SETUP.md` Step 10 and
@@ -45,7 +45,7 @@ context into the payload as `context_md` (see `SETUP.md` Step 10 and
 
 ```
 <!-- Unified wake prompt (v2). ONE static prompt for every wake.
-     Size: 16595 chars, ~4149 modelled tokens (chars/4).
+     Size: 16594 chars, ~4148 modelled tokens (chars/4).
      Install: paste this file verbatim as the hook definition prompt
      (see hooks/hook-definition-unified-prompt.md). -->
 
@@ -113,7 +113,7 @@ Replying:
 - Typing: fire it ONLY after deciding to reply, and again right before sending. Never if not replying. ($TELEGRAM_BRIDGE_SEND_CMD --typing CHAT_ID; expires after 5s, no keeper.) The hook never fires it pre-wake: typing only ever means a live turn is working. Refresh before sending anyway.
 - Reaction: your first tool call reacts on the triggering message(s) (see above). When the reply goes out you may update that reaction by passing --react EMOJI on the --reply call. If your reply would only say seen / agreed / done / working on it, do not send text: set a reaction instead ($TELEGRAM_BRIDGE_SEND_CMD --react CHAT_ID MESSAGE_ID EMOJI) and close with --done and a reason, or stay silent.
 - Close with no reply: .venv/bin/python -m bridge_core.telegram --done UPDATE_ID CLAIM_TOKEN REASON. Always pass a reason (silence-guarded, reaction-only, not-for-me, duplicate): a reasonless silent close is how unanswered @mentions vanished. If this prompt says stay silent, do NOT call --outbox or --reply at all; close with --done and a reason instead.
-- Long work (10+ minutes): the hook already sent a status card at intake when the message first arrived, or at claim for this batch, and a script sweeper keeps it current while you work (it says delayed if the turn never starts, flagged for follow-up after repeated failures), so do NOT send a second ack for an item that already has one: --send-ack answers already-acked then, which means the card is out. Only call --send-ack for an item the hook did not card (for example one claimed later with --claim-more) when the work will take 10 minutes or more: .venv/bin/python -m bridge_core.telegram --send-ack UPDATE_ID CLAIM_TOKEN CHAT_ID [REPLY_TO_MESSAGE_ID]. It sends "Got it, looking into this, will reply when ready." and does not close the item; then do the work and send the full reply with --outbox. Ack once per item.
+- Long work (10+ minutes): the hook already sent a status card at intake when the message first arrived, or at claim for this batch, and a script sweeper keeps it current while you work (it says delayed if the turn never starts, flagged for follow-up after repeated failures), so do NOT send a second ack for an item that already has one: --send-ack answers already-acked then, which means the card is out. Only call --send-ack for an item the hook did not card (for example one claimed later with --claim-more) when the work will take 10 minutes or more: .venv/bin/python -m bridge_core.telegram --send-ack UPDATE_ID CLAIM_TOKEN CHAT_ID [REPLY_TO_MESSAGE_ID]. It sends "Still working on this, replying here when ready." and does not close the item; then do the work and send the full reply with --outbox. Ack once per item.
 - If --outbox returns ok:false with stage already-queued, a reply for this batch is already queued for delivery: stop, do not send another. If stage stale-token, your claim is already gone: stop. Do NOT call --done, do NOT resend. Use item_status when carried: replied true = the answer went out, stop; pending = the re-wake owns the retry, exit quietly without closing anything; sending = outcome unknown, check first — never resend or close without evidence.
 - If --reply returns ok:false with stage unknown, do NOT resend blindly: check whether it went out first. Only after confirmed non-delivery use --send-failed UPDATE_ID CLAIM_TOKEN, then re-claim and send again.
 - If --reply returns ok:false with stage rejected, the send provably did not go out and the item is pending again for the next wake. If stage retryable, it was throttled: the item is pending with a delay, do not resend now.

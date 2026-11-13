@@ -70,8 +70,8 @@ Keeps the operational interface the wake hook drives:
                            not be written.
   --send-ack ID TOKEN CHAT_ID [REPLY_TO_MESSAGE_ID]
                            send the fixed acknowledgement for a
-                           claimed item without closing it: "Got it,
-                           looking into this, will reply when ready."
+                           claimed item without closing it: "Still
+                           working on this, replying here when ready."
                            For work that will take 10+ minutes, so the
                            owner knows the turn is working. The ack
                            text is fixed; nothing is read from stdin.
@@ -605,8 +605,9 @@ RETRYABLE_MAX_DELAY_SECONDS = 300.0
 #: 10+ minutes sends this first, so the owner knows the turn is
 #: working instead of wondering whether it errored. The text is
 #: fixed — never customized per turn — and short. Comma, not a dash,
-#: per the owner's style (no em dashes in replies).
-ACK_TEXT = "Got it, looking into this, will reply when ready."
+#: per the owner's style (no em dashes in replies). No "Got it":
+#: the owner asked for useful status only, no generic filler.
+ACK_TEXT = "Still working on this, replying here when ready."
 
 #: Environment variables tuning the pending-expiry sweep (claim-time
 #: and --purge-expired) and the send fence's stale guard, in seconds.
@@ -4459,32 +4460,109 @@ def send_ack(
 #: every command itself, and the card is deleted when the reply
 #: goes out (see ``send_reply``). No em dashes, matching the
 #: reply rules: the card is user-visible text.
-def claim_ack_text(position: int) -> str:
+#: Per-bot ack voices (Westin, 2026-11-13): every bot runs the
+#: same bridge code, so the card must not read the same robotic
+#: "#1 in queue" from all four of them. Each bot phrases the
+#: same honest queue position in its own voice, like a human
+#: would. Keys are lowercase usernames, no "@". A bot with no
+#: voice here keeps the plain numbers-only card.
+_ACK_VOICES = {
+    "doriancodingbot": {
+        "first": "I'm working on this, you're first in line.",
+        "later": "I'm working on this, you're #{position} in line, "
+        "{ahead} ahead of you.",
+        "delayed": "Still working on this, running behind, not dropped.",
+        "escalated": "Still working on this, taking much longer than "
+        "usual, flagged for follow-up.",
+    },
+    "westinmusebot": {
+        "first": "Got you, you're first up.",
+        "later": "Got you, you're #{position} in line, "
+        "{ahead} ahead of you.",
+        "delayed": "Still on it, running behind, not dropped.",
+        "escalated": "Still on it, taking much longer than usual, "
+        "flagged for follow-up.",
+    },
+    "gusgrandvalleybot": {
+        "first": "Working on it, you're first in my queue.",
+        "later": "Working on it, you're #{position} in my queue, "
+        "{ahead} ahead of you.",
+        "delayed": "Still working on it, running behind, not dropped.",
+        "escalated": "Still working on it, taking much longer than "
+        "usual, flagged for follow-up.",
+    },
+    "dexthedeveloperbot": {
+        "first": "On it, you're first in line, digging in now.",
+        "later": "On it, you're #{position} in line, "
+        "{ahead} ahead of you.",
+        "delayed": "Still digging in, running behind, not dropped.",
+        "escalated": "Still digging in, taking much longer than usual, "
+        "flagged for follow-up.",
+    },
+}
+
+
+def _ack_voice(bot_username: str = "") -> dict | None:
+    """This bot's ack voice, or None when it has none: the
+    name is normalized (case, leading "@") before lookup."""
+    if not isinstance(bot_username, str):
+        return None
+    return _ACK_VOICES.get(bot_username.strip().lstrip("@").lower())
+
+
+def _ack_bot_username(state: dict | None = None) -> str:
+    """This bot's username for ack voicing, "" when unknown:
+    never raises, so a sweeper or test without the env still
+    cards (numbers-only) instead of dying."""
+    try:
+        return _bot_username(state)
+    except RuntimeError:
+        return ""
+
+
+def claim_ack_text(position: int, bot_username: str = "") -> str:
     """The card text for a freshly claimed batch: the queue
-    position, honestly counted (see ``_queue_position``)."""
+    position, honestly counted (see ``_queue_position``).
+    A bot with its own voice phrases it like a human would;
+    any other bot keeps the numbers-only readout, no generic
+    filler: the card is a status readout, not a greeting."""
+    voice = _ack_voice(bot_username)
+    if voice is None:
+        if position <= 1:
+            return "#1 in queue"
+        return f"#{position} in queue, {position - 1} ahead of you"
     if position <= 1:
-        return "Got it, you're first in line. I'll reply here when ready."
-    return (
-        f"Got it, you're #{position} in the queue. "
-        "I'll reply here when ready."
-    )
+        return voice["first"]
+    return voice["later"].format(position=position, ahead=position - 1)
 
 
 #: The card text once the claim lease has released the batch and
 #: it is waiting to be re-claimed: the reply is delayed, but the
 #: work is not dropped.
 CLAIM_ACK_DELAYED_TEXT = (
-    "Still in the queue, the reply is delayed, but I haven't "
-    "dropped it. I'll reply here when ready."
+    "Still queued, delayed, not dropped."
 )
 
 #: The card text once the sweeper has escalated the item (K
 #: lease expiries): the loop has stopped and an operator has
 #: been woken, so the card says flagged, not forgotten.
 CLAIM_ACK_ESCALATED_TEXT = (
-    "This is taking much longer than usual, I've flagged it for "
-    "a follow-up. I'll reply here when I can."
+    "Taking much longer than usual, flagged for follow-up."
 )
+
+
+def claim_ack_delayed_text(bot_username: str = "") -> str:
+    """The delayed card text, in this bot's voice when it has
+    one, else the plain readout."""
+    voice = _ack_voice(bot_username)
+    return voice["delayed"] if voice is not None else CLAIM_ACK_DELAYED_TEXT
+
+
+def claim_ack_escalated_text(bot_username: str = "") -> str:
+    """The escalated card text, in this bot's voice when it has
+    one, else the plain readout."""
+    voice = _ack_voice(bot_username)
+    return voice["escalated"] if voice is not None else CLAIM_ACK_ESCALATED_TEXT
 
 
 def _queue_position(state: dict, batch_items: list) -> int:
@@ -4588,7 +4666,7 @@ def send_claim_ack(
         if type(chat_id) is not int:
             return {"ok": False, "stage": "fence"}
         position = _queue_position(state, items)
-        text = claim_ack_text(position)
+        text = claim_ack_text(position, _ack_bot_username(state))
         reply_to = anchor.get("message_id")
         if not queue_core.reserve_ack(
             state, PLATFORM, anchor["external_id"], token, now=now
@@ -4715,7 +4793,7 @@ def send_intake_ack(
         if type(chat_id) is not int:
             return {"ok": False, "stage": "fence"}
         position = _intake_queue_position(state, item)
-        text = claim_ack_text(position)
+        text = claim_ack_text(position, _ack_bot_username(state))
         reply_to = item.get("message_id")
         if not queue_core.reserve_intake_ack(
             state, PLATFORM, external_id, now=now
@@ -4854,7 +4932,7 @@ def _desired_ack_card_text(state: dict, item: dict) -> str | None:
     if item.get("status") == queue_core.DONE:
         return None
     if item.get("lease_escalated"):
-        return CLAIM_ACK_ESCALATED_TEXT
+        return claim_ack_escalated_text(_ack_bot_username(state))
     if item.get("status") == queue_core.CLAIMED:
         batch = [
             other
@@ -4863,16 +4941,20 @@ def _desired_ack_card_text(state: dict, item: dict) -> str | None:
             and other.get("claim_token") == item.get("claim_token")
             and other.get("replied_at") is None
         ]
-        return claim_ack_text(_queue_position(state, batch))
+        return claim_ack_text(
+            _queue_position(state, batch), _ack_bot_username(state)
+        )
     if item.get("status") == queue_core.PENDING and item.get(
         "lease_attempts", 0
     ) > 0:
-        return CLAIM_ACK_DELAYED_TEXT
+        return claim_ack_delayed_text(_ack_bot_username(state))
     if item.get("status") == queue_core.PENDING:
         # Intake-carded and never lease-released: keep the card
         # fresh with the live lane position (it shortens as the
         # items ahead of it are answered or closed).
-        return claim_ack_text(_intake_queue_position(state, item))
+        return claim_ack_text(
+            _intake_queue_position(state, item), _ack_bot_username(state)
+        )
     return None
 
 
