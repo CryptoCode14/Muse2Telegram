@@ -553,7 +553,7 @@ import urllib.request
 from pathlib import Path
 
 from . import queue as queue_core
-from .outbox import OutboxStore
+from .outbox import STALE_SENDING_SECONDS, OutboxStore
 from .store import JsonStateStore
 
 PLATFORM = "telegram"
@@ -5272,8 +5272,16 @@ def watchdog_sweep(store: JsonStateStore, *, now: float | None = None) -> dict:
     After the queue pass it refreshes the ack status cards
     (``refresh_ack_cards``): it EDITS the existing card messages
     to their current text, it never sends a new Telegram message.
+    It also surfaces stale outbox sends (``outbox_stale_sending``):
+    entries a dispatcher claimed (attempted_at) and never finished
+    — the dispatcher recovers those on its next pass (see
+    ``dispatch_outbox``), the sweep only reports them, so a dead
+    poll does not hide a stranded reply. Entries with no
+    attempted_at (claimed before the stamp existed) count as
+    stale here when the entry itself is older than the horizon;
+    the operator reconciles those, they are never auto-recovered.
     Returns the sweep report (see ``queue_core.watchdog_sweep``)
-    with an ``"ack_cards"`` entry for the card pass.
+    with ``"ack_cards"`` and ``"outbox_stale_sending"`` entries.
     """
     with store.transaction() as state:
         _ensure_adapter_state(state)
@@ -5289,6 +5297,22 @@ def watchdog_sweep(store: JsonStateStore, *, now: float | None = None) -> dict:
     # and the next sweep retries it — the recorded card text
     # only advances on a successful edit.
     report["ack_cards"] = refresh_ack_cards(store, now=now)
+    # Surface stale outbox sends for the operator: entries a
+    # dispatcher claimed and never finished (see
+    # outbox.stale_sending_entries). The dispatcher recovers
+    # them on its next pass; this sweep only reports them.
+    sweep_now = time.time() if now is None else now
+    outbox = OutboxStore(outbox_path(store))
+    report["outbox_stale_sending"] = [
+        {
+            "id": entry["id"],
+            "target_update_id": entry["target_update_id"],
+            "attempted_at": entry.get("attempted_at"),
+        }
+        for entry in outbox.stale_sending_entries(
+            sweep_now, include_unknown=True
+        )
+    ]
     return report
 
 
@@ -6539,7 +6563,7 @@ def _dispatch_one_outbox_entry(
     target = int(entry["target_update_id"])
     token = entry["claim_token"]
     extras = [int(t) for t in entry["extra_update_ids"]]
-    if not outbox.mark_sending(entry_id):
+    if not outbox.mark_sending(entry_id, now=now):
         # Another dispatcher claimed this attempt first.
         report["deferred"].append(entry_id)
         return
@@ -6654,21 +6678,37 @@ def dispatch_outbox(
     re-queues with backoff honoring Retry-After, unknown is
     never resent).
 
-    Returns {"ok": true, "checked": n, "delivered": [ids],
-    "failed": [ids], "retried": [ids], "unknown": [ids],
-    "superseded": [ids], "deferred": [ids], "record_failed":
-    [ids]} — ids are outbox entry ids. {"ok": false, "stage":
-    "config", "checked": n, "deferred": [ids]} when no send
-    command is configured: nothing is attempted, and the entries
-    stay queued for a later pass.
+    Before selecting due entries, the pass recovers stale
+    sending entries (see outbox.recover_stale_sending): a
+    dispatcher killed mid-attempt leaves its entry in "sending"
+    with an old attempted_at, and the entry is re-queued here
+    (CAS, exactly one dispatcher owns the retry) so it is due
+    in this same pass instead of stranded forever. The recovery
+    is scoped to the claim token exactly like due_entries. The
+    queue item is not touched by the recovery: it stays SENDING
+    under the entry's token and the re-send re-validates it in
+    place, exactly like a retryable attempt.
+
+    Returns {"ok": true, "checked": n, "recovered": [ids],
+    "delivered": [ids], "failed": [ids], "retried": [ids],
+    "unknown": [ids], "superseded": [ids], "deferred": [ids],
+    "record_failed": [ids]} — ids are outbox entry ids.
+    {"ok": false, "stage": "config", "checked": n, "recovered":
+    [ids], "deferred": [ids]} when no send command is
+    configured: nothing is attempted, and the entries stay queued
+    for a later pass (recovered ones are due then).
     """
     check_now = time.time() if now is None else now
     send_cmd = os.environ.get(SEND_CMD_ENV)
     outbox = OutboxStore(outbox_path(store))
+    recovered = outbox.recover_stale_sending(
+        check_now, claim_token=claim_token
+    )
     due = outbox.due_entries(check_now, limit=limit, claim_token=claim_token)
     report = {
         "ok": True,
         "checked": len(due),
+        "recovered": [entry["id"] for entry in recovered],
         "delivered": [],
         "failed": [],
         "retried": [],

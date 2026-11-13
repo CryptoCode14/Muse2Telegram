@@ -37,6 +37,9 @@ Schema (table ``outbox``):
                       superseded (see below)
   attempts            INTEGER NOT NULL DEFAULT 0 — delivery attempts
                       (incremented when an attempt starts)
+  attempted_at        REAL — epoch seconds the current attempt was
+                      claimed (set by mark_sending; NULL for an
+                      entry claimed before the stamp existed)
   created_at          REAL NOT NULL — epoch seconds of the write
   next_attempt_at     REAL — earliest next delivery attempt
                       (retryable backoff); NULL means due now
@@ -52,8 +55,13 @@ Statuses:
 
   pending — queued, due when ``next_attempt_at`` is NULL or past.
   sending — a dispatcher claimed this attempt (CAS on
-    status='pending'); another dispatcher that finds it here
-    leaves it alone.
+    status='pending', with attempted_at stamped); another
+    dispatcher that finds it here leaves it alone — unless the
+    attempt is stale (attempted_at older than
+    STALE_SENDING_SECONDS), in which case the next dispatcher
+    pass re-queues it for a fresh attempt (see
+    recover_stale_sending): a dispatcher killed mid-attempt
+    cannot strand the entry.
   delivered — the send was confirmed; ``reply_message_id`` and
     ``delivered_at`` are set. Terminal.
   failed — the sender definitively rejected the send (exit 2:
@@ -73,14 +81,33 @@ Statuses:
 Only the dispatcher writes delivery outcomes; only the agent's
 --outbox write inserts rows. Every status transition is a single
 SQLite statement guarded on the expected prior status, so two
-dispatchers can never deliver the same entry twice.
+dispatchers can never deliver the same entry twice. The one
+exception is recovery: a sending entry whose attempt is stale
+(see STALE_SENDING_SECONDS) is re-queued to pending by the next
+dispatcher pass, and the normal delivery path sends it — the
+queue item stays SENDING under the entry's token meanwhile (its
+resend reservation), so no fresh turn can answer in parallel.
 """
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
+
+#: Age (seconds) past which a ``sending`` attempt counts as stale:
+#: the dispatcher that claimed it is gone, so the next dispatcher
+#: pass re-queues the entry for a fresh attempt (see
+#: ``recover_stale_sending``). 600 s: longer than any legitimate
+#: send (the sender timeout is 200 s — a send from the attempt
+#: cannot still be in flight, and the sender is the dispatcher's
+#: child, so a send that completed is recorded within
+#: milliseconds of finishing), and the established heartbeat
+#: horizon (HEARTBEAT_STALE_SECONDS, 600 s) for a dead
+#: turn/dispatcher. A live attempt inside the horizon is never
+#: touched.
+STALE_SENDING_SECONDS = 600.0
 
 #: Live statuses: an entry in one of these blocks a second write
 #: for the same queue item (see enqueue). Terminal statuses do
@@ -104,6 +131,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   extra_update_ids TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL DEFAULT 'pending',
   attempts INTEGER NOT NULL DEFAULT 0,
+  attempted_at REAL,
   created_at REAL NOT NULL,
   next_attempt_at REAL,
   delivered_at REAL,
@@ -146,6 +174,14 @@ class OutboxStore:
         )
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
+        # Pre-fix databases have no attempted_at column
+        # (mark_sending recorded no timestamp): add it so an old
+        # outbox file keeps working and new attempts are stamped.
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(outbox)")
+        }
+        if "attempted_at" not in columns:
+            conn.execute("ALTER TABLE outbox ADD COLUMN attempted_at REAL")
         if not existed:
             # Reply text is private conversation: the file is
             # created mode 0600 like the state store's temp files.
@@ -255,6 +291,110 @@ class OutboxStore:
         finally:
             conn.close()
 
+    def stale_sending_entries(
+        self, now: float,
+        horizon: float = STALE_SENDING_SECONDS,
+        claim_token: str | None = None,
+        include_unknown: bool = False,
+    ) -> list:
+        """Sending entries whose attempt is provably stale:
+        attempted_at older than ``horizon`` (a dispatcher claimed
+        the attempt and never finished it). With a claim token,
+        only that token's entries. Entries with no attempted_at
+        (claimed before the stamp existed) are excluded unless
+        ``include_unknown`` is set — then they count as stale
+        when the entry itself is older than the horizon (the
+        watchdog report uses this: the operator reconciles those,
+        they are never auto-recovered, because their attempt
+        start is unprovable). Oldest first."""
+        cutoff = float(now) - float(horizon)
+        clauses = ["status = 'sending'"]
+        params: list = []
+        if claim_token is not None:
+            clauses.append("claim_token = ?")
+            params.append(str(claim_token))
+        if include_unknown:
+            clauses.append(
+                "((attempted_at IS NOT NULL AND attempted_at <= ?)"
+                " OR (attempted_at IS NULL AND created_at <= ?))"
+            )
+            params.extend([cutoff, cutoff])
+        else:
+            clauses.append("attempted_at IS NOT NULL")
+            clauses.append("attempted_at <= ?")
+            params.append(cutoff)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM outbox WHERE " + " AND ".join(clauses) +
+                " ORDER BY created_at ASC, id ASC",
+                params,
+            ).fetchall()
+            return [_row_to_entry(row) for row in rows]
+        finally:
+            conn.close()
+
+    def recover_stale_sending(
+        self, now: float,
+        horizon: float = STALE_SENDING_SECONDS,
+        claim_token: str | None = None,
+    ) -> list:
+        """Re-queue stale sending entries for a fresh attempt.
+
+        A sending entry whose attempted_at is older than the
+        horizon belongs to a dispatcher that died mid-attempt
+        (a VM replacement kills the poll mid-send): the send
+        cannot still be in flight (the horizon is longer than
+        any legitimate send), so the entry goes back to pending,
+        due now, and the normal delivery path sends it. Each
+        re-queue is a single CAS (status='sending' AND
+        attempted_at older than the horizon), so two dispatchers
+        racing the same stale entry recover it exactly once. The
+        queue item is deliberately NOT touched here: it stays
+        SENDING under the entry's token (its resend reservation),
+        so the re-send re-validates and sends from that
+        reservation — exactly like a retryable attempt — and no
+        fresh turn can claim the item and answer in parallel.
+        Entries with no attempted_at are never recovered (their
+        attempt start is unprovable). Returns the recovered
+        entries as found, oldest first (an empty list when
+        nothing is stale — the common case costs one SELECT and
+        no write lock)."""
+        check_now = float(now)
+        cutoff = check_now - float(horizon)
+        candidates = self.stale_sending_entries(
+            check_now, horizon, claim_token=claim_token,
+        )
+        if not candidates:
+            return []
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                recovered = []
+                for entry in candidates:
+                    cursor = conn.execute(
+                        "UPDATE outbox SET status = 'pending', "
+                        "next_attempt_at = ?, "
+                        "last_error = 'recovered: stale sending attempt' "
+                        "WHERE id = ? AND status = 'sending' "
+                        "AND attempted_at IS NOT NULL "
+                        "AND attempted_at <= ?",
+                        (check_now, int(entry["id"]), cutoff),
+                    )
+                    if cursor.rowcount == 1:
+                        recovered.append(entry)
+                conn.execute("COMMIT")
+                return recovered
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+        finally:
+            conn.close()
+
     def get(self, entry_id: int) -> dict | None:
         """One entry by id, or None when there is no such entry."""
         conn = self._connect()
@@ -279,21 +419,26 @@ class OutboxStore:
         finally:
             conn.close()
 
-    def mark_sending(self, entry_id: int) -> bool:
+    def mark_sending(self, entry_id: int, now: float | None = None) -> bool:
         """Claim one delivery attempt: pending -> sending, with
-        the attempt count incremented. The CAS on status='pending'
-        means exactly one dispatcher owns the attempt; False when
-        another dispatcher (or a terminal transition) got there
-        first."""
+        the attempt count incremented and the attempt start
+        stamped (``attempted_at``). The stamp is what makes a
+        dispatcher killed mid-attempt recoverable: an attempt
+        older than STALE_SENDING_SECONDS is re-queued by the next
+        dispatcher pass (see ``recover_stale_sending``). The CAS
+        on status='pending' means exactly one dispatcher owns the
+        attempt; False when another dispatcher (or a terminal
+        transition) got there first."""
+        stamp = time.time() if now is None else float(now)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 cursor = conn.execute(
                     "UPDATE outbox SET status = 'sending', "
-                    "attempts = attempts + 1 WHERE id = ? "
-                    "AND status = 'pending'",
-                    (int(entry_id),),
+                    "attempts = attempts + 1, attempted_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (stamp, int(entry_id)),
                 )
                 if cursor.rowcount != 1:
                     conn.execute("ROLLBACK")

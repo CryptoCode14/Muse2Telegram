@@ -17,6 +17,11 @@ Covered here:
   delete, record failure.
 - run_once delivers a queued reply with no wake (no new updates).
 - OutboxStore transitions (CAS, overlap refusal, terminal states).
+- Stale-sending recovery: a dispatcher killed mid-attempt leaves
+  an entry in "sending" with an old attempted_at; the next
+  dispatcher pass re-queues it (CAS) and delivers exactly once,
+  a live attempt inside the horizon is never touched, and the
+  watchdog sweep reports stale-sending entries.
 - --outbox-status / --outbox-drop operator commands.
 
 The Bot API is never touched: the send command is a fake script
@@ -30,12 +35,14 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from bridge_core import outbox
 from bridge_core import queue as queue_core
 from bridge_core import telegram
 from bridge_core.outbox import OutboxStore
@@ -1031,6 +1038,141 @@ class OutboxDispatchTests(OutboxTestBase):
         self.assertEqual(len(self.text_sends()), 1)
 
 
+class OutboxStaleSendingTests(OutboxTestBase):
+    """A dispatcher killed mid-attempt must not strand the reply.
+
+    The stranded state: the outbox entry is in "sending" with an
+    old attempted_at, and the queue item is in "sending" under
+    the entry's token — exactly what _dispatch_one_outbox_entry
+    leaves behind when the dispatcher dies after claiming the
+    attempt and reserving the item, before the send outcome is
+    recorded. The next dispatcher pass recovers the entry and
+    delivers it exactly once, from the item's own reservation.
+    """
+
+    def _stranded(self, text="hi there", attempted_age=None,
+                  updates=None):
+        # Claim + queue with no sender (the entry stays pending),
+        # then drive the attempt halfway by hand: the outbox entry
+        # claims the attempt (mark_sending, with an old
+        # attempted_at) and the queue item is reserved to sending
+        # — the state a dispatcher killed mid-attempt leaves.
+        payload = self.claim(updates or [
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        result = self.write_outbox_pending(payload["claim_token"], text)
+        entry_id = result["outbox_id"]
+        store = OutboxStore(self.path.with_suffix(".outbox.sqlite3"))
+        age = (
+            outbox.STALE_SENDING_SECONDS + 60.0
+            if attempted_age is None else attempted_age
+        )
+        self.assertTrue(
+            store.mark_sending(entry_id, now=time.time() - age))
+        with self.send_env(cmd):
+            error, _queued_chat_id = telegram._reserve_send(
+                JsonStateStore(self.path), 1, payload["claim_token"],
+                OWNER, now=time.time(),
+            )
+        self.assertIsNone(error, error)
+        return cmd, entry_id, payload["claim_token"]
+
+    def test_dispatch_recovers_stale_sending_after_killed_attempt(self):
+        cmd, entry_id, _token = self._stranded()
+        entry = self.outbox_entry(entry_id)
+        self.assertEqual(entry["status"], "sending")
+        self.assertEqual(entry["attempts"], 1)
+        self.assertIsNotNone(entry["attempted_at"])
+        self.assertEqual(self.item(1)["status"], "sending")
+        report = self.dispatch(cmd)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["recovered"], [entry_id])
+        self.assertEqual(report["checked"], 1)
+        self.assertEqual(report["delivered"], [entry_id])
+        self.assertEqual(len(self.text_sends()), 1)
+        entry = self.outbox_entry(entry_id)
+        self.assertEqual(entry["status"], "delivered")
+        self.assertEqual(entry["reply_message_id"], "4242")
+        item = self.item(1)
+        self.assertEqual(item["status"], "done")
+        self.assertIsNotNone(item["replied_at"])
+        self.assertEqual(item["reply_message_id"], "4242")
+        # A second pass finds nothing: exactly once, no re-send.
+        again = self.dispatch(cmd)
+        self.assertEqual(again["checked"], 0)
+        self.assertEqual(again["delivered"], [])
+        self.assertEqual(len(self.text_sends()), 1)
+
+    def test_dispatch_leaves_fresh_sending_entry_alone(self):
+        # A live attempt inside the horizon is never touched: no
+        # recovery, no send, no reset — a dispatcher may be
+        # mid-send on it right now.
+        cmd, entry_id, _token = self._stranded(attempted_age=100.0)
+        report = self.dispatch(cmd)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["recovered"], [])
+        self.assertEqual(report["delivered"], [])
+        self.assertEqual(report["checked"], 0)
+        self.assertEqual(self.text_sends(), [])
+        entry = self.outbox_entry(entry_id)
+        self.assertEqual(entry["status"], "sending")
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(self.item(1)["status"], "sending")
+
+    def test_recovered_entry_item_stays_sending_until_send(self):
+        # Recovery touches the outbox entry only: the queue item
+        # stays SENDING under the entry's token (its resend
+        # reservation), so no fresh turn can claim it and answer
+        # in parallel — the item is NOT bounced to pending.
+        cmd, entry_id, _token = self._stranded()
+        store = OutboxStore(self.path.with_suffix(".outbox.sqlite3"))
+        recovered = store.recover_stale_sending(time.time())
+        self.assertEqual([e["id"] for e in recovered], [entry_id])
+        entry = self.outbox_entry(entry_id)
+        self.assertEqual(entry["status"], "pending")
+        self.assertIsNotNone(entry["next_attempt_at"])
+        item = self.item(1)
+        self.assertEqual(item["status"], "sending")
+        self.assertIsNotNone(item["claim_token"])
+        # The next pass delivers it exactly once from that
+        # reservation and closes the item.
+        report = self.dispatch(cmd)
+        self.assertEqual(report["delivered"], [entry_id])
+        self.assertEqual(len(self.text_sends()), 1)
+        self.assertEqual(self.item(1)["status"], "done")
+
+    def test_watchdog_reports_stale_sending_outbox_entries(self):
+        store = OutboxStore(self.path.with_suffix(".outbox.sqlite3"))
+
+        def _entry(target):
+            return {
+                "claim_token": "tok",
+                "target_update_id": target,
+                "chat_id": OWNER,
+                "reply_to_message_id": 9001,
+                "keyboard": False,
+                "text": "hi",
+                "extra_update_ids": [],
+                "created_at": 1000.0,
+            }
+
+        stale_id = store.enqueue(_entry(1))
+        fresh_id = store.enqueue(_entry(2))
+        self.assertTrue(store.mark_sending(stale_id, now=1000.0))
+        self.assertTrue(store.mark_sending(fresh_id, now=time.time()))
+        report = telegram.watchdog_sweep(JsonStateStore(self.path))
+        stale = report["outbox_stale_sending"]
+        self.assertEqual([e["id"] for e in stale], [stale_id])
+        self.assertEqual(stale[0]["target_update_id"], 1)
+        self.assertEqual(stale[0]["attempted_at"], 1000.0)
+
+    def test_watchdog_reports_no_stale_sending_when_none(self):
+        report = telegram.watchdog_sweep(JsonStateStore(self.path))
+        self.assertEqual(report["outbox_stale_sending"], [])
+
+
 class OutboxRunOnceTests(OutboxTestBase):
     """The poll loop delivers a queued reply with no wake."""
 
@@ -1140,6 +1282,122 @@ class OutboxStoreTests(unittest.TestCase):
         entry = self.store.get(entry_id)
         self.assertEqual(entry["status"], "sending")
         self.assertEqual(entry["attempts"], 1)
+
+    def test_mark_sending_records_attempted_at(self):
+        entry_id = self.store.enqueue(self._entry())
+        self.assertTrue(self.store.mark_sending(entry_id, now=1500.0))
+        entry = self.store.get(entry_id)
+        self.assertEqual(entry["status"], "sending")
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(entry["attempted_at"], 1500.0)
+        # A second claim is refused (CAS) and does not move the stamp.
+        self.assertFalse(self.store.mark_sending(entry_id, now=1600.0))
+        self.assertEqual(
+            self.store.get(entry_id)["attempted_at"], 1500.0)
+
+    def test_recover_stale_sending_requeues_only_stale(self):
+        stale = self.store.enqueue(self._entry())
+        fresh = self.store.enqueue(self._entry(target=2))
+        self.assertTrue(self.store.mark_sending(stale, now=1000.0))
+        self.assertTrue(self.store.mark_sending(fresh, now=1900.0))
+        recovered = self.store.recover_stale_sending(2000.0)
+        self.assertEqual([e["id"] for e in recovered], [stale])
+        entry = self.store.get(stale)
+        self.assertEqual(entry["status"], "pending")
+        self.assertEqual(entry["next_attempt_at"], 2000.0)
+        self.assertEqual(entry["attempts"], 1)
+        self.assertEqual(self.store.get(fresh)["status"], "sending")
+        self.assertEqual(
+            [row["id"] for row in self.store.due_entries(2000.0, 10)],
+            [stale],
+        )
+
+    def test_recover_stale_sending_is_cas(self):
+        first = self.store.enqueue(self._entry())
+        second = self.store.enqueue(self._entry(target=2))
+        self.assertTrue(self.store.mark_sending(first, now=1000.0))
+        self.assertTrue(self.store.mark_sending(second, now=1000.0))
+        # Two dispatchers racing the same stale entries: each
+        # entry is recovered exactly once across both passes.
+        barrier = threading.Barrier(2)
+        recovered = []
+
+        def recover():
+            barrier.wait(timeout=10)
+            recovered.extend(
+                e["id"]
+                for e in self.store.recover_stale_sending(2000.0)
+            )
+
+        threads = [threading.Thread(target=recover) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(sorted(recovered), [first, second])
+        self.assertEqual(self.store.get(first)["status"], "pending")
+        self.assertEqual(self.store.get(second)["status"], "pending")
+        # A second recovery finds nothing: the CAS already moved them.
+        self.assertEqual(self.store.recover_stale_sending(2000.0), [])
+
+    def test_stale_entries_without_attempted_at_never_recovered(self):
+        # A legacy sending entry: claimed before attempted_at
+        # existed, so its attempt start is unprovable — the
+        # recovery never touches it (the watchdog reports it for
+        # the operator instead).
+        entry_id = self.store.enqueue(self._entry())
+        conn = sqlite3.connect(str(self.path))
+        conn.execute(
+            "UPDATE outbox SET status = 'sending', attempts = 1 "
+            "WHERE id = ?",
+            (entry_id,),
+        )
+        conn.commit()
+        conn.close()
+        self.assertEqual(
+            self.store.recover_stale_sending(100000.0), [])
+        self.assertEqual(
+            self.store.get(entry_id)["status"], "sending")
+
+    def test_old_schema_migrates_attempted_at_column(self):
+        # A DB created before attempted_at existed (the live
+        # outbox, pre-fix): opening it adds the column, and new
+        # attempts record it.
+        conn = sqlite3.connect(str(self.path))
+        conn.executescript(
+            "CREATE TABLE outbox ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " claim_token TEXT NOT NULL,"
+            " target_update_id INTEGER NOT NULL,"
+            " chat_id INTEGER NOT NULL,"
+            " reply_to_message_id INTEGER,"
+            " keyboard INTEGER NOT NULL DEFAULT 0,"
+            " text TEXT NOT NULL,"
+            " extra_update_ids TEXT NOT NULL DEFAULT '[]',"
+            " status TEXT NOT NULL DEFAULT 'pending',"
+            " attempts INTEGER NOT NULL DEFAULT 0,"
+            " created_at REAL NOT NULL,"
+            " next_attempt_at REAL,"
+            " delivered_at REAL,"
+            " reply_message_id TEXT,"
+            " last_error TEXT,"
+            " retry_after REAL"
+            ");"
+        )
+        conn.commit()
+        conn.close()
+        entry_id = self.store.enqueue(self._entry())
+        self.assertIsNotNone(entry_id)
+        self.assertTrue(self.store.mark_sending(entry_id, now=1500.0))
+        entry = self.store.get(entry_id)
+        self.assertEqual(entry["attempted_at"], 1500.0)
+        columns = [
+            row[1]
+            for row in sqlite3.connect(str(self.path)).execute(
+                "PRAGMA table_info(outbox)"
+            )
+        ]
+        self.assertIn("attempted_at", columns)
 
     def test_due_entries_honor_next_attempt_at(self):
         entry_id = self.store.enqueue(self._entry())
