@@ -645,5 +645,193 @@ class ClaimMoreUnitTests(unittest.TestCase):
         )
 
 
+class BatchFirstIntakeTests(unittest.TestCase):
+    """Fix C (batch-first intake): one turn clears the backlog.
+
+    - The intake claims a whole lane backlog (default batch 10) in
+      one wake, so a burst costs one lane wait instead of one per
+      message.
+    - --outbox folds messages that arrived while the turn was
+      working into the same reply, so they do not wake a fresh
+      turn (a fresh turn costs a whole lane wait, 2-5 min).
+    - The settle window coalesces a burst at intake: default 2s
+      (the live installed value), max 15s (the synthesis range).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.path = self.dir / "state.json"
+        self.calls = self.dir / "send-calls.log"
+        run_cli(self.path, ["--adopt", str(OWNER)])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_send_cmd(self):
+        script = self.dir / "fake-send.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"with open({str(self.calls)!r}, 'a', encoding='utf-8') as fh:\n"
+            "    fh.write('argv=' + repr(sys.argv[1:]) + '\\n')\n"
+            "    fh.write('stdin=' + sys.stdin.read() + '\\n')\n"
+            "print(\"4242\")\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return str(script)
+
+    def items(self):
+        return JsonStateStore(self.path).load()["queue"]
+
+    def test_one_intake_claim_clears_a_10_message_backlog(self):
+        updates = [
+            msg_update(uid, OWNER, "private", OWNER, f"msg {uid}",
+                       message_id=9000 + uid)
+            for uid in range(1, 11)
+        ]
+        payload = run_cli(
+            self.path, [], fetch=FakeFetch(updates),
+            extra_env={telegram.SETTLE_SECONDS_ENV: "0"},
+        )
+        self.assertIsNotNone(payload)
+        self.assertEqual(
+            [it["update_id"] for it in payload["items"]],
+            list(range(1, 11)),
+        )
+
+    def test_one_turn_clears_a_10_message_backlog_end_to_end(self):
+        # The Fix C acceptance test: a 10-message backlog is claimed
+        # in one intake, answered in one --outbox reply, and every
+        # item is done — one turn, one send, no second lane wait.
+        payload = run_cli(
+            self.path, [],
+            fetch=FakeFetch([
+                msg_update(uid, OWNER, "private", OWNER, f"msg {uid}",
+                           message_id=9000 + uid)
+                for uid in range(1, 11)
+            ]),
+            extra_env={telegram.SETTLE_SECONDS_ENV: "0"},
+        )
+        self.assertEqual(len(payload["items"]), 10)
+        cmd = self.write_send_cmd()
+        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: cmd}):
+            result = run_cli(
+                self.path,
+                ["--outbox", payload["claim_token"]],
+                stdin_text="got all ten",
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "delivered", result)
+        self.assertEqual(len(result["covered_update_ids"]), 10, result)
+        self.assertEqual(result["claimed_more_update_ids"], [], result)
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertEqual(calls.count("stdin=got all ten"), 1)
+        for item in self.items():
+            self.assertEqual(item["status"], "done")
+            self.assertEqual(item["reply_message_id"], "4242")
+
+    def test_outbox_folds_a_late_arrival_into_the_same_reply(self):
+        first = run_cli(
+            self.path, [],
+            fetch=FakeFetch([
+                msg_update(1, OWNER, "private", OWNER, "first",
+                           message_id=9001),
+                msg_update(2, OWNER, "private", OWNER, "second",
+                           message_id=9002),
+            ]),
+            extra_env={telegram.SETTLE_SECONDS_ENV: "0"},
+        )
+        self.assertEqual(len(first["items"]), 2)
+        # A third message arrives while the turn is thinking: the
+        # next poll queues it but cannot claim the busy lane.
+        second = run_cli(
+            self.path, [],
+            fetch=FakeFetch([
+                msg_update(3, OWNER, "private", OWNER, "third",
+                           message_id=9003),
+            ]),
+            extra_env={telegram.SETTLE_SECONDS_ENV: "0"},
+        )
+        self.assertIsNone(second)
+        # The turn sends via --outbox: the late arrival joins the
+        # same reply instead of waking a fresh turn.
+        cmd = self.write_send_cmd()
+        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: cmd}):
+            result = run_cli(
+                self.path,
+                ["--outbox", first["claim_token"]],
+                stdin_text="got all three, bro",
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["delivery"], "delivered", result)
+        self.assertEqual(result["claimed_more_update_ids"], [3], result)
+        self.assertEqual(result["covered_update_ids"], [3, 1, 2], result)
+        # Exactly ONE text send, threaded under the latest message.
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertEqual(calls.count("stdin=got all three, bro"), 1)
+        self.assertIn(f"argv=['{OWNER}', '--reply-to', '9003']", calls)
+        for item in self.items():
+            self.assertEqual(item["status"], "done")
+            self.assertEqual(item["reply_message_id"], "4242")
+
+    def test_outbox_fold_does_not_exceed_the_batch_cap(self):
+        # Ten claimed, five more arrive while the turn works: the
+        # fold takes only the headroom to the 12-message cap, and
+        # the rest stay pending for the next turn.
+        first = run_cli(
+            self.path, [],
+            fetch=FakeFetch([
+                msg_update(uid, OWNER, "private", OWNER, f"msg {uid}",
+                           message_id=9000 + uid)
+                for uid in range(1, 11)
+            ]),
+            extra_env={telegram.SETTLE_SECONDS_ENV: "0"},
+        )
+        self.assertEqual(len(first["items"]), 10)
+        second = run_cli(
+            self.path, [],
+            fetch=FakeFetch([
+                msg_update(uid, OWNER, "private", OWNER, f"msg {uid}",
+                           message_id=9000 + uid)
+                for uid in range(11, 16)
+            ]),
+            extra_env={telegram.SETTLE_SECONDS_ENV: "0"},
+        )
+        self.assertIsNone(second)
+        cmd = self.write_send_cmd()
+        with mock.patch.dict(os.environ, {telegram.SEND_CMD_ENV: cmd}):
+            result = run_cli(
+                self.path,
+                ["--outbox", first["claim_token"]],
+                stdin_text="got twelve of them",
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["claimed_more_update_ids"], [11, 12], result)
+        self.assertEqual(len(result["covered_update_ids"]), 12, result)
+        pending = [
+            item for item in self.items()
+            if item["status"] == "pending"
+        ]
+        self.assertEqual(
+            [item["external_id"] for item in pending], ["13", "14", "15"]
+        )
+
+    def test_settle_default_is_2s_and_max_is_15s(self):
+        with mock.patch.dict(
+            os.environ, {telegram.SETTLE_SECONDS_ENV: ""},
+        ):
+            self.assertEqual(telegram._settle_seconds(), 2.0)
+        with mock.patch.dict(
+            os.environ, {telegram.SETTLE_SECONDS_ENV: "99"},
+        ):
+            self.assertEqual(telegram._settle_seconds(), 15.0)
+        with mock.patch.dict(
+            os.environ, {telegram.SETTLE_SECONDS_ENV: "0"},
+        ):
+            self.assertEqual(telegram._settle_seconds(), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

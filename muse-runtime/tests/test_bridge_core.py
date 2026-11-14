@@ -223,6 +223,21 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(item["status"], queue_core.PENDING)
         self.assertIsNone(item["claimed_at"])
 
+    def test_default_batch_size_clears_ten(self):
+        """Batch-first intake (Fix C): one claim takes a 10-message
+        lane backlog, so one turn clears it instead of one turn per
+        message. The default is 10 (was 5); the hard cap stays 12."""
+        self.assertEqual(queue_core.DEFAULT_BATCH_SIZE, 10)
+        state = {}
+        enqueue_n(state, 12)
+        batch = queue_core.claim_batch(state, now=1000.0)
+        self.assertEqual(len(batch["items"]), 10)
+        pending = [
+            item for item in state["queue"]
+            if item["status"] == queue_core.PENDING
+        ]
+        self.assertEqual(len(pending), 2)
+
     def test_stale_recycle_only_unreplied(self):
         state = {}
         enqueue_n(state, 2)

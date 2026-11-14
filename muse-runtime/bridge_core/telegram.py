@@ -986,12 +986,21 @@ def _warm_baton_timeout():
 
 
 #: Settle / batching constants (OpenClaw bot-handlers + Hermes
-#: adapter, retuned for the hook intake): default settle 300 ms,
-#: max settle 7.5 s, batch cap 12 messages / 50,000 chars, album
+#: adapter, retuned for the hook intake): default settle 2 s,
+#: max settle 15 s, batch cap 12 messages / 50,000 chars, album
 #: (media-group) settle 1.5 s. The settle window is bypassed ONLY
-#: when every item in the current batch is a /command.
-SETTLE_DEFAULT_SECONDS = 0.3
-SETTLE_MAX_SECONDS = 7.5
+#: when every item in the current batch is a /command. Default
+#: 2 s matches the live installed hook
+#: (TELEGRAM_BRIDGE_SETTLE_SECONDS=2 in telegram-bridge-intake.sh)
+#: and the batch-first intake design (Fix C, latency synthesis
+#: P1): a burst typed over a couple of seconds coalesces into
+#: one batch instead of one turn per message, and the intake ack
+#: card goes out immediately, so the user sees a receipt while
+#: the batch settles — the old 0.3 s retune predated that card
+#: and split bursts. Max 15 s opens the synthesis's 10-15 s
+#: range for operators who want longer coalescing.
+SETTLE_DEFAULT_SECONDS = 2.0
+SETTLE_MAX_SECONDS = 15.0
 BATCH_MAX_MESSAGES = 12
 BATCH_MAX_CHARS = 50000
 ALBUM_SETTLE_SECONDS = 1.5
@@ -3244,15 +3253,17 @@ def build_payload(state: dict, batch: dict) -> dict | None:
 #: claimed: when a message lands, the intake waits this long and
 #: re-fetches once (non-blocking) so a rapid follow-up typed a
 #: second later joins the same batch instead of becoming a second
-#: turn. Default SETTLE_DEFAULT_SECONDS (0.3 s, OpenClaw debounce
-#: retune — the old 2.0 s default over-waited); set
+#: turn. Default SETTLE_DEFAULT_SECONDS (2.0 s, the live installed
+#: value — batch-first intake, Fix C); set
 #: TELEGRAM_BRIDGE_SETTLE_SECONDS to 0 to disable, or up to
-#: SETTLE_MAX_SECONDS (7.5 s, the OpenClaw long-paste max wait).
+#: SETTLE_MAX_SECONDS (15.0 s, the synthesis's 10-15 s range).
 #: The wait is at most the window, and only when a pending item
 #: arrived inside it; a quiet poll claims nothing and waits for
 #: nothing. The settle is bypassed entirely when every item in
 #: the current batch is a /command (see _has_immediately_claimable_work
-#: / run_once): commands never wait for a follow-up.
+#: / run_once): commands never wait for a follow-up. The intake
+#: ack card goes out immediately on arrival, so the settle never
+#: delays the receipt — only the claim.
 SETTLE_SECONDS_ENV = "TELEGRAM_BRIDGE_SETTLE_SECONDS"
 
 
@@ -6234,9 +6245,18 @@ def write_outbox(
     token: the dispatcher reserves them at delivery time, and
     records the reply and closes them then.
 
+    Batch-first fold (Fix C): before the reply is queued, the
+    write pulls any pending items of the same lane that arrived
+    while the turn was working into the batch (claim_more, capped
+    so the total never exceeds BATCH_MAX_MESSAGES), so they are
+    covered by this reply instead of waking a fresh turn. The
+    joined ids are reported as "claimed_more_update_ids" in the
+    result (empty when nothing joined).
+
     Returns {"ok": true, "outbox_id": n, "target_update_id": ...,
-    "covered_update_ids": [...], "chat_id": ...,
-    "delivery": "delivered", "message_id": ...} on success, or
+    "covered_update_ids": [...], "claimed_more_update_ids": [...],
+    "chat_id": ..., "delivery": "delivered", "message_id": ...}
+    on success, or
     {"ok": false, "stage": ...} with stage "input" (empty /
     oversized text), "fence" (split batch or a send in flight),
     "stale-token" (the token owns no live batch — with
@@ -6294,6 +6314,43 @@ def write_outbox(
     chat_id = next(iter(chat_ids))
     if type(chat_id) is not int:
         return {"ok": False, "stage": "fence"}
+    # Batch-first fold (Fix C): messages that arrived in this lane
+    # while the turn was working join this reply instead of waking
+    # a fresh turn — a fresh turn costs a whole lane wait (2-5
+    # min), the thing batch-first exists to kill. claim_more pulls
+    # pending lane items under the same token; the reply below
+    # covers them and the dispatcher closes them, exactly like
+    # --send-batch-and-close --cover. The fold is capped so the
+    # total batch never exceeds BATCH_MAX_MESSAGES, and it runs
+    # after the fence checks above, so a fenced write never claims
+    # more. It runs in its own transaction because the batch
+    # derivation already closed — the lane is busy under this
+    # token, so no other claim can take these items in between
+    # (claim_batch skips busy lanes; the sweeper only touches
+    # claimed items). The stale-age guard below runs over the
+    # expanded batch: a newly joined item is fresh (it just
+    # arrived), and a stall-backlog item passes the longer
+    # claimed-work limit, so the fold cannot smuggle a stale
+    # reply past the guard. The joined ids are reported in the
+    # result as claimed_more_update_ids.
+    claimed_more = []
+    headroom = BATCH_MAX_MESSAGES - len(items)
+    if headroom > 0:
+        with store.transaction() as state:
+            _ensure_adapter_state(state)
+            more = queue_core.claim_more(
+                state,
+                platform=PLATFORM,
+                chat_id=chat_id,
+                token=token,
+                batch_size=headroom,
+                now=check_now,
+            )
+        if more:
+            claimed_more = [
+                int(it["external_id"]) for it in more["items"]
+            ]
+            items = items + list(more["items"])
     # The stale-age guard, per item — the same rule _reserve_send
     # applies at delivery time, checked here so the agent learns
     # immediately instead of queuing a reply the dispatcher must
@@ -6386,6 +6443,7 @@ def write_outbox(
         "outbox_id": entry_id,
         "target_update_id": primary_id,
         "covered_update_ids": [primary_id] + extras,
+        "claimed_more_update_ids": claimed_more,
         "chat_id": chat_id,
         "delivery": delivery,
     }

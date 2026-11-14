@@ -99,7 +99,18 @@ import os
 import secrets
 import time
 
-DEFAULT_BATCH_SIZE = 5
+#: Default batch size for a claim (one conversation lane): one
+#: turn clears a 10-message lane backlog instead of one turn per
+#: message. Batch-first intake (Fix C, latency synthesis P1):
+#: the runtime lane starts ~1 worker per 2-5 min, so a burst of
+#: 5-10 messages costs one lane wait instead of 5-10. The hard
+#: cap stays BATCH_MAX_MESSAGES (12) in telegram.py; an operator
+#: can still tune the size down with
+#: $TELEGRAM_BRIDGE_BATCH_SIZE, and --claim-more inherits this
+#: default too. 10 is the Fix C test target (a 10-message
+#: backlog clears in one turn); a larger default would bloat
+#: the wake payload and the single batch reply.
+DEFAULT_BATCH_SIZE = 10
 DEFAULT_STALE_TTL = 1800.0
 
 #: Seconds without a heartbeat after which a claimed item counts as
