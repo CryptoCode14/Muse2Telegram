@@ -1038,6 +1038,109 @@ class OutboxDispatchTests(OutboxTestBase):
         self.assertEqual(len(self.text_sends()), 1)
 
 
+class ReplySafetyNetTests(OutboxTestBase):
+    """--reply queues a delayed safety-net outbox entry before its
+    direct send (DM-stuck fix, 2026-11-13): if the turn dies
+    mid-send, the poll delivers the queued reply; if the direct
+    send already went out, the poll supersedes it (no duplicate).
+    """
+
+    def _force_due(self, entry_id):
+        """Set an outbox entry's next_attempt_at to the past so
+        the next dispatch treats it as due."""
+        db = self.path.with_suffix(".outbox.sqlite3")
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute(
+                "UPDATE outbox SET next_attempt_at = ? WHERE id = ?",
+                (time.time() - 1, entry_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_reply_enqueues_safety_net_delayed_and_supersedes(self):
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        with self.send_env(cmd):
+            result = run_cli(
+                self.path, ["--reply", payload["claim_token"]],
+                stdin_text="hey bro",
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["stage"], "sent")
+        self.assertEqual(len(self.text_sends()), 1)
+        item = self.item(1)
+        self.assertEqual(item["status"], "done")
+        self.assertIsNotNone(item["replied_at"])
+        # The safety net: one pending entry, due after the delay.
+        entries = self.outbox_entries()
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["status"], "pending")
+        self.assertEqual(entry["text"], "hey bro")
+        self.assertIsNotNone(entry.get("next_attempt_at"))
+        delay = entry["next_attempt_at"] - entry["created_at"]
+        self.assertAlmostEqual(
+            delay, telegram.REPLY_SAFETY_NET_DELAY_SECONDS, delta=5.0,
+        )
+        # Not due yet: an immediate dispatch sends nothing.
+        report = self.dispatch(cmd)
+        self.assertEqual(report["checked"], 0)
+        self.assertEqual(len(self.text_sends()), 1)
+        self.assertEqual(
+            self.outbox_entry(entry["id"])["status"], "pending",
+        )
+        # Once due, the dispatcher supersedes it (already replied)
+        # instead of sending a second copy.
+        self._force_due(entry["id"])
+        report = self.dispatch(cmd)
+        self.assertEqual(report["superseded"], [entry["id"]])
+        self.assertEqual(len(self.text_sends()), 1)
+        self.assertEqual(
+            self.outbox_entry(entry["id"])["status"], "superseded",
+        )
+
+    def test_safety_net_delivers_when_turn_dies_before_send(self):
+        # The turn queued the safety net then died before the
+        # direct send: the item is still CLAIMED, the entry is
+        # due, and the poll must deliver it.
+        payload = self.claim([
+            msg_update(1, OWNER, "private", OWNER, "hello",
+                       message_id=9001),
+        ])
+        cmd = self.write_send_cmd()
+        entry_id = OutboxStore(
+            self.path.with_suffix(".outbox.sqlite3")
+        ).enqueue(
+            {
+                "claim_token": payload["claim_token"],
+                "target_update_id": 1,
+                "chat_id": OWNER,
+                "reply_to_message_id": 9001,
+                "keyboard": False,
+                "text": "hey bro",
+                "extra_update_ids": [],
+                "created_at": time.time(),
+                "next_attempt_at": time.time() - 1,
+            }
+        )
+        self.assertIsNotNone(entry_id)
+        self.assertEqual(self.item(1)["status"], "claimed")
+        report = self.dispatch(cmd)
+        self.assertEqual(report["delivered"], [entry_id])
+        self.assertEqual(len(self.text_sends()), 1)
+        item = self.item(1)
+        self.assertEqual(item["status"], "done")
+        self.assertIsNotNone(item["replied_at"])
+        self.assertEqual(
+            self.outbox_entry(entry_id)["status"], "delivered",
+        )
+
+
 class OutboxStaleSendingTests(OutboxTestBase):
     """A dispatcher killed mid-attempt must not strand the reply.
 

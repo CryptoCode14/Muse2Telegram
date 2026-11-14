@@ -770,6 +770,14 @@ OUTBOX_DISPATCH_PER_PASS = 20
 #: of waiting out a throttle delay.
 OUTBOX_DEFER_SECONDS = 30.0
 
+#: Delay (seconds) before the poll may dispatch a safety-net
+#: outbox entry that --reply queued before its direct send.
+#: Long enough for the direct send to finish (seconds) and short
+#: enough that a turn killed mid-send is recovered within about
+#: a minute. The entry supersedes harmlessly when the direct
+#: send already went out (the item is replied/closed by then).
+REPLY_SAFETY_NET_DELAY_SECONDS = 60.0
+
 
 def outbox_path(store: JsonStateStore | None = None) -> Path:
     """Path of the SQLite outbox for this bot.
@@ -6092,6 +6100,31 @@ def send_reply(
     extras = [
         int(item["external_id"]) for item in ordered if item is not primary
     ]
+    # Safety net (DM-stuck fix, 2026-11-13): queue the reply in
+    # the outbox BEFORE the direct send, due after
+    # REPLY_SAFETY_NET_DELAY_SECONDS. If this turn dies mid-send,
+    # the entry stays pending and the poll delivers it; if the
+    # direct send already went out, the poll supersedes it (the
+    # item is replied/closed by then). Best-effort only: a failed
+    # queue never blocks the reply.
+    try:
+        _safety_now = time.time() if now is None else now
+        OutboxStore(outbox_path(store)).enqueue(
+            {
+                "claim_token": token,
+                "target_update_id": primary_id,
+                "chat_id": chat_id,
+                "reply_to_message_id": reply_to,
+                "keyboard": keyboard,
+                "text": text,
+                "extra_update_ids": extras,
+                "created_at": _safety_now,
+                "next_attempt_at": _safety_now
+                + REPLY_SAFETY_NET_DELAY_SECONDS,
+            }
+        )
+    except Exception:
+        pass
     send_cmd = os.environ.get(SEND_CMD_ENV)
     # (c) Typing, best-effort: refresh the indicator right before
     # sending; a failed typing call never blocks the reply.

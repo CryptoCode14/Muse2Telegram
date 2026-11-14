@@ -197,7 +197,13 @@ class OutboxStore:
         same queue items — the second write is refused, never
         queued alongside, so one batch can never be delivered
         twice. The check and the insert run in one BEGIN
-        IMMEDIATE transaction."""
+        IMMEDIATE transaction. Optional ``next_attempt_at``
+        (epoch seconds) delays when the entry becomes due; when
+        absent it is NULL (due now). A delayed entry is the
+        safety net for a direct send: the poll only touches it
+        after the delay, so it cannot race a send still in
+        flight, and it supersedes harmlessly if that send
+        already went out."""
         target = int(entry["target_update_id"])
         extras = [int(v) for v in entry.get("extra_update_ids") or []]
         covered = [target] + [v for v in extras if v != target]
@@ -225,8 +231,9 @@ class OutboxStore:
                 cursor = conn.execute(
                     "INSERT INTO outbox (claim_token, target_update_id, "
                     "chat_id, reply_to_message_id, keyboard, text, "
-                    "extra_update_ids, status, attempts, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)",
+                    "extra_update_ids, status, attempts, created_at, "
+                    "next_attempt_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
                     (
                         entry["claim_token"],
                         target,
@@ -236,6 +243,11 @@ class OutboxStore:
                         entry["text"],
                         json.dumps(covered[1:]),
                         float(entry["created_at"]),
+                        (
+                            float(entry["next_attempt_at"])
+                            if entry.get("next_attempt_at") is not None
+                            else None
+                        ),
                     ),
                 )
                 conn.execute("COMMIT")
