@@ -54,6 +54,11 @@ export TELEGRAM_BRIDGE_PAUSED_PATH=~/workspace/telegram-bridge/PAUSED
 # the rest of this window and re-fetches once, so a rapid follow-up
 # joins the same batch instead of becoming a second turn.
 export TELEGRAM_BRIDGE_SETTLE_SECONDS=2
+# Long-poll OFF (2026-11-13): urllib read times out on the 30s held
+# getUpdates long-poll (TimeoutError) — same urllib-in-sandbox class
+# as the A2A list truncation. With 0 the call returns immediately, so
+# no held connection to time out; the hook tick is the pickup latency.
+export TELEGRAM_BRIDGE_LONG_POLL_SECONDS=0
 DECIDER=~/hooks/scripts/telegram-bridge-decide.py
 
 payload=""
