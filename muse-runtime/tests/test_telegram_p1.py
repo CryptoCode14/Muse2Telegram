@@ -99,6 +99,50 @@ def _claim(state, external_id=101, chat_id=CHAT, at=1000.0,
     return queue_core.claim_batch(state, platform="telegram", now=at)
 
 
+class StatePathExpanduserTests(unittest.TestCase):
+    """TELEGRAM_BRIDGE_STATE_PATH with an unexpanded ~ resolves
+    to the real state file (2026-11-13, Westin msg 209 wake 11:
+    a re-wake turn passed the env var with ~, state_path() built
+    a literal ~ path, read an empty store, and got a FALSE
+    stale-token — then burned its lease investigating instead
+    of heartbeating with absolute paths)."""
+
+    def test_tilde_override_resolves_to_real_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            real = home / "state.json"
+            store = JsonStateStore(real)
+            with store.transaction() as state:
+                batch = _claim(state)
+            token = batch["claim_token"]
+            with mock.patch.dict(os.environ, {
+                    "HOME": str(home),
+                    "TELEGRAM_BRIDGE_STATE_PATH": "~/state.json"}):
+                resolved = telegram.state_path()
+            self.assertEqual(resolved, real)
+            # The store at the resolved path sees the claim —
+            # this is the point: an unexpanded ~ used to read an
+            # empty store, so the token looked stale.
+            seen = JsonStateStore(resolved).load()
+            item = queue_core.find_item(seen, "telegram", 101)
+            self.assertEqual(item["claim_token"], token)
+            self.assertEqual(item["status"], "claimed")
+
+    def test_absolute_override_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "state.json"
+            with mock.patch.dict(os.environ, {
+                    "TELEGRAM_BRIDGE_STATE_PATH": str(real)}):
+                self.assertEqual(telegram.state_path(), real)
+
+    def test_no_override_returns_default(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TELEGRAM_BRIDGE_STATE_PATH", None)
+            self.assertEqual(
+                telegram.state_path(), telegram.HERE / "state.json")
+
+
 class ClaimLeaseTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

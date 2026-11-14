@@ -57,7 +57,7 @@ cd ~/workspace/muse2telegram/muse-runtime && python3 -m venv .venv
 .venv/bin/python -m unittest discover -s tests
 ```
 
-**Done looks like:** the suite runs with no failures (611 tests, the
+**Done looks like:** the suite runs with no failures (614 tests, the
 current baseline — zero failures). Do not proceed on a failing suite
 you cannot explain.
 

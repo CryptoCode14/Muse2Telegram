@@ -745,7 +745,12 @@ HERE = Path(__file__).resolve().parent
 
 def state_path() -> Path:
     override = os.environ.get("TELEGRAM_BRIDGE_STATE_PATH")
-    return Path(override) if override else HERE / "state.json"
+    # expanduser: a ~ override (the hook instructions pass the
+    # path with ~) must resolve to the real state file. Without
+    # it, Path("~") is a literal relative path, the store reads
+    # an empty file, and a live claim token looks stale (a re-wake
+    # turn on Westin msg 209, 2026-11-13, lost its reply this way).
+    return Path(override).expanduser() if override else HERE / "state.json"
 
 
 #: Environment variable overriding the outbox SQLite path (tests
