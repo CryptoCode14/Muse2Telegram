@@ -8,7 +8,7 @@
   cd muse-runtime && python3 -m unittest discover -s tests
   ```
 
-  The baseline is 607 tests with zero failures. Do not proceed on a
+  The baseline is 611 tests with zero failures. Do not proceed on a
   failing suite you cannot explain, and do not weaken, delete, or
   edit a failing test to make it pass — if a test fails after your
   change, the code is wrong, not the test.

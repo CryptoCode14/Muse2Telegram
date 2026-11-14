@@ -5,8 +5,8 @@ Covers (see latency-synthesis-20261112.md, "Build order" P1):
 - Ack as a live status card: the intake sends one card at claim
   (with the queue position); the sweeper EDITS that same message
   (never a second card, never a resend) to keep it current.
-- Claim lease 60-120s + script sweeper: the sweeper releases
-  never-started claims past the lease (120s), re-queues with an
+- Claim lease 600s + script sweeper: the sweeper releases
+  never-started claims past the lease (600s), re-queues with an
   attempt counter, and escalates at K=3; the 600s heartbeat
   horizon for started turns is untouched.
 - No pre-wake typing (see test_v2_unified_prompt.py).
@@ -111,7 +111,7 @@ class ClaimLeaseTests(unittest.TestCase):
             batch = _claim(state)
             token = batch["claim_token"]
         with self.store.transaction() as state:
-            out = queue_core.sweep_claim_lease(state, now=1000.0 + 121.0)
+            out = queue_core.sweep_claim_lease(state, now=1000.0 + 601.0)
         self.assertEqual([i["external_id"] for i in out["expired"]], ["101"])
         self.assertEqual(out["escalated"], [])
         item = queue_core.find_item(self.store.load(), "telegram", 101)
@@ -125,12 +125,41 @@ class ClaimLeaseTests(unittest.TestCase):
         # The old token is dead: a late transition is refused.
         with self.store.transaction() as state:
             self.assertFalse(
-                queue_core.heartbeat(state, "telegram", 101, token, now=1130.0))
+                queue_core.heartbeat(state, "telegram", 101, token, now=1610.0))
 
-    def test_lease_does_not_fire_before_120s(self):
+    def test_late_turn_start_inside_new_lease_keeps_live_token(self):
+        # Regression (Westin msg 209, 2026-11-13): turns now
+        # start well after the old 120s lease (wake p50 40s,
+        # p90 110s, worst observed ~8.5 min), so a 120s lease
+        # recycled the claim before the turn started and the
+        # token arrived dead — 10 wakes / 10 recycles on one
+        # item. At 300s in — past the old lease, inside the
+        # new 600s lease — the claim must still be live and
+        # the turn must be able to heartbeat and reply.
+        with self.store.transaction() as state:
+            batch = _claim(state)
+            token = batch["claim_token"]
+            out = queue_core.sweep_claim_lease(state, now=1300.0)
+        self.assertEqual(out, {"expired": [], "escalated": []})
+        item = queue_core.find_item(self.store.load(), "telegram", 101)
+        self.assertEqual(item["status"], "claimed")
+        self.assertEqual(item["claim_token"], token)
+        # The late-starting turn heartbeats and replies on the
+        # same token: no stale-token fence, no second turn needed.
+        with self.store.transaction() as state:
+            self.assertTrue(
+                queue_core.heartbeat(state, "telegram", 101, token, now=1300.0))
+        with self.store.transaction() as state:
+            self.assertTrue(
+                queue_core.mark_replied(
+                    state, "telegram", 101, "777", token, now=1310.0))
+        item = queue_core.find_item(self.store.load(), "telegram", 101)
+        self.assertIsNotNone(item["replied_at"])
+
+    def test_lease_does_not_fire_before_600s(self):
         with self.store.transaction() as state:
             _claim(state)
-            out = queue_core.sweep_claim_lease(state, now=1000.0 + 119.0)
+            out = queue_core.sweep_claim_lease(state, now=1000.0 + 599.0)
         self.assertEqual(out, {"expired": [], "escalated": []})
         item = queue_core.find_item(self.store.load(), "telegram", 101)
         self.assertEqual(item["status"], "claimed")
@@ -176,21 +205,21 @@ class ClaimLeaseTests(unittest.TestCase):
         # Attempt 1: released, re-claimed.
         with self.store.transaction() as state:
             _claim(state)
-            out = queue_core.sweep_claim_lease(state, now=1121.0)
+            out = queue_core.sweep_claim_lease(state, now=1601.0)
         self.assertEqual(len(out["expired"]), 1)
         with self.store.transaction() as state:
-            batch = queue_core.claim_batch(state, platform="telegram", now=1125.0)
+            batch = queue_core.claim_batch(state, platform="telegram", now=1605.0)
         self.assertIsNotNone(batch)
         # Attempt 2: released, re-claimed.
         with self.store.transaction() as state:
-            out = queue_core.sweep_claim_lease(state, now=1246.0)
+            out = queue_core.sweep_claim_lease(state, now=2206.0)
         self.assertEqual(len(out["expired"]), 1)
         with self.store.transaction() as state:
-            batch = queue_core.claim_batch(state, platform="telegram", now=1250.0)
+            batch = queue_core.claim_batch(state, platform="telegram", now=2210.0)
         self.assertIsNotNone(batch)
         # Attempt 3: escalated, not merely released.
         with self.store.transaction() as state:
-            out = queue_core.sweep_claim_lease(state, now=1371.0)
+            out = queue_core.sweep_claim_lease(state, now=2811.0)
         self.assertEqual(out["expired"], [])
         self.assertEqual(
             [i["external_id"] for i in out["escalated"]], ["101"])
@@ -198,16 +227,16 @@ class ClaimLeaseTests(unittest.TestCase):
         self.assertEqual(item["status"], "pending")
         self.assertTrue(item["lease_escalated"])
         self.assertEqual(item["lease_attempts"], 3)
-        self.assertEqual(item["wake_after"], 1371.0 + 86400.0)
+        self.assertEqual(item["wake_after"], 2811.0 + 86400.0)
         # The intake stops re-waking it while the backoff runs.
         with self.store.transaction() as state:
             self.assertIsNone(
-                queue_core.claim_batch(state, platform="telegram", now=1400.0))
+                queue_core.claim_batch(state, platform="telegram", now=2900.0))
 
     def test_watchdog_reports_lease_once_and_merges_recycled(self):
         with self.store.transaction() as state:
             _claim(state)
-            report = queue_core.watchdog_sweep(state, now=1121.0)
+            report = queue_core.watchdog_sweep(state, now=1601.0)
         self.assertEqual(report["lease_expired"], ["101"])
         self.assertEqual(report["lease_escalated"], [])
         self.assertEqual(report["recycled"], ["101"])
@@ -216,9 +245,9 @@ class ClaimLeaseTests(unittest.TestCase):
     def test_escalated_item_requeues_after_backoff_with_fresh_attempts(self):
         with self.store.transaction() as state:
             _claim(state)
-            for at in (1121.0, 1246.0, 1371.0):
+            for at in (1601.0, 2206.0, 2811.0):
                 queue_core.sweep_claim_lease(state, now=at)
-                if at < 1371.0:
+                if at < 2811.0:
                     queue_core.claim_batch(state, platform="telegram", now=at + 4.0)
         item = queue_core.find_item(self.store.load(), "telegram", 101)
         self.assertTrue(item["lease_escalated"])
@@ -226,7 +255,7 @@ class ClaimLeaseTests(unittest.TestCase):
         # counter resets: a fresh episode, not a fourth strike.
         with self.store.transaction() as state:
             batch = queue_core.claim_batch(
-                state, platform="telegram", now=1371.0 + 86400.0 + 1.0)
+                state, platform="telegram", now=2811.0 + 86400.0 + 1.0)
         self.assertIsNotNone(batch)
         item = queue_core.find_item(self.store.load(), "telegram", 101)
         self.assertFalse(item["lease_escalated"])
@@ -235,9 +264,9 @@ class ClaimLeaseTests(unittest.TestCase):
     def test_clear_lease_cli_requeues_at_once(self):
         with self.store.transaction() as state:
             _claim(state)
-            for at in (1121.0, 1246.0, 1371.0):
+            for at in (1601.0, 2206.0, 2811.0):
                 queue_core.sweep_claim_lease(state, now=at)
-                if at < 1371.0:
+                if at < 2811.0:
                     queue_core.claim_batch(state, platform="telegram", now=at + 4.0)
         code, result = run_cli(self.path, ["--clear-lease", "101"])
         self.assertEqual(code, 0)
@@ -248,7 +277,7 @@ class ClaimLeaseTests(unittest.TestCase):
         self.assertEqual(item["lease_attempts"], 0)
         with self.store.transaction() as state:
             self.assertIsNotNone(
-                queue_core.claim_batch(state, platform="telegram", now=1400.0))
+                queue_core.claim_batch(state, platform="telegram", now=2900.0))
         # Clearing a non-escalated item is a no-op false.
         code, result = run_cli(self.path, ["--clear-lease", "101"])
         self.assertEqual(result, {"ok": False})
@@ -271,14 +300,82 @@ class ClaimLeaseTests(unittest.TestCase):
         self.assertNotEqual(batch["claim_token"], token)
 
     def test_lease_constants_are_in_range(self):
-        # Synthesis: lease 60-120s, K attempts. 120s is the top
-        # of the range (a live turn heartbeats first thing even
-        # when reading MEMORY first); K=3 is ~6 min of
-        # never-started before escalation.
-        self.assertEqual(queue_core.CLAIM_LEASE_SECONDS, 120.0)
-        self.assertGreaterEqual(queue_core.CLAIM_LEASE_SECONDS, 60.0)
-        self.assertLessEqual(queue_core.CLAIM_LEASE_SECONDS, 120.0)
+        # Retuned 2026-11-13 (Westin msg 209): the lease is
+        # 600s, matching the heartbeat horizon — the 120s
+        # synthesis range no longer fits the lane (wake p90
+        # 110s, worst observed ~8.5 min). K=3 is ~30 min of
+        # never-started before escalation, still surfacing a
+        # dead claim the same hour.
+        self.assertEqual(queue_core.CLAIM_LEASE_SECONDS, 600.0)
+        self.assertEqual(
+            queue_core.CLAIM_LEASE_SECONDS,
+            queue_core.HEARTBEAT_STALE_SECONDS)
         self.assertEqual(queue_core.CLAIM_LEASE_MAX_ATTEMPTS, 3)
+
+    def test_lease_recycled_item_is_reclaimed_with_new_token(self):
+        # The longer lease still recycles: a never-started claim
+        # is released past 600s, and the intake re-claims it
+        # under a new token — the item is re-woken, not dropped.
+        with self.store.transaction() as state:
+            batch = _claim(state)
+            old_token = batch["claim_token"]
+            out = queue_core.sweep_claim_lease(state, now=1601.0)
+        self.assertEqual([i["external_id"] for i in out["expired"]], ["101"])
+        item = queue_core.find_item(self.store.load(), "telegram", 101)
+        self.assertEqual(item["status"], "pending")
+        self.assertEqual(item["lease_attempts"], 1)
+        self.assertEqual(item["recycle_count"], 1)
+        with self.store.transaction() as state:
+            batch = queue_core.claim_batch(state, platform="telegram", now=1605.0)
+        self.assertIsNotNone(batch)
+        self.assertNotEqual(batch["claim_token"], old_token)
+        item = queue_core.find_item(self.store.load(), "telegram", 101)
+        self.assertEqual(item["status"], "claimed")
+
+    def test_started_turn_stale_heartbeat_recycled_not_lease_released(self):
+        # The heartbeat backstop still catches a started-but-
+        # stalled turn: a started claim is never lease-released,
+        # however long it runs, but once its heartbeat is stale
+        # past 600s the watchdog recycles it. The lease did not
+        # fire (lease_expired empty); the heartbeat did.
+        with self.store.transaction() as state:
+            batch = _claim(state)
+            queue_core.heartbeat(
+                state, "telegram", 101, batch["claim_token"], now=1001.0)
+            report = queue_core.watchdog_sweep(state, now=2000.0)
+        self.assertEqual(report["lease_expired"], [])
+        self.assertEqual(report["lease_escalated"], [])
+        self.assertEqual(report["recycled"], ["101"])
+        item = queue_core.find_item(self.store.load(), "telegram", 101)
+        self.assertEqual(item["status"], "pending")
+
+    def test_lease_recycled_old_token_cannot_double_send(self):
+        # No double-send from the longer lease: after a claim
+        # is lease-released and re-claimed under a new token,
+        # the dead turn's old token authorizes nothing — a late
+        # mark_sending / mark_replied / mark_done with it is
+        # refused — while the new token sends normally.
+        with self.store.transaction() as state:
+            batch = _claim(state)
+            old_token = batch["claim_token"]
+            queue_core.sweep_claim_lease(state, now=1601.0)
+        with self.store.transaction() as state:
+            batch = queue_core.claim_batch(state, platform="telegram", now=1605.0)
+        self.assertIsNotNone(batch)
+        new_token = batch["claim_token"]
+        self.assertNotEqual(new_token, old_token)
+        with self.store.transaction() as state:
+            self.assertFalse(
+                queue_core.mark_sending(state, "telegram", 101, old_token))
+            self.assertFalse(
+                queue_core.mark_replied(state, "telegram", 101, "777", old_token))
+            self.assertFalse(
+                queue_core.mark_done(state, "telegram", 101, old_token))
+            # The new turn sends on its own token.
+            self.assertTrue(
+                queue_core.mark_sending(state, "telegram", 101, new_token))
+        item = queue_core.find_item(self.store.load(), "telegram", 101)
+        self.assertEqual(item["status"], "sending")
 
 
 class BatchFirstTests(unittest.TestCase):
@@ -398,7 +495,7 @@ class ClaimAckCardTests(unittest.TestCase):
         self.assertIsNone(item["turn_started_at"])
         self.assertEqual(item["heartbeat_at"], 1000.0)
         with self.store.transaction() as state:
-            report = queue_core.watchdog_sweep(state, now=1121.0)
+            report = queue_core.watchdog_sweep(state, now=1601.0)
         self.assertEqual(report["lease_expired"], ["101"])
         self.assertEqual(self.item()["status"], "pending")
 
@@ -469,7 +566,7 @@ class ClaimAckCardTests(unittest.TestCase):
             with mock.patch.object(
                 telegram, "_run_sender_action", return_value=True
             ) as edit_mock:
-                report = telegram.watchdog_sweep(self.store, now=1121.0)
+                report = telegram.watchdog_sweep(self.store, now=1601.0)
         self.assertEqual(report["lease_expired"], ["101"])
         self.assertEqual(report["ack_cards"]["edited"], 1)
         # The SAME message id, edited — not a second card sent.
@@ -490,15 +587,15 @@ class ClaimAckCardTests(unittest.TestCase):
             with mock.patch.object(
                 telegram, "_run_sender_action", return_value=True
             ) as edit_mock:
-                telegram.watchdog_sweep(self.store, now=1121.0)
+                telegram.watchdog_sweep(self.store, now=1601.0)
                 with self.store.transaction() as state:
                     queue_core.claim_batch(
-                        state, platform="telegram", now=1125.0)
-                telegram.watchdog_sweep(self.store, now=1246.0)
+                        state, platform="telegram", now=1605.0)
+                telegram.watchdog_sweep(self.store, now=2206.0)
                 with self.store.transaction() as state:
                     queue_core.claim_batch(
-                        state, platform="telegram", now=1250.0)
-                report = telegram.watchdog_sweep(self.store, now=1371.0)
+                        state, platform="telegram", now=2210.0)
+                report = telegram.watchdog_sweep(self.store, now=2811.0)
         self.assertEqual(report["lease_escalated"], ["101"])
         self.assertTrue(self.item()["lease_escalated"])
         self.assertEqual(
@@ -585,9 +682,9 @@ class ClaimAckCardTests(unittest.TestCase):
 
     def test_latency_report_counts_lease_escalations(self):
         with self.store.transaction() as state:
-            for at in (1121.0, 1246.0, 1371.0):
+            for at in (1601.0, 2206.0, 2811.0):
                 queue_core.sweep_claim_lease(state, now=at)
-                if at < 1371.0:
+                if at < 2811.0:
                     queue_core.claim_batch(state, platform="telegram", now=at + 4.0)
         code, report = run_cli(self.path, ["--latency-report"])
         self.assertEqual(code, 0)

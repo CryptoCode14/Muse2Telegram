@@ -157,7 +157,7 @@ Keeps the operational interface the wake hook drives:
   --watchdog               one watchdog pass: recycle claimed items
                            whose heartbeat went stale (a turn that
                            died mid-work) back to pending, release
-                           never-started claims past the 120s claim
+                           never-started claims past the 600s claim
                            lease (escalating at 3 attempts), refresh
                            the ack status cards (EDITING the existing
                            card messages, never sending a new one),
@@ -7110,7 +7110,7 @@ def main(argv=None, *, fetch=fetch_updates, path: Path | None = None, api_call=a
         # --watchdog: one watchdog pass — recycle claimed items
         # whose heartbeat went stale (a turn that died mid-work)
         # back to pending, release never-started claims past the
-        # 120s claim lease (escalating at 3 attempts), refresh the
+        # 600s claim lease (escalating at 3 attempts), refresh the
         # ack status cards (editing the existing card messages,
         # never sending a new one), verify the bridge install
         # (intake hook definition, checkout, venv, sender), and

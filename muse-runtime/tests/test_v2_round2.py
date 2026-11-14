@@ -658,9 +658,10 @@ class WatchdogHeartbeatWiringTests(unittest.TestCase):
         return state
 
     def test_watchdog_releases_never_started_claim_at_lease(self):
-        # P1 claim lease: a never-started claim is released by
-        # the sweeper at 120s, not at the old 600s horizon — the
-        # 600s boundary below now applies to STARTED claims only.
+        # Claim lease, retuned 2026-11-13 (Westin msg 209):
+        # a never-started claim is released by the sweeper at
+        # the 600s lease — the same 600s horizon as started
+        # claims, because turns now start well after 120s.
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
             store = JsonStateStore(path)
@@ -668,12 +669,12 @@ class WatchdogHeartbeatWiringTests(unittest.TestCase):
                 state.update(self._claimed_state())
             with mock.patch.dict(os.environ, {
                     telegram.BOT_USERNAME_ENV: "ExampleBot"}):
-                # 119 s in: the lease has not expired yet.
-                report = telegram.watchdog_sweep(store, now=1119.0)
+                # 599 s in: the lease has not expired yet.
+                report = telegram.watchdog_sweep(store, now=1599.0)
                 self.assertEqual(report["recycled"], [])
                 self.assertEqual(report["lease_expired"], [])
-                # 121 s in: lease-released (and reported as such).
-                report = telegram.watchdog_sweep(store, now=1121.0)
+                # 601 s in: lease-released (and reported as such).
+                report = telegram.watchdog_sweep(store, now=1601.0)
                 self.assertEqual(report["recycled"], ["1"])
                 self.assertEqual(report["lease_expired"], ["1"])
 

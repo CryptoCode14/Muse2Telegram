@@ -49,7 +49,7 @@ Claim discipline (the rules that keep wake turns from double-answering):
 - Claim lease (P1 latency, see ``sweep_claim_lease``): a claim
   whose turn never started (``turn_started_at`` None) is released
   by the watchdog sweeper once it is older than
-  ``CLAIM_LEASE_SECONDS`` (120s), re-queued with an attempt
+  ``CLAIM_LEASE_SECONDS`` (600s), re-queued with an attempt
   counter, and re-woken by the intake's next poll — no re-wake
   before the lease expires. After ``CLAIM_LEASE_MAX_ATTEMPTS``
   (3) expiries the item is escalated: it stays pending with a
@@ -173,20 +173,28 @@ NEVER_STARTED_RECYCLE_SECONDS = 600.0
 
 #: Claim lease (seconds, P1 latency): a claim whose turn never
 #: started (``turn_started_at`` is None) is released by the
-#: watchdog sweeper once its claim is older than this. 120 s is
-#: the TOP of the synthesis's 60-120 s range, deliberately: a
-#: live turn heartbeats first thing (the wake prompt's first
-#: action) even when it reads MEMORY first — the same reason the
-#: warm baton is 120 s — so 60/90 s would risk recycling a
-#: slow-starting live turn, the failure that forced the 600 s
-#: horizon above. The lease applies ONLY to never-started,
-#: non-warm claims (see ``sweep_claim_lease``); a started turn
-#: keeps the 600 s heartbeat horizon, untouched. The sweeper
-#: enforces the lease (it polls every 60 s), so a dead claim is
-#: released 120-180 s after its claim; the intake's next poll
+#: watchdog sweeper once its claim is older than this. 600 s
+#: matches the heartbeat horizon (``HEARTBEAT_STALE_SECONDS``),
+#: deliberately: the lease was 120 s (the TOP of the
+#: synthesis's 60-120 s range) when turns started in 40-95 s,
+#: but live wake latency grew past it — wake p50 40 s, p90
+#: 110 s, worst observed ~8.5 min — so turns arrived to a
+#: dead token and cycled without ever replying (Westin msg
+#: 209, 2026-11-13: 10 wakes / 10 recycles on one item).
+#: 600 s covers the observed distribution with margin and
+#: the ~8.5 min worst case that set the heartbeat horizon.
+#: The lease applies ONLY to never-started, non-warm claims
+#: (see ``sweep_claim_lease``); a started turn keeps the
+#: 600 s heartbeat horizon, untouched. The sweeper enforces
+#: the lease (it polls every 60 s), so a dead claim is
+#: released 600-660 s after its claim; the intake's next poll
 #: re-claims and re-wakes it. No re-wake happens before the
-#: lease expires.
-CLAIM_LEASE_SECONDS = 120.0
+#: lease expires. The cost of the longer lease is slower
+#: recycling of a genuinely dead never-started claim (up to
+#: ten minutes instead of two); the cost of the short lease
+#: was a live turn arriving to a dead token, which wastes
+#: the whole turn and the reply.
+CLAIM_LEASE_SECONDS = 600.0
 
 #: Failed lease attempts (P1 latency): after this many
 #: lease expiries for one claim episode, the sweeper stops
@@ -194,13 +202,17 @@ CLAIM_LEASE_SECONDS = 120.0
 #: it stays pending with ``lease_escalated`` set and a 24 h
 #: ``wake_after`` backoff, so the intake stops re-waking it,
 #: and the sweep reports it once for an operator wake. 3
-#: attempts is ~6 minutes of never-started before escalation:
-#: enough for the runtime lane to drain a short backup, short
-#: enough that a genuinely dead claim is surfaced the same
-#: hour. The counter resets only when an escalated item is
-#: re-claimed after its backoff (a fresh episode); ordinary
-#: recycles keep it, so the bound is per episode, not per
-#: claim.
+#: attempts is ~30 minutes of never-started before escalation
+#: (3 x 600 s): enough for the runtime lane to drain a backup
+#: — each attempt is now a real 10-minute window for a slow
+#: turn to start, not a guaranteed failure — and short enough
+#: that a genuinely dead claim is still surfaced the same
+#: hour. K stays 3 with the longer lease: cutting it would
+#: cut the number of chances a slow turn gets to start, and
+#: the 24 h hold is unchanged. The counter resets only when
+#: an escalated item is re-claimed after its backoff (a fresh
+#: episode); ordinary recycles keep it, so the bound is per
+#: episode, not per claim.
 CLAIM_LEASE_MAX_ATTEMPTS = 3
 
 #: Backoff (seconds) applied to a lease-escalated item: the
