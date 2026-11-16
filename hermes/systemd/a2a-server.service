@@ -1,0 +1,19 @@
+[Unit]
+Description=A2A server for Westin's bots
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/a2a
+ExecStart=/usr/bin/python3 /home/ubuntu/a2a/a2a_server.py --host 0.0.0.0 --port 443 --tls-cert /home/ubuntu/a2a/tls/fullchain.pem --tls-key /home/ubuntu/a2a/tls/privkey.pem
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ubuntu/a2a/server.log
+StandardError=append:/home/ubuntu/a2a/server.log
+
+[Install]
+WantedBy=multi-user.target

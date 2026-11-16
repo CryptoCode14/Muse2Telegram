@@ -1,0 +1,16 @@
+[Unit]
+Description=Quinn health watch - passive service health + unanswered-work check, alerts westin-jr via A2A
+After=quinn-bridge.service a2a-server.service
+Wants=quinn-bridge.service a2a-server.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/a2a/quinn-brain
+ExecStart=/usr/bin/python3 /home/ubuntu/a2a/quinn-brain/quinn-health-watch.py
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

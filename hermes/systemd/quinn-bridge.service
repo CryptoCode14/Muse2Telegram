@@ -1,0 +1,25 @@
+[Unit]
+Description=Quinn Bridge - OpenAI-compatible HTTP bridge to Quinn (A2A) with Ollama fallback
+Documentation=file:///home/ubuntu/a2a/quinn-brain/quinn-bridge.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/a2a/quinn-brain
+ExecStart=/usr/bin/python3 /home/ubuntu/a2a/quinn-brain/quinn-bridge.py
+Environment=A2A_URL=https://YOUR-A2A-HOST/
+Environment=A2A_KEY_FILE=/home/ubuntu/a2a/key
+Environment=OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+Environment=OLLAMA_MODEL=qwen2.5:7b-64k
+Environment=A2A_TIMEOUT=600
+Environment=OLLAMA_TIMEOUT=120
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

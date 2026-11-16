@@ -67,7 +67,49 @@ Details on how it works live in [`muse-runtime/README.md`](muse-runtime/README.m
 
 - `muse-runtime/` — the bridge itself. `bridge_core/` is the queue, store, Telegram adapter, and send lifecycle; `hooks/` is the intake, decider, and watchdog hook scripts; `prompts/unified.md` is the one wake prompt; `bin/telegram-sender` is the Telegram send command; `tests/` is the suite.
 - `simulation/` — scripted end-to-end scenarios with a fake Telegram and a fake agent turn.
+- `hermes/` — the multi-bot side: the A2A bus and push notification layer that lets Muse bots talk to each other, the Hermes bridge that answers through Quinn, and the passive health watch plus the token-free intake watchdog. All stdlib-only Python and shell, with the live systemd units. See [`hermes/README.md`](hermes/README.md) for the whole setup.
+- `skills/` — agent skills: the Telegram collab protocol for multi-bot groups, the group chat rules, and the proactive finisher.
 - `.github/workflows/` — CI and security workflows.
+
+## Hermes multi-bot setup
+
+One bridge is one bot. Hermes is several Muse bots (a front-door assistant, a coding bot, a web dev bot, a ServiceTitan bot) plus Quinn as the overseeing brain, all talking over one A2A bus on a small VM, with the Telegram bridge as the front door. The bus (`hermes/a2a_server.py`) is a JSON-RPC 2.0 server with real push: `GET /events` long-polls for new tasks, and `hermes/a2a-push-intake.sh` is the script each bot runs to get notified when another bot talks to it. The full setup, including what is deliberately not in this repo (keys, tokens, task history, personal details) and the known limitations, is in [`hermes/README.md`](hermes/README.md).
+- `hermes/` — the multi-bot / Hermes tree. An A2A message bus so several Muse bots can talk to each other, plus a bridge that lets the local Hermes agent use a Muse as its brain. See below.
+- `skills/` — Muse skills used with this setup: proactive finisher, Telegram chat rules, and the Telegram collaboration protocol.
+
+## Hermes / A2A multi-bot tree (`hermes/`)
+
+This is a second tree in the same repo. It is not part of the Telegram bridge itself — it is the setup for running several Muse bots together, with one of them (Quinn) as the brain for the local Hermes agent.
+
+What is in it:
+
+- `hermes/a2a_server.py` — the A2A bus. A file-backed JSON task store on HTTPS 443, with long-poll push (`GET /events?bot=<id>&after=<seq>`, 25s hold, returns at once on a new task) so a bot wakes in seconds instead of polling every 5s. Agent Card advertises `pushNotifications: true`.
+- `hermes/a2a_client.py`, `hermes/a2a_client_v2.py` — A2A clients for sending tasks and polling for replies.
+- `hermes/a2a-push-intake.sh` — push intake for a bot: long-polls `/events`, falls back to a full list sweep, skips its own events so a confirm does not re-wake it.
+- `hermes/quinn-bridge.py` — the Hermes brain bridge (Dex v2). An OpenAI-compatible HTTP server on `127.0.0.1:8769` (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`). It forwards each turn to Quinn over A2A and falls back to local Ollama on timeout. It does not execute tools — a client's tools list is passed through to Quinn as JSON and the reply is plain text.
+- `hermes/quinn-brain/` — the design and the pieces: `DESIGN.md` and `A2A-INSTANT.md`, Dorian's A2A client library and Hermes config-change plan plus the bridge test script (`dorian/`), Dex's bridge (`dex/`), Quinn's v1 bridge (`quinn/`), and the health watcher (`quinn-health-watch.py`) and watchdog (`quinn-watchdog.py`).
+- `hermes/a2a_lib.py` — adapter so the bridge can use Dorian's library (`a2a_lib.ask(messages)` → `ask_quinn(prompt)`).
+- `hermes/intake-watchdog.sh` — token-free intake watchdog (see below). Systemd units in `hermes/systemd/`.
+- `hermes/docs/` — setup, roles, onboarding, and the instant-notification design.
+
+Setup, in brief — full steps in `hermes/docs/A2A-SETUP.md` and `hermes/docs/ONBOARDING.md`:
+
+1. Put `a2a_server.py` on a VM, run it on HTTPS 443 with TLS, and share one bearer key with every bot (env / key file, never pasted in chat or a repo).
+2. Each bot runs its own copy on its own port with its own Agent Card, and polls the bus with `a2a-push-intake.sh` (set `A2A_BOT_NAME` and `A2A_KEY_FILE`).
+3. To make Hermes use Quinn as its brain: run `quinn-bridge.py` on `127.0.0.1:8769` (systemd unit in `hermes/systemd/quinn-bridge.service`), back up Hermes `config.yaml`, then point its `model.base_url` at `http://127.0.0.1:8769/v1`, `model.default` to `quinn`, `provider` to `custom`, and restart `hermes-gateway`. Dorian's plan in `hermes/quinn-brain/dorian/hermes-config-change-plan.md` has the exact edits and the rollback. Verify with `hermes/quinn-brain/dorian/test_bridge.py` first — do not switch Hermes until the bridge answers.
+4. All placeholders in this tree must be filled in before use: `YOUR-A2A-HOST`, `<your-telegram-group-id>`, `<owner-telegram-id>`, bot usernames, and so on. Nothing in this tree contains a real host, group id, or Telegram user id.
+
+Known limits, honestly: the bridge only returns plain text, so Hermes cannot run skills through it — the brain answers in words, it does not execute tools. Replies can land minutes late when the brain is busy elsewhere, and the Ollama fallback may return nothing on a resource-starved host. The A2A bus truncates large reads, so very large task histories can fail to read.
+
+## Intake watchdog (`hermes/intake-watchdog.sh`)
+
+The runtime's hook scheduler can freeze — all hooks stop together, longest gap seen 5.2 hours — and the watchdog hook freezes with it, so nothing catches the stall. This script is the token-free workaround: a plain bash script on a systemd timer every 5 minutes.
+
+- Healthy, it reads two timestamps from the state files, logs one line, and exits — zero tokens.
+- If Telegram intake is stale over 180s, it runs the bridge poll directly, which claims any waiting messages and refreshes the poll clock. Claimed items are answered by the hook intake when the scheduler resumes.
+- A2A staleness is only logged — there is no token-free way to wake an agent from outside a hook run.
+
+Install: copy `hermes/intake-watchdog.sh` and the units in `hermes/systemd/` (`intake-watchdog.service`, `intake-watchdog.timer`), set `INTAKE_WATCHDOG_HOME` to the install base and `TELEGRAM_BRIDGE_BOT_USERNAME` to your bot's username, enable the timer. Worst case for a message arriving mid-freeze is about 15 minutes, not hours.
 
 ## Requirements
 
