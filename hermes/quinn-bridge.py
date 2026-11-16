@@ -11,8 +11,9 @@ Listens on 127.0.0.1:8769 and exposes a small OpenAI-compatible surface:
 
 Request flow for POST /v1/chat/completions:
   1. Ask Quinn over A2A (JSON-RPC to the registry): send one task carrying
-     the chat messages (plus any "tools" the client sent, as a JSON block),
-     then poll tasks/get until Quinn replies.
+     the chat messages compacted (latest turn in full, tool names only,
+     system prompt capped — the verbatim ~52KB full turn tripped the fetch
+     safety check, qh-03bfab49-001), then poll tasks/get until Quinn replies.
   2. On A2A timeout, error, or no reply, fall back to local Ollama at
      OLLAMA_BASE_URL (default http://127.0.0.1:11434/v1), proxying the same
      request (tools included) and normalising its OpenAI-format reply.
@@ -74,6 +75,17 @@ A2A_KEY_FILE = os.environ.get("A2A_KEY_FILE", "/home/ubuntu/.a2a/key")
 A2A_TIMEOUT = float(os.environ.get("A2A_TIMEOUT", "600"))
 A2A_POLL_SECONDS = float(os.environ.get("A2A_POLL_SECONDS", "2"))
 A2A_RPC_TIMEOUT = float(os.environ.get("A2A_RPC_TIMEOUT", "15"))
+#: Max chars of the turn forwarded to Quinn over A2A (env-overridable).
+#: Bridge-generated full turns (~52KB: the Hermes system prompt repeated
+#: verbatim plus full tool schemas) tripped the fetch safety check and sat
+#: unanswered past the 600s window (qh-03bfab49-001, qh-4ae05c49-001,
+#: 2026-11-15/16). The forward stays small: latest turn in full, tool
+#: names only, system prompt capped.
+MAX_FORWARD_CHARS = int(os.environ.get("QUINN_BRIDGE_MAX_FORWARD_CHARS", "8000"))
+#: System messages are capped to this many chars in the forward: the Hermes
+#: system prompt repeats verbatim every turn and Quinn needs the turn, not
+#: the helper's standing prompt.
+MAX_SYSTEM_CHARS = int(os.environ.get("QUINN_BRIDGE_MAX_SYSTEM_CHARS", "500"))
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b-64k")
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "120"))
@@ -292,16 +304,67 @@ def _tool_names(tools):
     return names
 
 
+def _message_text(message):
+    """Plain text of one OpenAI chat message (list content joined)."""
+    if not isinstance(message, dict):
+        return str(message)
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = " ".join(
+            c.get("text", "") for c in content if isinstance(c, dict))
+    return content if isinstance(content, str) else str(content)
+
+
+def _compact_forward(messages, tools=None, max_chars=MAX_FORWARD_CHARS):
+    """Build the small prompt forwarded to Quinn over A2A.
+
+    The bridge used to forward the whole OpenAI request verbatim: the
+    Hermes system prompt (~11KB, repeated every turn) plus the full tool
+    schemas as JSON (~35KB). Those ~52KB forwards tripped the fetch
+    safety check and sat unanswered past the 600s window. Compact instead:
+    system messages capped to a short head, tools as names only, and the
+    whole forward capped — oldest turns dropped first, and a single
+    over-long newest turn middle-truncated so its head and tail survive.
+    (Twin copy in a2a_lib.py, which the bridge prefers when present;
+    keep the two in sync.)
+    """
+    lines = []
+    for message in messages or []:
+        role = message.get("role", "user") if isinstance(message, dict) else "user"
+        text = _message_text(message)
+        if role == "system" and len(text) > MAX_SYSTEM_CHARS:
+            text = text[:MAX_SYSTEM_CHARS] + " [...system prompt truncated...]"
+        lines.append("%s: %s" % (role, text))
+    tools_line = ""
+    if tools:
+        names = _tool_names(tools)
+        if names:
+            tools_line = "Available tools: " + ", ".join(names)
+    while True:
+        parts = list(lines)
+        if tools_line:
+            parts.append(tools_line)
+        forward = "\n\n".join(parts)
+        if len(forward) <= max_chars or len(lines) <= 1:
+            break
+        lines.pop(0)
+    if len(forward) > max_chars:
+        # One line alone exceeds the cap: middle-truncate it, keeping
+        # head and tail (the ask sits at one end or the other).
+        marker = " [...] "
+        keep = max(0, (max_chars - len(marker)) // 2)
+        forward = (forward[:keep] + marker + forward[-keep:]
+                   if keep else forward[:max_chars])
+    return forward
+
+
 def _ask_quinn_builtin(messages, tools=None, timeout=A2A_TIMEOUT):
     """Minimal stdlib A2A client: send one task, poll until Quinn replies."""
     key = _read_a2a_key()
     task_id = _next_task_id(messages)
-    text = "\n\n".join(
-        "%s: %s" % (m.get("role", "user"), m.get("content", ""))
-        for m in messages
-    )
-    if tools:
-        text += "\n\nAvailable tools (JSON):\n" + json.dumps(tools)
+    # Compact forward: the verbatim full turn (~52KB) tripped the fetch
+    # safety check; see _compact_forward.
+    text = _compact_forward(messages, tools)
     send_msg = {
         "id": "msg-%d" % int(time.time()),
         "from": "quinn-helper",
@@ -311,7 +374,8 @@ def _ask_quinn_builtin(messages, tools=None, timeout=A2A_TIMEOUT):
         "payload": {"message": text},
     }
     _a2a_rpc("message/send", {"message": send_msg}, key)
-    LOG.info("asked Quinn via A2A task %s", task_id)
+    LOG.info("asked Quinn via A2A task %s (forward %d chars)",
+             task_id, len(text))
 
     deadline = time.time() + timeout
     while time.time() < deadline:
