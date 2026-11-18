@@ -69,7 +69,12 @@ Details on how it works live in [`muse-runtime/README.md`](muse-runtime/README.m
 - `simulation/` — scripted end-to-end scenarios with a fake Telegram and a fake agent turn.
 - `hermes/` — the multi-bot side: the A2A bus and push notification layer that lets Muse bots talk to each other, the Hermes bridge that answers through Quinn, and the passive health watch plus the token-free intake watchdog. All stdlib-only Python and shell, with the live systemd units. See [`hermes/README.md`](hermes/README.md) for the whole setup.
 - `skills/` — agent skills: the Telegram collab protocol for multi-bot groups, the group chat rules, and the proactive finisher.
+- `mcp/telegram-webapp/` — Telegram-native secure password entry (Web App / Mini App) for all bots: a one-time form that opens inside Telegram so the owner can enter a password without a browser link or a Secure Vault card. See [`mcp/telegram-webapp/README.md`](mcp/telegram-webapp/README.md).
 - `.github/workflows/` — CI and security workflows.
+
+## Telegram Web App secure password entry (`mcp/telegram-webapp/`)
+
+A one-time password form that opens **inside Telegram** — no browser link, no Secure Vault card, nothing typed in chat. Any bot in the fleet can send the owner a button in a DM; the owner taps it, types the password, and it is saved on the server only (per-bot file, 0600), with the link invalidated after one use. See [`mcp/telegram-webapp/README.md`](mcp/telegram-webapp/README.md) for setup and rules.
 
 ## Hermes multi-bot setup
 
